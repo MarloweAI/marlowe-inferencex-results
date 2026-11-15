@@ -1,0 +1,49 @@
+{
+ "result": "PASS",
+ "start": "2026-11-15T03:20:30+00:00",
+ "end": "2026-11-15T04:31:36+00:00",
+ "gpus": 2,
+ "concurrency": 1,
+ "server_ready_s": 562,
+ "server_fault_lines": 0,
+ "errored_requests": 0,
+ "accept_len_mean": 3.511,
+ "replay_checks": [
+  "ok: sequential trace order",
+  "ok: 1 lanes from 393 traces",
+  "ok: lane 0 at turn 84/130",
+  "ok: lane 0 trace 00200129",
+  "ok: 10 warm-up requests per lane",
+  "profiling records 338 lane-0 primer ISL 314837 ok"
+ ],
+ "decode": {
+  "intervals": 4768,
+  "mono_share": 1.0,
+  "graph_share": 1.0,
+  "mono_batch_sizes": [
+   1
+  ]
+ },
+ "score_full_window": {
+  "n": 338,
+  "intv50": 721.0185632622479,
+  "intv90": 705.8340593687037,
+  "itl50_ms": 1.386926843430356,
+  "itl90_ms": 1.4167635958151377,
+  "ttft50": 0.472668619,
+  "ttft90": 0.9099221769,
+  "e2en50": 557.1467106000558,
+  "tpg": 15662.871402199593,
+  "otpg": 93.56286048846998,
+  "isl50": 355078.0,
+  "osl50": 924.5,
+  "traces": 5
+ },
+ "score_keys": {
+  "intv50/intv90": "interactivity P50/P90, tokens/s/user (1/TPOT)",
+  "itl50_ms/itl90_ms": "TPOT P50/P90, ms",
+  "ttft50/ttft90": "time to first token P50/P90, s",
+  "tpg/otpg": "total (input incl. cached + output) / output tokens/s per GPU",
+  "isl50/osl50": "median input/output tokens per request"
+ }
+}

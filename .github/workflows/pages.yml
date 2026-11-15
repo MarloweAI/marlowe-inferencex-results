@@ -1,0 +1,57 @@
+# The results site: tools/build_site.py folds data/marlowe/, recipes/ and the latest data/inferencex/ snapshot into
+# _site/ and publishes it to this repository's GitHub Pages site. It runs on changes to main, after each daily
+# InferenceX snapshot (a push made with the workflow token does not trigger other workflows, so the snapshot's
+# completion does), and on demand. A pull request builds the site without deploying; the build fails if a Marlowe
+# point lacks its recipe or a published file carries a local path, node name or private IP address.
+
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths: ["data/**", "recipes/**", "site/**", "tools/**", ".github/workflows/pages.yml"]
+  pull_request:
+    paths: ["data/**", "recipes/**", "site/**", "tools/**", ".github/workflows/pages.yml"]
+  workflow_run:
+    workflows: ["InferenceX snapshot"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || 'deploy' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.sha || 'main' }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build
+        run: python3 tools/build_site.py --out _site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
