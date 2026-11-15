@@ -1,0 +1,271 @@
+/**
+ * CollectiveX neutral contract — the version-tagged shape shared by the
+ * results-upload validator, the Neon ingest, and the dashboard frontend.
+ *
+ * This module is pure TypeScript (no Node/DB imports) so it is safe to import
+ * from client components. UI-only types (chart points, axis modes, display
+ * label helpers) live in `packages/app/src/components/collectivex/types.ts`.
+ */
+
+export type CollectiveXPhase = 'decode' | 'prefill';
+export type CollectiveXPrecision = 'bf16' | 'fp8';
+/** Kernel mode: throughput-oriented `normal`, or decode-only `low-latency`. */
+export type CollectiveXMode = 'normal' | 'low-latency';
+export const COLLECTIVEX_VERSIONS = [1] as const;
+export type CollectiveXVersion = (typeof COLLECTIVEX_VERSIONS)[number];
+export const COLLECTIVEX_DEFAULT_VERSION: CollectiveXVersion = COLLECTIVEX_VERSIONS.at(-1)!;
+
+export function parseCollectiveXVersion(raw: string): CollectiveXVersion | null {
+  const version = Number(raw);
+  return (COLLECTIVEX_VERSIONS as readonly number[]).includes(version)
+    ? (version as CollectiveXVersion)
+    : null;
+}
+
+export type CollectiveXOperation = 'pair_period' | 'dispatch' | 'stage' | 'combine' | 'roundtrip';
+export type CollectiveXPercentile = 'p50' | 'p90' | 'p95' | 'p99';
+export type CollectiveXOutcome =
+  | 'success'
+  | 'unsupported'
+  | 'failed'
+  | 'invalid'
+  | 'diagnostic'
+  | 'pending';
+export type CollectiveXTerminalStatus = Exclude<CollectiveXOutcome, 'success'> | 'measured';
+
+export type CollectiveXPercentiles = Record<CollectiveXPercentile, number>;
+// EP rows: null where the harness withheld a tail because too many of its samples were misaligned
+// or host-stalled. p50 is always published.
+export type CollectiveXTailPercentiles = Record<CollectiveXPercentile, number | null>;
+
+export interface CollectiveXComponent {
+  latency_us: CollectiveXTailPercentiles;
+  activation_data_rate_gbps_at_latency_percentile: CollectiveXTailPercentiles | null;
+  /**
+   * Per-GPU bandwidth over the FULL logical payload (activation bytes plus any
+   * FP8 scale bytes), i.e. `total_logical_bytes / ep_size / latency`. Distinct
+   * from `activation_data_rate_gbps_at_latency_percentile`, which is aggregate
+   * and excludes scale bytes. Null when the component carries no byte
+   * provenance (e.g. an unavailable component).
+   */
+  payload_data_rate_gbps_at_latency_percentile: CollectiveXTailPercentiles | null;
+  /**
+   * Aggregate total logical payload bytes for this component at this point
+   * (the numerator behind `payload_data_rate_*`). Carried raw so a consumer can
+   * fit latency vs bytes across the ladder (bandwidth-vs-overhead decomposition)
+   * without reconstructing bytes from a rate. Null when no byte provenance.
+   */
+  payload_bytes: number | null;
+}
+
+export interface CollectiveXPoint {
+  tokens_per_rank: number;
+  global_tokens: number;
+  components: Record<CollectiveXOperation, CollectiveXComponent | null>;
+  roundtrip_token_rate_at_latency_percentile: CollectiveXTailPercentiles;
+}
+
+export interface CollectiveXTopology {
+  ep_size: number;
+  nodes: number;
+  gpus_per_node: number;
+  scale_up_domain: number;
+  scale_up_transport: string;
+  scale_out_transport: string | null;
+  topology_class: string;
+}
+
+export interface CollectiveXSeries {
+  series_id: string;
+  phase: CollectiveXPhase;
+  mode: CollectiveXMode;
+  precision: CollectiveXPrecision;
+  backend: string;
+  /** The backend build the case ran (`implementation.library_version`), when recorded. */
+  library_version?: string | null;
+  system: CollectiveXTopology & {
+    sku: string;
+    vendor: 'nvidia' | 'amd';
+  };
+  points: CollectiveXPoint[];
+  /** `candidate`: no engine can select this configuration today. Absent on older results. */
+  maturity?: 'production' | 'candidate' | null;
+}
+
+export interface CollectiveXCoveragePoint {
+  tokens_per_rank: number;
+  global_tokens: number;
+  terminal_status: CollectiveXTerminalStatus;
+  reason: string | null;
+}
+
+export interface CollectiveXCoverage {
+  case_id: string;
+  label: string;
+  disposition: 'runnable' | 'unsupported';
+  sku: string;
+  backend: string;
+  phase: CollectiveXPhase;
+  mode: CollectiveXMode;
+  precision: CollectiveXPrecision;
+  topology: CollectiveXTopology;
+  points: CollectiveXCoveragePoint[];
+  outcome: CollectiveXOutcome;
+  reason: string | null;
+  detail: string | null;
+}
+
+/** kv-transfer latency percentiles (the suite reports ms, not us). */
+export interface CollectiveXKvLatency {
+  p50: number;
+  p95: number;
+  min: number;
+  max: number;
+  n: number;
+}
+
+/** One measured kv-transfer grid point (a burst of `batch` requests). */
+export interface CollectiveXKvRow {
+  kind: 'paged' | 'bulk';
+  isl: number;
+  page_tokens: number | null;
+  batch: number;
+  op: 'pull' | 'push';
+  /** Entries the library posts for one request (whole rows; Mooncake adds page entries). */
+  descs: number;
+  /** One request's KV bytes, the same for every library, so GB/s compares on one payload. */
+  req_bytes: number;
+  /** Bytes the library posts for one request; absent on rows measured before it was recorded. */
+  posted_bytes?: number;
+  prep_ms: number;
+  latency_ms: CollectiveXKvLatency;
+  /**
+   * Each request's host-observed completion offset within its burst — the
+   * per-request latency distribution. Absent on rows measured before the
+   * harness recorded it; `latency_ms` (whole-burst) is a capacity quantity.
+   */
+  request_ms?: CollectiveXKvLatency;
+  gbps_p50: number;
+  /** Cold-path rate: descriptor/handle prep paid once per burst. */
+  gbps_p50_incl_prep?: number;
+  verify_passed: boolean;
+  /** Why verification failed; absent when it passed. */
+  verify_detail?: string;
+}
+
+/**
+ * One kv-transfer matrix case (2 nodes x 1 GPU: the per-worker prefill/decode
+ * pair). Fabric is the case's declared lane (`rdma` | `mnnvl`); rows are empty
+ * unless a successful shard measured the case.
+ */
+export interface CollectiveXKvCase {
+  case_id: string;
+  label: string;
+  disposition: 'runnable' | 'unsupported';
+  sku: string;
+  vendor: 'nvidia' | 'amd' | null;
+  backend: string;
+  fabric: string;
+  workload: string;
+  precision: CollectiveXPrecision;
+  topology: CollectiveXTopology;
+  outcome: CollectiveXOutcome;
+  reason: string | null;
+  detail: string | null;
+  /** The measured library build (`implementation.library_version`); null when unmeasured. */
+  library_version: string | null;
+  /** `production` when vLLM can run this library for the model today; null when unmeasured. */
+  maturity: 'production' | 'candidate' | null;
+  /** Probed link layer (`infiniband`, `roce`, `efa`) or `mnnvl`; null when unmeasured. */
+  network: string | null;
+  /** Wire transport under the library (`ucx`, `libfabric`, `verbs`); null when unmeasured. */
+  transport: string | null;
+  rows: CollectiveXKvRow[];
+}
+
+export interface CollectiveXSwapPoint {
+  direction: 'h2d' | 'd2h' | 'd2d';
+  layout: 'contiguous' | 'random';
+  block_bytes: number;
+  num_blocks: number;
+  payload_bytes: number;
+  seed: number;
+  host_memory: string;
+  api: string;
+  sample_count: number;
+  latency_us: CollectiveXPercentiles;
+  payload_gbps_at_latency_percentile: CollectiveXPercentiles;
+}
+
+/** One verified swap_blocks artifact, with runtime provenance retained. */
+export interface CollectiveXSwapResult {
+  result_id: string;
+  sku: string;
+  runtime: {
+    device: string;
+    torch: string;
+    vllm: string;
+    cuda: string | null;
+    hip: string | null;
+    image: string;
+    source_sha: string;
+  };
+  timing: string;
+  warmup: number;
+  iterations: number;
+  max_payload_bytes: number | null;
+  skipped_points: number;
+  points: CollectiveXSwapPoint[];
+}
+
+export interface CollectiveXRun {
+  run_id: string;
+  run_attempt: number;
+  generated_at: string;
+  conclusion: string | null;
+  source_sha: string;
+  /** GitHub `owner/repo` that ran the sweep. Runs stored before it was recorded omit it. */
+  source_repository?: string;
+  requested_cases: number;
+  terminal_cases: number;
+  measured_cases: number;
+  unsupported_cases: number;
+  failed_cases: number;
+  requested_points: number;
+  terminal_points: number;
+  measured_points: number;
+  covered_skus: string[];
+  /** kv-transfer case counts; absent on datasets read before the kv suite. */
+  swap_requested_cases?: number;
+  swap_measured_cases?: number;
+  kv_requested_cases?: number;
+  kv_measured_cases?: number;
+}
+
+export interface CollectiveXDataset {
+  version: number;
+  run: CollectiveXRun;
+  coverage: CollectiveXCoverage[];
+  series: CollectiveXSeries[];
+  /** kv-transfer cases; absent on datasets captured before the kv suite. */
+  kv?: CollectiveXKvCase[];
+  swap_blocks?: CollectiveXSwapResult[];
+}
+
+export interface CollectiveXRunSummary {
+  run_id: string;
+  run_attempt: number;
+  generated_at: string;
+  conclusion: string | null;
+  /** GitHub `owner/repo` that ran the sweep. Runs stored before it was recorded omit it. */
+  source_repository?: string;
+  covered_skus: string[];
+  requested_cases: number;
+  measured_cases: number;
+  requested_points: number;
+  terminal_points: number;
+  terminal_counts: { measured: number; unsupported: number; failed: number };
+  /** kv-transfer case counts; absent on summaries stored before the kv suite. */
+  kv_cases?: { requested: number; measured: number };
+  swap_cases?: { requested: number; measured: number };
+}

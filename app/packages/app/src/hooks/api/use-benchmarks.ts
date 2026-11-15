@@ -1,0 +1,82 @@
+import { DISPLAY_MODEL_TO_DB } from '@semianalysisai/inferencex-constants';
+import { useQuery } from '@tanstack/react-query';
+
+import { fetchBenchmarks, type BenchmarkRow } from '@/lib/api/api';
+
+export function benchmarkQueryOptions(
+  model: string,
+  date: string,
+  enabled = true,
+  exact?: boolean,
+  runId?: string,
+  exactRun?: boolean,
+  view?: { type: 'calculator'; sequence: string; cacheScope?: string },
+  initialData?: BenchmarkRow[],
+  scope?: string,
+  keepPreviousForModel?: boolean,
+) {
+  const canonicalDate = date === 'latest' ? '' : date;
+  return {
+    queryKey: [
+      'benchmarks',
+      model,
+      canonicalDate,
+      exact ? 'exact' : 'latest',
+      runId ?? 'all',
+      exactRun ? 'run' : 'asof',
+      ...(view
+        ? ([view.type, view.sequence, ...(view.cacheScope ? [view.cacheScope] : [])] as const)
+        : []),
+      ...(scope ? (['scope', scope] as const) : []),
+    ] as const,
+    queryFn: ({ signal }: { signal: AbortSignal }) =>
+      // A model seen only in an unofficial-run overlay has no published rows, and the API rejects it.
+      DISPLAY_MODEL_TO_DB[model]
+        ? fetchBenchmarks(model, canonicalDate, exact, signal, runId, exactRun, view)
+        : Promise.resolve<BenchmarkRow[]>([]),
+    enabled: enabled && Boolean(model),
+    ...(initialData ? { initialData } : {}),
+    ...(keepPreviousForModel
+      ? {
+          // A seed key covers a narrower slice (one sequence) than the shared
+          // key, so its rows would render as an empty chart for another scope.
+          placeholderData: (
+            previousData: BenchmarkRow[] | undefined,
+            previousQuery: { queryKey: readonly unknown[] } | undefined,
+          ) => {
+            const previousKey = previousQuery?.queryKey;
+            if (previousKey?.[1] !== model) return undefined;
+            const previousScope = previousKey.at(-2) === 'scope' ? previousKey.at(-1) : undefined;
+            return previousScope === scope ? previousData : undefined;
+          },
+        }
+      : {}),
+  };
+}
+
+export function useBenchmarks(
+  model: string,
+  date?: string,
+  enabled = true,
+  runId?: string,
+  exactRun?: boolean,
+  view?: { type: 'calculator'; sequence: string; cacheScope?: string },
+  initialData?: BenchmarkRow[],
+  scope?: string,
+  keepPreviousForModel?: boolean,
+) {
+  return useQuery(
+    benchmarkQueryOptions(
+      model,
+      date ?? '',
+      enabled,
+      undefined,
+      runId,
+      exactRun,
+      view,
+      initialData,
+      scope,
+      keepPreviousForModel,
+    ),
+  );
+}

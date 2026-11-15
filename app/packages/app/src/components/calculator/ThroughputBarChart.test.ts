@@ -1,0 +1,716 @@
+import { describe, expect, it } from 'vitest';
+
+import { splitLabel } from '@/lib/d3-chart/axis-labels';
+
+import type { InterpolatedResult } from './types';
+import {
+  generateTooltipHTML,
+  getThroughputPointDetails,
+  getResultLabel,
+  getCostForType,
+  getCostProviderLabel,
+  getCostTypeLabel,
+  getChartTitle,
+  getMetricLabel,
+  getMetricValue,
+  getSortedResults,
+  getThroughputForType,
+  getComparableTpPerMwForType,
+  getTpPerMwForType,
+  getValueLabel,
+} from './ThroughputBarChart';
+
+function makeResult(overrides: Partial<InterpolatedResult> = {}): InterpolatedResult {
+  const hwKey = overrides.hwKey ?? 'h100';
+  return {
+    hwKey,
+    resultKey: overrides.resultKey ?? hwKey,
+    value: 500,
+    outputTputValue: 450,
+    inputTputValue: 50,
+    cost: 1.5,
+    costInput: 0.8,
+    costOutput: 2.2,
+    tpPerMw: 1200,
+    inputTpPerMw: 300,
+    outputTpPerMw: 1100,
+    concurrency: 64,
+    nearestPoints: [],
+    ...overrides,
+  };
+}
+
+describe('getCostForType', () => {
+  const result = makeResult({ cost: 1.5, costInput: 0.8, costOutput: 2.2 });
+
+  it('returns total cost for "total" type', () => {
+    expect(getCostForType(result, 'total')).toBe(1.5);
+  });
+
+  it('returns input cost for "input" type', () => {
+    expect(getCostForType(result, 'input')).toBe(0.8);
+  });
+
+  it('returns output cost for "output" type', () => {
+    expect(getCostForType(result, 'output')).toBe(2.2);
+  });
+});
+
+describe('getCostTypeLabel', () => {
+  it('returns "/M tok" for total', () => {
+    expect(getCostTypeLabel('total')).toBe('/M tok');
+  });
+
+  it('returns "/M input tok" for input', () => {
+    expect(getCostTypeLabel('input')).toBe('/M input tok');
+  });
+
+  it('returns "/M output tok" for output', () => {
+    expect(getCostTypeLabel('output')).toBe('/M output tok');
+  });
+});
+
+describe('getThroughputForType', () => {
+  const result = makeResult({ value: 500, outputTputValue: 450, inputTputValue: 50 });
+
+  it('returns total value (value) for "total" type', () => {
+    expect(getThroughputForType(result, 'total')).toBe(500);
+  });
+
+  it('returns input throughput for "input" type', () => {
+    expect(getThroughputForType(result, 'input')).toBe(50);
+  });
+
+  it('returns output throughput for "output" type', () => {
+    expect(getThroughputForType(result, 'output')).toBe(450);
+  });
+});
+
+describe('getTpPerMwForType', () => {
+  const result = makeResult({ tpPerMw: 1200, inputTpPerMw: 300, outputTpPerMw: 1100 });
+
+  it('returns total tpPerMw for "total" type', () => {
+    expect(getTpPerMwForType(result, 'total')).toBe(1200);
+  });
+
+  it('returns input tpPerMw for "input" type', () => {
+    expect(getTpPerMwForType(result, 'input')).toBe(300);
+  });
+
+  it('returns output tpPerMw for "output" type', () => {
+    expect(getTpPerMwForType(result, 'output')).toBe(1100);
+  });
+});
+
+describe('getMetricValue', () => {
+  const result = makeResult({
+    value: 500,
+    outputTputValue: 450,
+    inputTputValue: 50,
+    tpPerMw: 1200,
+    cost: 1.5,
+    costInput: 0.8,
+    costOutput: 2.2,
+  });
+
+  it('returns total value for "throughput" metric with total type', () => {
+    expect(getMetricValue(result, 'throughput', 'total')).toBe(500);
+  });
+
+  it('returns output throughput for "throughput" metric with output type', () => {
+    expect(getMetricValue(result, 'throughput', 'output')).toBe(450);
+  });
+
+  it('returns input throughput for "throughput" metric with input type', () => {
+    expect(getMetricValue(result, 'throughput', 'input')).toBe(50);
+  });
+
+  it('returns total tpPerMw for "power" metric with total type', () => {
+    expect(getMetricValue(result, 'power', 'total')).toBe(1200);
+  });
+
+  it('returns input tpPerMw for "power" metric with input type', () => {
+    expect(getMetricValue(result, 'power', 'input')).toBe(300);
+  });
+
+  it('returns output tpPerMw for "power" metric with output type', () => {
+    expect(getMetricValue(result, 'power', 'output')).toBe(1100);
+  });
+
+  it('returns total cost for "cost" metric with total type', () => {
+    expect(getMetricValue(result, 'cost', 'total')).toBe(1.5);
+  });
+
+  it('returns input cost for "cost" metric with input type', () => {
+    expect(getMetricValue(result, 'cost', 'input')).toBe(0.8);
+  });
+
+  it('returns output cost for "cost" metric with output type', () => {
+    expect(getMetricValue(result, 'cost', 'output')).toBe(2.2);
+  });
+});
+
+describe('getMetricLabel', () => {
+  it('returns localized Chinese axis labels while preserving protected units', () => {
+    expect(getMetricLabel('throughput', 'interactivity_to_throughput', 'output', 'zh')).toBe(
+      '每芯片输出吞吐量 (tok/s/chip)',
+    );
+    expect(getMetricLabel('cost', 'interactivity_to_throughput', 'input', 'zh')).toBe(
+      '成本 ($/M input tok)',
+    );
+    expect(getMetricLabel('power', 'interactivity_to_throughput', 'input', 'zh')).toBe(
+      '每全电源配置兆瓦输入 token 吞吐量 (tok/s/MW)',
+    );
+  });
+
+  it('returns power label for power metric with total type', () => {
+    expect(getMetricLabel('power', 'interactivity_to_throughput', 'total')).toBe(
+      'Tokens per Provisioned All-in Megawatt (tok/s/MW)',
+    );
+  });
+
+  it('returns input power label for power metric with input type', () => {
+    expect(getMetricLabel('power', 'interactivity_to_throughput', 'input')).toBe(
+      'Input Tokens per Provisioned All-in Megawatt (tok/s/MW)',
+    );
+  });
+
+  it('returns output power label for power metric with output type', () => {
+    expect(getMetricLabel('power', 'interactivity_to_throughput', 'output')).toBe(
+      'Output Tokens per Provisioned All-in Megawatt (tok/s/MW)',
+    );
+  });
+
+  it('returns cost label with total cost type', () => {
+    expect(getMetricLabel('cost', 'interactivity_to_throughput', 'total')).toBe('Cost ($/M tok)');
+  });
+
+  it('returns cost label with input cost type', () => {
+    expect(getMetricLabel('cost', 'interactivity_to_throughput', 'input')).toBe(
+      'Cost ($/M input tok)',
+    );
+  });
+
+  it('returns cost label with output cost type', () => {
+    expect(getMetricLabel('cost', 'interactivity_to_throughput', 'output')).toBe(
+      'Cost ($/M output tok)',
+    );
+  });
+
+  it('returns throughput label for interactivity_to_throughput mode with total type', () => {
+    expect(getMetricLabel('throughput', 'interactivity_to_throughput', 'total')).toBe(
+      'Throughput per Chip (tok/s/chip)',
+    );
+  });
+
+  it('returns input throughput label for interactivity_to_throughput mode with input type', () => {
+    expect(getMetricLabel('throughput', 'interactivity_to_throughput', 'input')).toBe(
+      'Input Throughput per Chip (tok/s/chip)',
+    );
+  });
+
+  it('returns output throughput label for interactivity_to_throughput mode with output type', () => {
+    expect(getMetricLabel('throughput', 'interactivity_to_throughput', 'output')).toBe(
+      'Output Throughput per Chip (tok/s/chip)',
+    );
+  });
+
+  it('returns interactivity label for throughput_to_interactivity mode', () => {
+    expect(getMetricLabel('throughput', 'throughput_to_interactivity', 'total')).toBe(
+      'Interactivity (tok/s/user)',
+    );
+  });
+});
+
+describe('getValueLabel', () => {
+  it('formats total power metric value', () => {
+    const result = makeResult({ tpPerMw: 1234 });
+    expect(getValueLabel(result, 'power', 'interactivity_to_throughput', 'total')).toBe(
+      '1.23k tok/s/MW',
+    );
+  });
+
+  it('formats input power metric value', () => {
+    const result = makeResult({ inputTpPerMw: 456 });
+    expect(getValueLabel(result, 'power', 'interactivity_to_throughput', 'input')).toBe(
+      '456 tok/s/MW',
+    );
+  });
+
+  it('formats output power metric value', () => {
+    const result = makeResult({ outputTpPerMw: 987 });
+    expect(getValueLabel(result, 'power', 'interactivity_to_throughput', 'output')).toBe(
+      '987 tok/s/MW',
+    );
+  });
+
+  it('formats cost metric value with total type', () => {
+    const result = makeResult({ cost: 1.567 });
+    expect(getValueLabel(result, 'cost', 'interactivity_to_throughput', 'total')).toBe(
+      '$1.567/M tok',
+    );
+  });
+
+  it('formats cost metric value with input type', () => {
+    const result = makeResult({ costInput: 0.823 });
+    expect(getValueLabel(result, 'cost', 'interactivity_to_throughput', 'input')).toBe(
+      '$0.823/M input tok',
+    );
+  });
+
+  it('formats total throughput value in interactivity_to_throughput mode', () => {
+    const result = makeResult({ value: 456.7 });
+    expect(getValueLabel(result, 'throughput', 'interactivity_to_throughput', 'total')).toBe(
+      '457 tok/s/chip',
+    );
+  });
+
+  it('formats input throughput value when costType is input', () => {
+    const result = makeResult({ inputTputValue: 55.3 });
+    expect(getValueLabel(result, 'throughput', 'interactivity_to_throughput', 'input')).toBe(
+      '55.3 tok/s/chip',
+    );
+  });
+
+  it('formats output throughput value when costType is output', () => {
+    const result = makeResult({ outputTputValue: 401.2 });
+    expect(getValueLabel(result, 'throughput', 'interactivity_to_throughput', 'output')).toBe(
+      '401 tok/s/chip',
+    );
+  });
+
+  it('formats interactivity value in throughput_to_interactivity mode', () => {
+    const result = makeResult({ value: 32.5 });
+    expect(getValueLabel(result, 'throughput', 'throughput_to_interactivity', 'total')).toBe(
+      '32.5 tok/s/user',
+    );
+  });
+});
+
+describe('getCostProviderLabel', () => {
+  it('returns natural Chinese ownership labels', () => {
+    expect(getCostProviderLabel('costh', 'zh')).toBe('自有设备 · 超大规模云厂商批量采购');
+    expect(getCostProviderLabel('costr', 'zh')).toBe('租赁设备 · 3 年承诺');
+  });
+
+  it('returns "Owning at large hyperscaler volume" for costh', () => {
+    expect(getCostProviderLabel('costh')).toBe('Owning at large hyperscaler volume');
+  });
+
+  it('returns "Rent – 3-year commit" for costr', () => {
+    expect(getCostProviderLabel('costr')).toBe('Rent – 3-year commit');
+  });
+});
+
+function fullTitle(...args: Parameters<typeof getChartTitle>) {
+  const { title, qualifier } = getChartTitle(...args);
+  return `${title} ${qualifier}`;
+}
+
+describe('getChartTitle', () => {
+  it('keeps the operating point out of the title so phones can show it as a subtitle', () => {
+    expect(getChartTitle('throughput', 'interactivity_to_throughput', 30, 'total')).toEqual({
+      title: 'Total token throughput per chip',
+      qualifier: 'at 30 tok/s/user interactivity',
+    });
+  });
+
+  it('returns total throughput title with interactivity target label', () => {
+    const title = fullTitle('throughput', 'interactivity_to_throughput', 30, 'total');
+    expect(title).toBe('Total token throughput per chip at 30 tok/s/user interactivity');
+  });
+
+  it('includes the selected percentile in an agentic interactivity title', () => {
+    const title = fullTitle(
+      'throughput',
+      'interactivity_to_throughput',
+      30,
+      'total',
+      undefined,
+      'p90',
+    );
+    expect(title).toBe('Total token throughput per chip at 30 tok/s/user P90 interactivity');
+  });
+
+  it('returns input throughput title when costType is input', () => {
+    const title = fullTitle('throughput', 'interactivity_to_throughput', 30, 'input');
+    expect(title).toBe('Input token throughput per chip at 30 tok/s/user interactivity');
+  });
+
+  it('returns output throughput title when costType is output', () => {
+    const title = fullTitle('throughput', 'interactivity_to_throughput', 30, 'output');
+    expect(title).toBe('Output token throughput per chip at 30 tok/s/user interactivity');
+  });
+
+  it('returns interactivity title in throughput_to_interactivity mode', () => {
+    const title = fullTitle('throughput', 'throughput_to_interactivity', 500, 'total');
+    expect(title).toBe('Interactivity at 500 tok/s/chip throughput');
+  });
+
+  it('returns total power title with target label', () => {
+    const title = fullTitle('power', 'interactivity_to_throughput', 25, 'total');
+    expect(title).toBe(
+      'Total tokens per provisioned all-in megawatt at 25 tok/s/user interactivity',
+    );
+  });
+
+  it('returns input power title when costType is input', () => {
+    const title = fullTitle('power', 'interactivity_to_throughput', 25, 'input');
+    expect(title).toBe(
+      'Input tokens per provisioned all-in megawatt at 25 tok/s/user interactivity',
+    );
+  });
+
+  it('returns output power title when costType is output', () => {
+    const title = fullTitle('power', 'interactivity_to_throughput', 25, 'output');
+    expect(title).toBe(
+      'Output tokens per provisioned all-in megawatt at 25 tok/s/user interactivity',
+    );
+  });
+
+  it('returns cost title with provider and cost type', () => {
+    const title = fullTitle('cost', 'interactivity_to_throughput', 30, 'input', 'costh');
+    expect(title).toBe(
+      'Cost per million input tokens (Owning at large hyperscaler volume) at 30 tok/s/user interactivity',
+    );
+  });
+
+  it('returns cost title with output cost type and rental provider', () => {
+    const title = fullTitle('cost', 'interactivity_to_throughput', 30, 'output', 'costr');
+    expect(title).toBe(
+      'Cost per million output tokens (Rent – 3-year commit) at 30 tok/s/user interactivity',
+    );
+  });
+
+  it('defaults to hyperscaler when no costProvider is specified for cost', () => {
+    const title = fullTitle('cost', 'throughput_to_interactivity', 500, 'total');
+    expect(title).toBe(
+      'Cost per million total tokens (Owning at large hyperscaler volume) at 500 tok/s/chip throughput',
+    );
+  });
+});
+
+describe('getSortedResults', () => {
+  const results: InterpolatedResult[] = [
+    makeResult({
+      hwKey: 'a',
+      value: 300,
+      outputTputValue: 270,
+      inputTputValue: 30,
+      tpPerMw: 800,
+      inputTpPerMw: 200,
+      outputTpPerMw: 700,
+      cost: 2,
+      costInput: 1,
+    }),
+    makeResult({
+      hwKey: 'b',
+      value: 500,
+      outputTputValue: 450,
+      inputTputValue: 50,
+      tpPerMw: 1200,
+      inputTpPerMw: 100,
+      outputTpPerMw: 1100,
+      cost: 1,
+      costInput: 0.5,
+    }),
+    makeResult({
+      hwKey: 'c',
+      value: 100,
+      outputTputValue: 90,
+      inputTputValue: 10,
+      tpPerMw: 2000,
+      inputTpPerMw: 500,
+      outputTpPerMw: 1500,
+      cost: 3,
+      costInput: 1.5,
+    }),
+  ];
+
+  it('sorts by total throughput descending for throughput metric with total type', () => {
+    const sorted = getSortedResults(results, 'throughput', 'total');
+    expect(sorted.map((r) => r.hwKey)).toEqual(['b', 'a', 'c']);
+  });
+
+  it('sorts by output throughput descending for throughput metric with output type', () => {
+    const sorted = getSortedResults(results, 'throughput', 'output');
+    expect(sorted.map((r) => r.hwKey)).toEqual(['b', 'a', 'c']);
+  });
+
+  it('sorts by input throughput descending for throughput metric with input type', () => {
+    const sorted = getSortedResults(results, 'throughput', 'input');
+    expect(sorted.map((r) => r.hwKey)).toEqual(['b', 'a', 'c']);
+  });
+
+  it('sorts by total tpPerMw descending for power metric with total type', () => {
+    const sorted = getSortedResults(results, 'power', 'total');
+    expect(sorted.map((r) => r.hwKey)).toEqual(['c', 'b', 'a']);
+  });
+
+  it('sorts by input tpPerMw descending for power metric with input type', () => {
+    const sorted = getSortedResults(results, 'power', 'input');
+    expect(sorted.map((r) => r.hwKey)).toEqual(['c', 'a', 'b']);
+  });
+
+  it('sorts by output tpPerMw descending for power metric with output type', () => {
+    const sorted = getSortedResults(results, 'power', 'output');
+    expect(sorted.map((r) => r.hwKey)).toEqual(['c', 'b', 'a']);
+  });
+
+  it('sorts by total cost ascending for cost metric', () => {
+    const sorted = getSortedResults(results, 'cost', 'total');
+    expect(sorted.map((r) => r.hwKey)).toEqual(['b', 'a', 'c']);
+  });
+
+  it('sorts by input cost ascending for cost metric with input type', () => {
+    const sorted = getSortedResults(results, 'cost', 'input');
+    expect(sorted.map((r) => r.hwKey)).toEqual(['b', 'a', 'c']);
+  });
+
+  it('does not mutate the original results array', () => {
+    const original = [...results];
+    getSortedResults(results, 'power', 'total');
+    expect(results).toEqual(original);
+  });
+
+  it('handles empty results array', () => {
+    expect(getSortedResults([], 'throughput', 'total')).toEqual([]);
+  });
+
+  it('handles single-element array', () => {
+    const single = [makeResult({ hwKey: 'x', value: 100 })];
+    const sorted = getSortedResults(single, 'throughput', 'total');
+    expect(sorted).toHaveLength(1);
+    expect(sorted[0].hwKey).toBe('x');
+  });
+});
+
+describe('getResultLabel', () => {
+  const noConfig = {};
+
+  it('returns the bare hardware name for a single-precision official bar', () => {
+    expect(getResultLabel(makeResult({ hwKey: 'b300' }), noConfig)).toBe('B300');
+  });
+
+  it('appends the precision when multiple precisions are selected', () => {
+    expect(getResultLabel(makeResult({ hwKey: 'b300', precision: 'fp4' }), noConfig)).toBe(
+      'B300 (FP4)',
+    );
+  });
+
+  it('joins the framework and precision with a middle dot in one bracket', () => {
+    const config = {
+      b300: { label: 'B300', suffix: '(Dynamo SGLang)' },
+    } as unknown as Parameters<typeof getResultLabel>[1];
+    const label = getResultLabel(makeResult({ hwKey: 'b300', precision: 'fp4' }), config);
+    expect(label).toBe('B300 (Dynamo SGLang · FP4)');
+    expect(splitLabel(label, 'parens')).toEqual(['B300', '(Dynamo SGLang · FP4)']);
+  });
+
+  it('marks an overlay bar with ✕ and the branch name', () => {
+    const label = getResultLabel(
+      makeResult({ hwKey: 'b300', isOverlay: true, runIndex: 0, runLabel: 'feat/my-branch' }),
+      noConfig,
+    );
+    expect(label).toBe('B300 (✕ feat/my-branch)');
+  });
+
+  it('combines precision and branch inside a single paren group', () => {
+    const label = getResultLabel(
+      makeResult({
+        hwKey: 'b300',
+        precision: 'fp8',
+        isOverlay: true,
+        runIndex: 1,
+        runLabel: 'feat/my-branch',
+      }),
+      noConfig,
+    );
+    expect(label).toBe('B300 (FP8 · ✕ feat/my-branch)');
+    expect(splitLabel(label, 'parens')).toEqual(['B300', '(FP8 · ✕ feat/my-branch)']);
+  });
+
+  it('falls back to "unofficial" when the run has no branch name', () => {
+    expect(getResultLabel(makeResult({ hwKey: 'b300', isOverlay: true }), noConfig)).toBe(
+      'B300 (✕ unofficial)',
+    );
+  });
+});
+
+const throughputDetails = (
+  result: InterpolatedResult,
+  runUrl?: string,
+  locale: 'en' | 'zh' = 'en',
+) =>
+  getThroughputPointDetails(
+    result,
+    {},
+    'interactivity_to_throughput',
+    'throughput',
+    'total',
+    runUrl,
+    locale,
+  );
+
+describe('getThroughputPointDetails', () => {
+  const officialRunUrl = 'https://github.com/org/repo/actions/runs/999';
+  const overlayRunUrl = 'https://github.com/org/repo/actions/runs/111';
+
+  it('omits the unofficial warning for official bars and links the official run', () => {
+    const d = throughputDetails(makeResult({ hwKey: 'b300' }), officialRunUrl);
+    expect(d.warning).toBeUndefined();
+    expect(d.links).toEqual([
+      {
+        action: 'run',
+        label: 'View raw result on GitHub',
+        href: officialRunUrl,
+        external: true,
+      },
+    ]);
+    expect(generateTooltipHTML(d, 'red')).not.toContain('Unofficial run');
+  });
+
+  it('adds the branch notice and overlay run link for overlay bars', () => {
+    const d = throughputDetails(
+      makeResult({
+        hwKey: 'b300',
+        isOverlay: true,
+        runIndex: 0,
+        runLabel: 'feat/my-branch',
+        runUrl: overlayRunUrl,
+      }),
+      officialRunUrl,
+    );
+    expect(d.warning).toBe('✕ feat/my-branch');
+    expect(d.rows?.map((row) => row.label)).not.toContain('Branch');
+    expect(d.links[0]).toMatchObject({
+      label: 'View workflow run',
+      href: overlayRunUrl,
+    });
+    expect(generateTooltipHTML(d, 'red')).toContain('✕ feat/my-branch');
+  });
+
+  it('localizes the overlay strings in Chinese', () => {
+    const d = throughputDetails(
+      makeResult({
+        hwKey: 'b300',
+        isOverlay: true,
+        runIndex: 0,
+        runLabel: 'feat/my-branch',
+        runUrl: overlayRunUrl,
+      }),
+      undefined,
+      'zh',
+    );
+    expect(d.warning).toBe('✕ feat/my-branch');
+    expect(d.rows?.map((row) => row.label)).not.toContain('分支');
+    expect(d.links[0]?.label).toBe('查看工作流运行');
+  });
+
+  it('localizes parallelism and the raw link in Chinese', () => {
+    const d = throughputDetails(
+      makeResult({
+        hwKey: 'b300',
+        nearestPoints: [
+          {
+            tp: 4,
+            ep: 2,
+            dp_attention: true,
+            precision: 'fp8',
+          } as InterpolatedResult['nearestPoints'][number],
+        ],
+      }),
+      officialRunUrl,
+      'zh',
+    );
+    expect(d.rows).toContainEqual({
+      label: '并行策略',
+      value: 'TP 4 · EP 2 · DPA 是',
+    });
+    expect(d.links[0]?.label).toBe('在 GitHub 查看原始结果');
+  });
+
+  it('keeps the English DPA value as True and puts the plotted metric first', () => {
+    const d = throughputDetails(
+      makeResult({
+        nearestPoints: [
+          {
+            tp: 4,
+            ep: 2,
+            dp_attention: true,
+            precision: 'fp8',
+          } as InterpolatedResult['nearestPoints'][number],
+        ],
+      }),
+      officialRunUrl,
+    );
+    expect(d.rows).toContainEqual({
+      label: 'Parallelism',
+      value: 'TP 4 · EP 2 · DPA True',
+    });
+    expect(d.metrics[0]).toEqual({ value: '500.0', label: 'tok/s/chip' });
+    expect(d.subtitle).toBe('FP8');
+  });
+});
+
+const rankResult = (over: Partial<InterpolatedResult> = {}): InterpolatedResult =>
+  ({
+    hwKey: 'mi355x',
+    resultKey: 'mi355x',
+    value: 900,
+    inputTputValue: 800,
+    outputTputValue: 100,
+    cost: 1,
+    costInput: 1,
+    costOutput: 1,
+    tpPerMw: 9000,
+    inputTpPerMw: 8000,
+    outputTpPerMw: 1000,
+    concurrency: 8,
+    nearestPoints: [],
+    ...over,
+  }) as InterpolatedResult;
+
+describe('getComparableTpPerMwForType', () => {
+  it('leaves the total basis alone — it is already per total chip', () => {
+    const r = rankResult({ inputTokenShare: 0.5 });
+    expect(getComparableTpPerMwForType(r, 'total')).toBe(r.tpPerMw);
+    expect(getComparableTpPerMwForType(r, 'total')).toBe(getTpPerMwForType(r, 'total'));
+  });
+
+  it('is an identity for an aggregated config, whose rates already sum to the total', () => {
+    const r = rankResult({ inputTokenShare: 800 / 900 });
+    expect(getComparableTpPerMwForType(r, 'input')).toBeCloseTo(8000, 6);
+    expect(getComparableTpPerMwForType(r, 'output')).toBeCloseTo(1000, 6);
+  });
+
+  it('deflates a disaggregated config back onto the per-total-chip basis', () => {
+    const r = rankResult({
+      value: 300,
+      inputTputValue: 400,
+      outputTputValue: 100,
+      tpPerMw: 3000,
+      inputTpPerMw: 4000,
+      outputTpPerMw: 1000,
+      inputTokenShare: 8192 / 9216,
+    });
+    expect(getTpPerMwForType(r, 'output')).toBe(1000);
+    expect(getComparableTpPerMwForType(r, 'output')).toBeCloseTo(3000 / 9, 6);
+    expect(getComparableTpPerMwForType(r, 'output')).toBeLessThan(getTpPerMwForType(r, 'output'));
+    expect(
+      getComparableTpPerMwForType(r, 'input') + getComparableTpPerMwForType(r, 'output'),
+    ).toBeCloseTo(3000, 6);
+    expect(getTpPerMwForType(r, 'input') + getTpPerMwForType(r, 'output')).toBeGreaterThan(3000);
+  });
+
+  it('falls back to the raw figure when no share was recovered', () => {
+    const r = rankResult();
+    expect(getComparableTpPerMwForType(r, 'input')).toBe(r.inputTpPerMw);
+    expect(getComparableTpPerMwForType(r, 'output')).toBe(r.outputTpPerMw);
+  });
+
+  it('clamps a share outside [0,1]', () => {
+    expect(getComparableTpPerMwForType(rankResult({ inputTokenShare: 1.4 }), 'output')).toBe(0);
+    expect(getComparableTpPerMwForType(rankResult({ inputTokenShare: -1 }), 'input')).toBe(0);
+  });
+});

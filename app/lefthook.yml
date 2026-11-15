@@ -1,0 +1,16 @@
+pre-commit:
+  parallel: true
+  jobs:
+    - name: lint
+      run: bun run lint:fix -- {staged_files}
+      stage_fixed: true
+
+    - name: format
+      run: bun run fmt:fix -- {staged_files}
+      stage_fixed: true
+
+    - name: typecheck
+      run: bun run typecheck
+
+    - name: typography
+      run: bun run check:typography

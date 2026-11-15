@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "target": "ES2018",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "jsx": "react-jsx",
+    "incremental": true,
+    "tsBuildInfoFile": "./node_modules/.cache/tsc/root.tsbuildinfo",
+    "paths": {
+      "@/*": ["./packages/app/src/*"]
+    }
+  },
+  "include": ["packages/**/*.ts", "packages/**/*.tsx", "scripts/**/*.ts"],
+  "exclude": ["packages/*/node_modules", "packages/*/.next", "packages/*/scratch"]
+}

@@ -1,0 +1,312 @@
+import { describe, it, expect } from 'vitest';
+
+import type { InferenceData } from '@/components/inference/types';
+
+import {
+  EMPTY_QUICK_FILTERS,
+  applyQuickFilters,
+  computeAvailableQuickFilters,
+  matchesQuickFilters,
+  pointDeploymentMode,
+  parseDeploymentModes,
+  parsePowerTiers,
+  pointVendor,
+  quickFiltersActive,
+  type QuickFilters,
+} from './quickFilters';
+
+function point(partial: Partial<InferenceData>): InferenceData {
+  return { hwKey: 'h100', ...partial } as InferenceData;
+}
+
+const filters = (f: Partial<QuickFilters>): QuickFilters => ({ ...EMPTY_QUICK_FILTERS, ...f });
+
+describe('pointVendor', () => {
+  it('resolves vendor from the base GPU in the hardware key', () => {
+    expect(pointVendor('h100_vllm_mtp')).toBe('NVIDIA');
+    expect(pointVendor('mi300x_sglang')).toBe('AMD');
+    expect(pointVendor('tpuv7_vllm')).toBe('Google');
+  });
+
+  it('returns undefined for an unknown GPU base', () => {
+    expect(pointVendor('madeupgpu_vllm')).toBeUndefined();
+  });
+});
+
+describe('parseDeploymentModes', () => {
+  it('expands legacy agg links to both non-disaggregated deployment modes', () => {
+    expect(parseDeploymentModes(['agg'])).toEqual(['single-node', 'multi-node']);
+  });
+
+  it('keeps current modes, removes duplicates, and ignores unknown values', () => {
+    expect(parseDeploymentModes(['multi-node', 'disagg', 'multi-node', 'other'])).toEqual([
+      'multi-node',
+      'disagg',
+    ]);
+  });
+});
+
+describe('computeAvailableQuickFilters', () => {
+  it('reports present values per category in display order', () => {
+    const points = [
+      point({
+        hwKey: 'h100_vllm',
+        framework: 'vllm',
+        disagg: false,
+        is_multinode: false,
+        spec_decoding: 'none',
+      }),
+      point({
+        hwKey: 'gb200_dynamo-trt',
+        framework: 'dynamo-trt',
+        disagg: true,
+        spec_decoding: 'mtp',
+      }),
+      point({
+        hwKey: 'mi355x_atom',
+        framework: 'mooncake-atom',
+        disagg: false,
+        is_multinode: true,
+        spec_decoding: 'none',
+        power_tier: 'certified',
+      }),
+    ];
+    expect(computeAvailableQuickFilters(points)).toMatchObject({
+      vendors: ['NVIDIA', 'AMD'],
+      frameworks: ['vllm', 'trt', 'atom'],
+      deployment: ['single-node', 'multi-node', 'disagg'],
+      spec: ['mtp', 'stp'],
+      power: ['certified'],
+    });
+  });
+
+  it('omits categories/values with no data', () => {
+    const points = [
+      point({ hwKey: 'h100_vllm', framework: 'vllm', disagg: false, spec_decoding: 'none' }),
+    ];
+    expect(computeAvailableQuickFilters(points)).toMatchObject({
+      vendors: ['NVIDIA'],
+      frameworks: ['vllm'],
+      deployment: ['single-node'],
+      spec: ['stp'],
+      power: [],
+    });
+  });
+
+  it('reports exactly the power tiers present, in display order', () => {
+    const legacy = point({ power_tier: 'legacy' });
+    const certified = point({ power_tier: 'certified' });
+    expect(computeAvailableQuickFilters([legacy]).power).toEqual(['legacy']);
+    expect(computeAvailableQuickFilters([certified]).power).toEqual(['certified']);
+    expect(computeAvailableQuickFilters([legacy, certified]).power).toEqual([
+      'certified',
+      'legacy',
+    ]);
+  });
+
+  it('returns all-empty for an empty point set', () => {
+    expect(computeAvailableQuickFilters([])).toEqual({
+      vendors: [],
+      frameworks: [],
+      deployment: [],
+      spec: [],
+      power: [],
+      topologies: [],
+    });
+  });
+});
+
+describe('quickFiltersActive', () => {
+  it('is false only when every category is empty', () => {
+    expect(quickFiltersActive(EMPTY_QUICK_FILTERS)).toBe(false);
+    expect(quickFiltersActive(filters({ vendors: ['AMD'] }))).toBe(true);
+    expect(quickFiltersActive(filters({ frameworks: ['vllm'] }))).toBe(true);
+    expect(quickFiltersActive(filters({ deployment: ['disagg'] }))).toBe(true);
+    expect(quickFiltersActive(filters({ spec: ['mtp'] }))).toBe(true);
+    expect(quickFiltersActive(filters({ power: ['certified'] }))).toBe(true);
+  });
+});
+
+describe('parsePowerTiers', () => {
+  it('keeps known tiers, removes duplicates, and drops unknown values', () => {
+    expect(parsePowerTiers(['certified', 'legacy', 'certified', 'bogus', ''])).toEqual([
+      'certified',
+      'legacy',
+    ]);
+    expect(parsePowerTiers([])).toEqual([]);
+  });
+});
+
+describe('matchesQuickFilters', () => {
+  it('matches everything when no filters are active', () => {
+    expect(matchesQuickFilters(point({ hwKey: 'mi325x_sglang' }), EMPTY_QUICK_FILTERS)).toBe(true);
+  });
+
+  it('filters by vendor', () => {
+    const f = filters({ vendors: ['NVIDIA'] });
+    expect(matchesQuickFilters(point({ hwKey: 'h100_vllm' }), f)).toBe(true);
+    expect(matchesQuickFilters(point({ hwKey: 'mi300x_sglang' }), f)).toBe(false);
+    expect(matchesQuickFilters(point({ hwKey: 'tpuv7_vllm' }), f)).toBe(false);
+  });
+
+  it('filters TPU points under the Google vendor', () => {
+    const f = filters({ vendors: ['Google'] });
+    expect(matchesQuickFilters(point({ hwKey: 'tpuv7_vllm' }), f)).toBe(true);
+    expect(matchesQuickFilters(point({ hwKey: 'h100_vllm' }), f)).toBe(false);
+  });
+
+  it('treats multiple vendors as OR', () => {
+    const f = filters({ vendors: ['NVIDIA', 'AMD'] });
+    expect(matchesQuickFilters(point({ hwKey: 'h100' }), f)).toBe(true);
+    expect(matchesQuickFilters(point({ hwKey: 'mi355x' }), f)).toBe(true);
+  });
+
+  it('filters by framework family', () => {
+    const f = filters({ frameworks: ['trt'] });
+    expect(matchesQuickFilters(point({ framework: 'dynamo-trt' }), f)).toBe(true);
+    expect(matchesQuickFilters(point({ framework: 'trtllm' }), f)).toBe(true);
+    expect(matchesQuickFilters(point({ framework: 'vllm' }), f)).toBe(false);
+    expect(matchesQuickFilters(point({ framework: undefined }), f)).toBe(false);
+  });
+
+  it('keeps single-node, multi-node aggregate, and disaggregated modes distinct', () => {
+    const single = point({ disagg: false, is_multinode: false });
+    const multi = point({ disagg: false, is_multinode: true });
+    const disagg = point({ disagg: true, is_multinode: true });
+
+    expect(pointDeploymentMode(single)).toBe('single-node');
+    expect(pointDeploymentMode(multi)).toBe('multi-node');
+    expect(pointDeploymentMode(disagg)).toBe('disagg');
+    expect(matchesQuickFilters(multi, filters({ deployment: ['multi-node'] }))).toBe(true);
+    expect(matchesQuickFilters(multi, filters({ deployment: ['single-node', 'disagg'] }))).toBe(
+      false,
+    );
+    expect(matchesQuickFilters(point({}), filters({ deployment: ['single-node'] }))).toBe(true);
+  });
+
+  it('filters by spec-decoding via spec_decoding field or _mtp suffix', () => {
+    const mtpFilter = filters({ spec: ['mtp'] });
+    const stpFilter = filters({ spec: ['stp'] });
+    expect(matchesQuickFilters(point({ spec_decoding: 'mtp' }), mtpFilter)).toBe(true);
+    expect(matchesQuickFilters(point({ hwKey: 'h100_vllm_mtp' }), mtpFilter)).toBe(true);
+    expect(matchesQuickFilters(point({ spec_decoding: 'none' }), mtpFilter)).toBe(false);
+    expect(matchesQuickFilters(point({ spec_decoding: 'none' }), stpFilter)).toBe(true);
+    expect(matchesQuickFilters(point({ hwKey: 'h100_vllm' }), stpFilter)).toBe(true);
+  });
+
+  it('filters by measured-power certification tier', () => {
+    const certifiedOnly = filters({ power: ['certified'] });
+    const bothTiers = filters({ power: ['certified', 'legacy'] });
+    const certified = point({ power_tier: 'certified' });
+    const legacy = point({ power_tier: 'legacy' });
+    const tierless = point({});
+
+    expect(matchesQuickFilters(certified, certifiedOnly)).toBe(true);
+    expect(matchesQuickFilters(legacy, certifiedOnly)).toBe(false);
+    expect(matchesQuickFilters(tierless, certifiedOnly)).toBe(false);
+    expect(matchesQuickFilters(certified, bothTiers)).toBe(true);
+    expect(matchesQuickFilters(legacy, bothTiers)).toBe(true);
+    expect(matchesQuickFilters(tierless, bothTiers)).toBe(false);
+    expect(matchesQuickFilters(tierless, EMPTY_QUICK_FILTERS)).toBe(true);
+  });
+
+  it('treats non-standard spec methods (e.g. eagle) as spec-on (MTP), never STP', () => {
+    const eagle = point({ hwKey: 'h200_trt_eagle', spec_decoding: 'eagle' });
+    expect(matchesQuickFilters(eagle, filters({ spec: ['stp'] }))).toBe(false);
+    expect(matchesQuickFilters(eagle, filters({ spec: ['mtp'] }))).toBe(true);
+    expect(matchesQuickFilters(eagle, EMPTY_QUICK_FILTERS)).toBe(true);
+    expect(computeAvailableQuickFilters([eagle]).spec).toEqual(['mtp']);
+  });
+
+  it('ANDs categories together', () => {
+    const f = filters({ vendors: ['AMD'], deployment: ['disagg'], spec: ['stp'] });
+    expect(
+      matchesQuickFilters(
+        point({ hwKey: 'mi300x_sglang', disagg: true, spec_decoding: 'none' }),
+        f,
+      ),
+    ).toBe(true);
+    expect(
+      matchesQuickFilters(point({ hwKey: 'mi300x_sglang', disagg: true, spec_decoding: 'mtp' }), f),
+    ).toBe(false);
+    expect(
+      matchesQuickFilters(point({ hwKey: 'h100_vllm', disagg: true, spec_decoding: 'none' }), f),
+    ).toBe(false);
+  });
+});
+
+describe('applyQuickFilters', () => {
+  it('offers TokenSpeed and filters both official and unofficial points by its family', () => {
+    const official = point({ id: 42, hwKey: 'gb300_tokenspeed_mtp', framework: 'tokenspeed' });
+    const overlay = point({
+      run_url: 'https://github.com/example/actions/runs/2',
+      hwKey: 'gb300_tokenspeed_mtp',
+      framework: 'tokenspeed',
+    });
+    const other = point({ hwKey: 'gb300_sglang_mtp', framework: 'sglang' });
+    const points = [official, overlay, other];
+
+    expect(computeAvailableQuickFilters(points).frameworks).toEqual(['sglang', 'tokenspeed']);
+    expect(applyQuickFilters(points, filters({ frameworks: ['tokenspeed'] }))).toEqual([
+      official,
+      overlay,
+    ]);
+  });
+
+  const data = [
+    point({ hwKey: 'h100_vllm', disagg: false, spec_decoding: 'none' }),
+    point({ hwKey: 'h100_vllm_mtp', disagg: false, spec_decoding: 'mtp' }),
+    point({ hwKey: 'mi300x_sglang', disagg: true, spec_decoding: 'none' }),
+  ];
+
+  it('returns the same array reference when nothing is selected', () => {
+    expect(applyQuickFilters(data, EMPTY_QUICK_FILTERS)).toBe(data);
+  });
+
+  it('narrows the list to matching points', () => {
+    const result = applyQuickFilters(data, filters({ vendors: ['NVIDIA'], spec: ['stp'] }));
+    expect(result.map((d) => d.hwKey)).toEqual(['h100_vllm']);
+  });
+
+  it('applies the same deployment classification to unofficial overlay points', () => {
+    const official = point({
+      id: 42,
+      hwKey: 'b200_dynamo-vllm',
+      disagg: false,
+      is_multinode: false,
+    });
+    const overlay = point({
+      id: undefined,
+      run_url: 'https://github.com/example/actions/runs/1',
+      hwKey: 'b200_dynamo-vllm',
+      disagg: false,
+      is_multinode: true,
+    });
+
+    expect(applyQuickFilters([official, overlay], filters({ deployment: ['multi-node'] }))).toEqual(
+      [overlay],
+    );
+  });
+
+  it('filters agentic unofficial overlays by the options exposed in the UI', () => {
+    const official = point({
+      id: 42,
+      benchmark_type: 'agentic_traces',
+      hwKey: 'b200_vllm_mtp',
+      framework: 'vllm',
+      spec_decoding: 'mtp',
+    });
+    const overlay = point({
+      id: undefined,
+      benchmark_type: 'agentic_traces',
+      run_url: 'https://github.com/example/actions/runs/2',
+      hwKey: 'mi300x_sglang_mtp',
+      framework: 'sglang',
+      spec_decoding: 'mtp',
+    });
+
+    expect(
+      applyQuickFilters([official, overlay], filters({ vendors: ['AMD'], frameworks: ['sglang'] })),
+    ).toEqual([overlay]);
+  });
+});

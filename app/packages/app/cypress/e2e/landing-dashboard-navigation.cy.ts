@@ -1,0 +1,489 @@
+import type { AvailabilityRow } from '@/lib/api/api';
+
+import { availabilityBody } from '../support/e2e';
+import { vrPublicationRows } from '../support/vr-publication-fixtures';
+import {
+  interceptPreviewSnapshots,
+  previewAvailability,
+} from '../support/preview-snapshot-fixtures';
+import {
+  assertTpuGb300Selected,
+  interceptTpuLaunchData,
+  tpuLaunchRows,
+} from '../support/tpu-launch-fixtures';
+
+const minimaxM3RubinRows = vrPublicationRows.map((row) => ({ ...row, model: 'minimaxm3' }));
+
+function interceptMinimaxM3RubinData(
+  rows: typeof minimaxM3RubinRows = minimaxM3RubinRows,
+  extraAvailability: readonly AvailabilityRow[] = [],
+): void {
+  cy.fixture<AvailabilityRow[]>('api/availability.json').then((availability) => {
+    cy.intercept('GET', '/api/v1/availability/compact', {
+      body: availabilityBody([
+        ...availability.filter((row) => row.model !== 'minimaxm3'),
+        ...rows.map(({ metrics: _metrics, ...row }) => row),
+        ...extraAvailability,
+      ]),
+    });
+  });
+  cy.intercept('GET', '/api/v1/benchmarks*', (request) => {
+    if (String(request.query.model).includes('MiniMax-M3')) {
+      request.reply({ body: rows });
+    }
+  });
+}
+
+const TARGET = '/infx/inference/kimi-k31-pro';
+
+describe('Muse Spark Open results', () => {
+  beforeEach(() => {
+    cy.fixture('api/muse-spark-unofficial-run.json').then((body) => {
+      cy.intercept('GET', '/api/unofficial-run*', { body }).as('museRun');
+    });
+  });
+  for (const prefix of ['', '/zh']) {
+    it(`opens the canonical Muse dashboard from ${prefix}/compare with the Meta logo`, () => {
+      cy.visit(`${prefix}/compare`);
+      cy.get('[data-testid="compare-agentx-model-muse-spark-open"]')
+        .should('contain.text', prefix ? '查看结果' : 'View results')
+        .and('not.contain.text', prefix ? '预览' : 'Preview')
+        .find('img')
+        .should('have.attr', 'src', '/logos/meta-color.svg');
+      cy.get('[data-testid="compare-agentx-model-muse-spark-open"]').should(
+        'have.attr',
+        'href',
+        `${prefix}/infx/inference/muse-spark-open`,
+      );
+      cy.get('[data-testid="compare-agentx-model-muse-spark-open"]').click();
+      cy.location('pathname').should('eq', `${prefix}/infx/inference/muse-spark-open`);
+      cy.location('search').should('eq', '');
+      cy.get('[data-testid="model-selector"]').should('contain.text', 'Muse Spark 1.3/Open 816B');
+      cy.get('[data-testid="model-selector"] img').should(
+        'have.attr',
+        'src',
+        '/logos/meta-color.svg',
+      );
+      cy.title().should('contain', 'Muse Spark 1.3/Open');
+      cy.get('[data-testid="scenario-selector"]').should('not.exist');
+      cy.get('[data-slot="unofficial-banner"]').should('not.exist');
+      cy.get('@museRun.all').should('have.length', 0);
+    });
+
+    it(`still opens an explicitly requested Muse unofficial run under ${prefix || '/'}`, () => {
+      cy.visit(`${prefix}/infx/inference/muse-spark-open?unofficialRun=38825822770`);
+      cy.wait('@museRun');
+      cy.location('search').should('match', /unofficialruns?=38825822770/iu);
+      cy.get('[data-testid="model-selector"]')
+        .should('contain.text', 'Muse Spark 1.3/Open 816B')
+        .find('img')
+        .should('have.attr', 'src', '/logos/meta-color.svg');
+      cy.get('[data-testid="scatter-graph"] .unofficial-overlay-pt').should(
+        'have.length.greaterThan',
+        0,
+      );
+      cy.get('[data-slot="unofficial-banner"]').should('be.visible');
+    });
+  }
+});
+
+interface HistoryWrite {
+  kind: 'push' | 'replace';
+  pathname: string;
+}
+
+const TPU_RESULTS_HREF =
+  '/infx/inference/qwen-3-5?g_model=Qwen-3.5-397B-A17B&i_xmode=interactivity&i_seq=agentic-traces&i_prec=fp8';
+const TPU_KIMI_RESULTS_HREF = '/infx/inference/kimi-k3';
+
+function assertTpuView() {
+  cy.get('[data-testid="model-selector"]').should('contain.text', 'Qwen3.5 397B');
+  cy.get('[data-testid="scenario-selector"]')
+    .invoke('text')
+    .should('match', /Agentic|智能体/u);
+  cy.get('[data-testid="precision-multiselect"]')
+    .should('contain.text', 'FP8')
+    .and('not.contain.text', 'FP4');
+  cy.get('[data-testid="x-axis-mode-selector"]').should('have.attr', 'data-value', 'interactivity');
+  cy.location('search').should('contain', 'i_prec=fp8');
+  cy.location('search').should('not.contain', 'i_spec=');
+  assertTpuGb300Selected();
+}
+
+function assertKimiTpuView() {
+  cy.get('[data-testid="model-selector"]').should('contain.text', 'Kimi K3');
+  cy.get('[data-testid="scenario-selector"]').should('not.exist');
+  cy.location('search').should('eq', '');
+}
+
+describe('landing model curation', () => {
+  for (const prefix of ['', '/zh']) {
+    it(`shows the curated ledger on ${prefix || '/'} without changing compare coverage`, () => {
+      cy.visit(prefix || '/');
+      cy.get('[data-testid="compare-agentx-primary"]').within(() => {
+        cy.get('[data-testid^="compare-agentx-model-"]').should(($links) => {
+          expect([...$links].map((link) => link.getAttribute('href'))).to.deep.eq(
+            ['kimi-k31-pro', 'deepseek-v41-flash'].map(
+              (slug) => `${prefix}/infx/inference/${slug}`,
+            ),
+          );
+        });
+        cy.get('[data-testid="compare-agentx-model-kimi-k31-pro"]')
+          .should('contain.text', 'Kimi K3.1 Pro')
+          .and('contain.text', 'AgentX')
+          .and('contain.text', prefix ? '查看结果' : 'View results')
+          .find('img')
+          .should('have.attr', 'src', '/logos/kimi-color.svg');
+        cy.get('[data-new-badge="agentx-ledger"]').should('not.exist');
+        cy.get('[data-testid="compare-agentx-model-muse-spark-open"]').should('not.exist');
+        cy.get('[data-testid="compare-agentx-model-kimi-k3"]').should('not.exist');
+        cy.get('[data-testid="compare-agentx-model-glm-5-3"]').should('not.exist');
+        cy.get('[data-testid="compare-agentx-model-deepseek-v4"]').should('not.exist');
+        cy.get('[data-testid="compare-agentx-model-qwen-3-8-flash-next"]').should('not.exist');
+        cy.get('[data-testid="compare-agentx-model-qwen-3-5"]').should('not.exist');
+        cy.get('[data-testid="compare-agentx-model-minimax-m3"]').should('not.exist');
+        cy.get('[data-testid="landing-huawei-results-link"]')
+          .should('match', ':first-child')
+          .and('have.attr', 'href', `${prefix}/ubx/core-memory-profiles`)
+          .next()
+          .should('have.attr', 'data-testid', 'landing-tpu-kimi-k3-results-link')
+          .parent()
+          .next('nav')
+          .find('[data-testid^="compare-agentx-model-"]')
+          .first()
+          .should('have.attr', 'data-testid', 'compare-agentx-model-kimi-k31-pro');
+        cy.get('[data-testid="landing-minimax-m31-flash-results-link"]')
+          .should('contain.text', 'MiniMax M3.1 Flash')
+          .and('contain.text', 'AgentX')
+          .and('have.attr', 'href', `${prefix}/infx/inference/minimax-m31-flash`);
+        cy.get('[data-new-badge="landing-minimax-m31-flash"]').should('not.exist');
+        cy.get('[data-testid="landing-huawei-results-link"]')
+          .find('[data-new-badge="landing-huawei"]')
+          .should('contain.text', prefix ? '新' : 'New')
+          .and('have.class', 'new-badge-flash');
+        cy.get('[data-testid="landing-minimax-m31-flash-minimax-logo"]').should(
+          'have.attr',
+          'src',
+          '/logos/minimax-color.svg',
+        );
+        cy.get('[data-testid="landing-tpu-kimi-k3-results-link"]')
+          .should('have.attr', 'href', `${prefix}${TPU_KIMI_RESULTS_HREF}`)
+          .and('contain.text', 'Google TPU')
+          .and(
+            'contain.text',
+            prefix ? 'Kimi K3 · 2.8 万亿参数 · AgentX' : 'Kimi K3 · 2.8T parameters · AgentX',
+          );
+        cy.get('[data-testid="landing-tpu-kimi-k3-google-logo"] path').should('have.length', 4);
+        cy.get('[data-new-badge="landing-tpu-kimi-k3"]')
+          .should('contain.text', prefix ? '新' : 'New')
+          .and('have.class', 'new-badge-flash');
+        cy.get('[data-testid="landing-tpu-kimi-k3-results-link"]')
+          .next()
+          .should('have.attr', 'data-testid', 'landing-rubin-glm-5-3-results-link')
+          .and('have.attr', 'href', `${prefix}/infx/inference/glm-5-3`)
+          .and('contain.text', 'Vera Rubin NVL72')
+          .and(
+            'contain.text',
+            prefix ? 'GLM 5.3 · 7440 亿参数 · AgentX' : 'GLM 5.3 · 744B parameters · AgentX',
+          );
+        cy.get('[data-testid="landing-rubin-glm-5-3-nvidia-logo"] path').should(
+          'have.attr',
+          'fill',
+          '#76B900',
+        );
+        cy.get('[data-testid="landing-rubin-results-link"]').should('not.exist');
+        cy.get('[data-testid="landing-rubin-glm-5-3-results-link"]')
+          .next()
+          .should('have.attr', 'data-testid', 'landing-jalapeno-results-link')
+          .and(
+            'have.attr',
+            'href',
+            `${prefix}/infx/inference/deepseek-r1?i_seq=8k%2F1k&i_prec=fp4&i_xmode=e2e`,
+          )
+          .and('contain.text', 'OpenAI Jalapeño')
+          .and('contain.text', 'DeepSeek R1');
+        cy.get('[data-testid="landing-jalapeno-openai-logo"] path').should(
+          'have.attr',
+          'fill',
+          'currentColor',
+        );
+        cy.get('[data-testid="landing-jalapeno-results-link"]')
+          .next()
+          .should('have.attr', 'data-testid', 'landing-minimax-m31-flash-results-link');
+        cy.get('[data-testid="landing-minimax-m31-flash-results-link"]')
+          .parent()
+          .next('nav')
+          .find('[data-testid^="compare-agentx-model-"]')
+          .first()
+          .should('have.attr', 'data-testid', 'compare-agentx-model-kimi-k31-pro');
+      });
+
+      cy.visit(`${prefix}/compare`);
+      cy.get('[data-testid="compare-agentx-primary"]').within(() => {
+        cy.get('[data-testid="landing-minimax-m31-flash-results-link"]').should('not.exist');
+        cy.get('[data-testid="landing-tpu-kimi-k3-results-link"]').should('not.exist');
+        cy.get('[data-testid="landing-rubin-glm-5-3-results-link"]').should('not.exist');
+        cy.get('[data-testid="landing-rubin-results-link"]').should('not.exist');
+        cy.get('[data-testid="landing-jalapeno-results-link"]').should('not.exist');
+        cy.get('[data-testid^="compare-agentx-model-"]').should('have.length', 9);
+        for (const slug of [
+          'kimi-k31-pro',
+          'muse-spark-open',
+          'deepseek-v4',
+          'qwen-3-8-flash-next',
+          'qwen-3-5',
+          'minimax-m3',
+        ]) {
+          cy.get(`[data-testid="compare-agentx-model-${slug}"]`).should(
+            'have.attr',
+            'href',
+            `${prefix}/infx/inference/${slug}`,
+          );
+        }
+      });
+    });
+
+    it(`opens MiniMax M3.1 Flash AgentX results from ${prefix || '/'} and retains them on reload`, () => {
+      cy.visit(prefix || '/');
+      cy.get('[data-testid="landing-minimax-m31-flash-results-link"]').click();
+      cy.location('pathname').should('eq', `${prefix}/infx/inference/minimax-m31-flash`);
+      cy.get('[data-testid="model-selector"]')
+        .invoke('text')
+        .should('match', /MiniMax[- ]M3\.1[- ]Flash/u);
+      cy.get('[data-testid="scenario-selector"]')
+        .invoke('text')
+        .should('match', /Agentic|智能体/u);
+      cy.reload();
+      cy.location('pathname').should('eq', `${prefix}/infx/inference/minimax-m31-flash`);
+      cy.get('[data-testid="model-selector"]')
+        .invoke('text')
+        .should('match', /MiniMax[- ]M3\.1[- ]Flash/u);
+    });
+
+    it(`opens Kimi K3.1 Pro AgentX results from ${prefix || '/'} and retains them on reload`, () => {
+      cy.visit(prefix || '/');
+      cy.get('[data-testid="compare-agentx-model-kimi-k31-pro"]').click();
+      cy.location('pathname').should('eq', `${prefix}/infx/inference/kimi-k31-pro`);
+      cy.get('[data-testid="model-selector"]')
+        .invoke('text')
+        .should('match', /Kimi[- ]K3\.1[- ]Pro/u);
+      cy.reload();
+      cy.location('pathname').should('eq', `${prefix}/infx/inference/kimi-k31-pro`);
+      cy.get('[data-testid="model-selector"]')
+        .invoke('text')
+        .should('match', /Kimi[- ]K3\.1[- ]Pro/u);
+    });
+
+    it(`opens Kimi K3 AgentX TPU results from ${prefix || '/'} and retains them on reload`, () => {
+      interceptTpuLaunchData('Kimi-K3');
+      cy.visit(prefix || '/');
+      cy.get('[data-testid="landing-tpu-kimi-k3-results-link"]').click();
+      cy.location('pathname').should('eq', `${prefix}/infx/inference/kimi-k3`);
+      assertKimiTpuView();
+      cy.reload();
+      assertKimiTpuView();
+      cy.go('back');
+      cy.location('pathname').should('eq', prefix || '/');
+    });
+
+    it(`opens GLM 5.3 Rubin AgentX results from ${prefix || '/'}`, () => {
+      const rows = vrPublicationRows.map((row) => ({ ...row, model: 'glm5.2' }));
+      cy.intercept('GET', '/api/v1/availability/compact', {
+        body: availabilityBody(rows.map(({ metrics: _metrics, ...row }) => row)),
+      });
+      cy.intercept('GET', '/api/v1/benchmarks*', { body: rows });
+      cy.visit(prefix || '/');
+      cy.get('[data-testid="landing-rubin-glm-5-3-results-link"]').click();
+      cy.location('pathname').should('eq', `${prefix}/infx/inference/glm-5-3`);
+      cy.get('[data-testid="model-selector"]').should('contain.text', 'GLM5.3');
+      cy.get('[data-testid="scenario-selector"]').should('not.exist');
+      cy.get('[data-testid="chart-legend"]').should('contain.text', 'Vera Rubin NVL72');
+      cy.reload();
+      cy.location('pathname').should('eq', `${prefix}/infx/inference/glm-5-3`);
+      cy.get('[data-testid="model-selector"]').should('contain.text', 'GLM5.3');
+      cy.get('[data-testid="chart-legend"]').should('contain.text', 'Vera Rubin NVL72');
+      cy.go('back');
+      cy.location('pathname').should('eq', prefix || '/');
+    });
+
+    it(`opens MiniMax M3 Rubin AgentX results from ${prefix}/compare`, () => {
+      interceptMinimaxM3RubinData();
+      cy.visit(`${prefix}/compare`);
+      cy.get('[data-testid="compare-agentx-model-minimax-m3"]').click();
+      cy.location('pathname').should('eq', `${prefix}/infx/inference/minimax-m3`);
+      cy.location('search').should('not.contain', 'i_spec=');
+      cy.get('[data-testid^="remove-filter-spec-"]').should('not.exist');
+      cy.get('[data-testid="scenario-selector"]').should('not.exist');
+      cy.get('[data-testid="chart-legend"]').should('contain.text', 'Vera Rubin NVL72');
+      cy.reload();
+      cy.get('[data-testid="chart-legend"]').should('contain.text', 'Vera Rubin NVL72');
+      cy.location('search').should('not.contain', 'i_spec=');
+      cy.get('[data-testid^="remove-filter-spec-"]').should('not.exist');
+      cy.go('back');
+      cy.location('pathname').should('eq', `${prefix}/compare`);
+    });
+
+    it(`opens Jalapeño R1 results from ${prefix || '/'}`, () => {
+      interceptPreviewSnapshots({ overFixtures: true });
+      cy.visit(prefix || '/');
+      cy.get('[data-testid="landing-jalapeno-results-link"]').click();
+      cy.location('pathname').should('eq', `${prefix}/infx/inference/deepseek-r1`);
+      cy.get('[data-testid="scenario-selector"]').should('contain.text', '8K / 1K');
+      cy.get('[data-testid="precision-multiselect"]').should('contain.text', 'FP4');
+      cy.get('[data-testid="x-axis-mode-selector"]').should('have.attr', 'data-value', 'e2e');
+      cy.location('search').should('not.contain', 'i_spec=');
+      cy.get('[data-testid^="remove-filter-spec-"]').should('not.exist');
+      cy.get('[data-testid="chart-legend"]').should('contain.text', 'Jalapeño');
+      cy.reload();
+      cy.get('[data-testid="x-axis-mode-selector"]').should('have.attr', 'data-value', 'e2e');
+      cy.location('search').should('not.contain', 'i_spec=');
+      cy.get('[data-testid^="remove-filter-spec-"]').should('not.exist');
+      cy.get('[data-testid="chart-legend"]').should('contain.text', 'Jalapeño');
+    });
+  }
+
+  it('keeps the Qwen3.5 AgentX TPU deep link working on /', () => {
+    interceptTpuLaunchData();
+    cy.visit(TPU_RESULTS_HREF);
+    cy.location('pathname').should('eq', '/infx/inference/qwen-3-5');
+    assertTpuView();
+    cy.reload();
+    assertTpuView();
+  });
+
+  it('does not carry TPU precision through Back into Rubin on /compare', () => {
+    const rubinRows = [
+      ...minimaxM3RubinRows,
+      ...minimaxM3RubinRows
+        .filter((row) => row.hardware === 'vr200')
+        .map((row) => ({
+          ...row,
+          id: row.id + 1000,
+          hardware: 'h200',
+          precision: 'fp8',
+        })),
+    ];
+    interceptPreviewSnapshots();
+    interceptTpuLaunchData();
+    interceptMinimaxM3RubinData(rubinRows, [
+      ...tpuLaunchRows().map(({ metrics: _metrics, ...row }) => row),
+      ...previewAvailability,
+    ]);
+    cy.visit('/compare');
+    cy.visit(TPU_RESULTS_HREF);
+    assertTpuView();
+    cy.go('back');
+    cy.location('pathname').should('eq', '/compare');
+    cy.get('[data-testid="compare-agentx-model-minimax-m3"]').click();
+    cy.get('[data-testid="precision-multiselect"]')
+      .should('contain.text', 'FP4')
+      .and('contain.text', 'FP8');
+    cy.get('[data-testid="chart-legend"]').should('contain.text', 'Vera Rubin NVL72');
+    cy.reload();
+    cy.get('[data-testid="chart-legend"]').should('contain.text', 'Vera Rubin NVL72');
+    cy.go('back');
+    cy.location('pathname').should('eq', '/compare');
+    cy.visit('/');
+    cy.get('[data-testid="landing-jalapeno-results-link"]').click();
+    cy.get('[data-testid="precision-multiselect"]').should('contain.text', 'FP4');
+    cy.get('[data-testid^="remove-filter-spec-"]').should('not.exist');
+    cy.get('[data-testid="chart-legend"]').should('contain.text', 'Jalapeño');
+  });
+});
+
+describe('landing → full dashboard navigation', () => {
+  const isChromium = Cypress.browser.family === 'chromium';
+
+  const setReducedMotion = (value: string) =>
+    isChromium
+      ? Cypress.automation('remote:debugger:protocol', {
+          command: 'Emulation.setEmulatedMedia',
+          params: { features: [{ name: 'prefers-reduced-motion', value }] },
+        })
+      : Promise.resolve();
+
+  before(() => {
+    cy.wrap(null).then(() => setReducedMotion('no-preference'));
+  });
+
+  after(() => {
+    cy.wrap(null).then(() => setReducedMotion(''));
+  });
+
+  it('commits exactly one navigation and one history entry on a cold dashboard load', () => {
+    const writes: HistoryWrite[] = [];
+
+    cy.intercept({ url: /\/infx\/inference\/kimi-k31-pro/ }, (req) => {
+      if (req.headers['next-router-prefetch']) {
+        req.reply({ statusCode: 404, body: '' });
+        return;
+      }
+      req.on('response', (res) => {
+        res.setDelay(800);
+      });
+    });
+
+    cy.visit('/', {
+      onBeforeLoad(win) {
+        win.localStorage.setItem('inferencex-star-modal-dismissed', String(Date.now()));
+        const origPush = win.history.pushState.bind(win.history);
+        const origReplace = win.history.replaceState.bind(win.history);
+        const pathnameOf = (url: unknown) =>
+          new URL(String(url ?? win.location.href), win.location.origin).pathname;
+        win.history.pushState = function (data, unused, url) {
+          writes.push({ kind: 'push', pathname: pathnameOf(url) });
+          return origPush(data, unused, url as string);
+        };
+        win.history.replaceState = function (data, unused, url) {
+          writes.push({ kind: 'replace', pathname: pathnameOf(url) });
+          return origReplace(data, unused, url as string);
+        };
+      },
+    });
+
+    cy.window().then((win) => {
+      expect(
+        win.matchMedia('(prefers-reduced-motion: reduce)').matches,
+        'prefers-reduced-motion: reduce',
+      ).to.eq(false);
+    });
+
+    cy.get('[data-testid="compare-agentx-dashboard-link"]').should('be.visible');
+    // eslint-disable-next-line cypress/no-unnecessary-waiting
+    cy.wait(1500);
+
+    cy.window().then((win) => {
+      cy.wrap(win.history.length).as('historyLenBefore');
+    });
+
+    cy.get('[data-testid="compare-agentx-dashboard-link"]').click();
+    cy.location('pathname').should('eq', TARGET);
+
+    // eslint-disable-next-line cypress/no-unnecessary-waiting
+    cy.wait(1000);
+
+    cy.location('pathname').should('eq', TARGET);
+    cy.then(() => {
+      const commits = writes.filter((w) => w.kind === 'push' && w.pathname === TARGET);
+      expect(commits.length, 'router commits to the dashboard').to.eq(1);
+
+      const firstCommit = writes.findIndex((w) => w.kind === 'push' && w.pathname === TARGET);
+      const revertsAfterCommit = writes.slice(firstCommit + 1).filter((w) => w.pathname === '/');
+      expect(
+        revertsAfterCommit,
+        'URL rewrites back to the landing page after the commit',
+      ).to.deep.eq([]);
+    });
+    cy.window().then(function (win) {
+      expect(win.history.length, 'exactly one new history entry').to.eq(
+        Number(this.historyLenBefore) + 1,
+      );
+    });
+
+    cy.go('back');
+    cy.location('pathname').should('eq', '/');
+    cy.get('[data-testid="compare-agentx-dashboard-link"]').should('be.visible');
+    cy.go('forward');
+    cy.location('pathname').should('eq', TARGET);
+  });
+});

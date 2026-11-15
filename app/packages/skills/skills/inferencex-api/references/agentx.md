@@ -1,0 +1,510 @@
+# AgentX cookbook
+
+## Benchmark your own hardware
+
+Share [the AgentX quickstart](https://inferencex.semianalysis.com/infx/agentx/quickstart)
+([简体中文](https://inferencex.semianalysis.com/zh/infx/agentx/quickstart)).
+Use Python 3.11–3.13. Start an OpenAI-compatible streaming
+chat-completions server, then set `HUGGINGFACE_MODEL_NAME` and `CONC_SESSIONS`
+for your deployment:
+
+```bash
+pip install 'agentx-harness==1.0.14'
+
+export HUGGINGFACE_MODEL_NAME="org/model"
+export CONC_SESSIONS=16
+
+agentx profile \
+  --url "http://127.0.0.1:8000" --endpoint /v1/chat/completions \
+  --model "$HUGGINGFACE_MODEL_NAME" --tokenizer "$HUGGINGFACE_MODEL_NAME" \
+  --tokenizer-trust-remote-code \
+  --concurrency "$CONC_SESSIONS" \
+  --public-dataset "semianalysis_cc_traces_weka_062126" \
+  --output-artifact-dir "output_dir_results"
+```
+
+Replace the URL as needed. `agentx profile` selects the AgentX scenario
+automatically. If the server uses an alias, change `--model` but retain the
+matching Hugging Face tokenizer. Only trust remote tokenizer code from a
+repository you trust; omit that flag when custom code is unnecessary.
+Concurrency counts session trees, not individual in-flight requests.
+
+Optionally export these in the same shell before running the benchmark:
+
+```bash
+# Adds X-Dynamo-Session-ID; subagents also get X-Dynamo-Parent-Session-ID.
+# Only this option sends the parent ID, preserving forked-agent lineage.
+export AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=true
+# Also sends X-Session-ID, if a front-end router needs it.
+export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
+```
+
+`X-Session-ID` alone does not send the parent ID. Inspect errors and
+`submission_valid` in the output artifacts, retain the server configuration,
+and follow the methodology before comparing hardware. This CLI runs against
+your server; it does not publish results to InferenceX or add a read-only API
+operation.
+
+## Read published benchmark results
+
+GLM-5.3-Flash uses display model `GLM-5.3-Flash`, raw DB key `glm5.3flash`,
+and dashboard route `/infx/inference/glm-5-3-flash` (also under `/zh`). Use
+`model=GLM-5.3-Flash&sequence=agentic-traces` for the inference view. Native
+`zai-org/GLM-5.3-Flash` and `nvidia/GLM-5.3-Flash-NVFP4` observations share
+this model bucket; precision remains a separate field. Registration does not
+publish experimental runs or establish hardware qualification. Preserve empty
+responses, and never substitute the older GLM-5.2/5.3 bucket. The future
+`OneNexus/GLM-5.3-Flash-MXFP4` checkpoint is not registered as a qualified
+benchmark target; `OneNexus/GLM-5.3-MXFP4` is a different, non-Flash checkpoint.
+Parameter counts, weights-publication date, OpenRouter ID and API list pricing
+remain unverified and are not inherited from GLM-5.3.
+
+The dashboard exposes this model only after its existing UI feature gate is
+enabled. This is a presentation flag, not authorization: read-only API model
+parameters, raw identities and returned data are unaffected. An unofficial
+run does not unlock the UI. Public model discovery omits Flash by default.
+
+For interactivity comparisons and performance-over-time charts, first read
+[AgentX P90 interactivity](agentic-interactivity.md). The dashboard operating point
+uses reciprocal P90 full-response ITL, not the median or P90 of token rates.
+
+Muse Spark 1.3/Open is the UI label (with an `816B` suffix where sizes are shown).
+The measured checkpoints remain Open, not Meta's hosted Muse Spark 1.3 service.
+It uses API display-model identifier `Muse-Spark-Open`, raw DB key
+`musespark`, and dashboard route `/infx/inference/muse-spark-open` (also under `/zh`).
+Use `model=Muse-Spark-Open` for benchmark reads and the inference view API,
+with `sequence=agentic-traces` for the latter. Comparison results links open the
+canonical dashboard without an `unofficialRun` parameter.
+Unofficial runs remain available through explicitly supplied overlay links; they
+do not populate the published benchmark API. Preserve empty API responses as no
+published data; do not substitute another model.
+
+MiniMax M3.1 Flash uses display model `MiniMax-M3.1-Flash`, raw DB key
+`minimaxm31flash`, and dashboard route `/infx/inference/minimax-m31-flash` (also under
+`/zh`). It is benchmarked on AgentX only, with the checkpoint's built-in DSpark
+drafter, which the API reports as spec method `mtp`. Use
+`model=MiniMax-M3.1-Flash` for benchmark reads and the inference view API, with
+`sequence=agentic-traces` for the latter. Its rows never fall back to `MiniMax-M3`.
+
+Installed raw recipes use `scripts/capture-response.mjs`, which applies the shared
+request-header helper for version attribution. Set `INFERENCEX_TELEMETRY=0` or
+`DO_NOT_TRACK=1` to omit attribution; use `INFERENCEX_TRAFFIC=validation` for demos
+and acceptance checks. See [request usage](cli.md#request-usage) for the captured
+fields. Standalone copies of older inline recipes without that helper send no
+attribution.
+
+AgentX observations measure serving-system performance under concurrent,
+closed-loop agent clients. `conc` is the number of clients that issue their next
+request after the previous response; it is not a fixed request batch. Report
+throughput together with TTFT and interactivity rather than treating one metric as
+a complete result. P75 and p90 E2E Normalized Interactivity are slow-tail
+`1 / pXX(E2EL / OSL)`, in `tok/s/user`; they are not percentiles of per-request
+rates.
+
+The benchmark read is stable, while the current AgentX diagnostic operations are
+beta. Read the live OpenAPI document once per task and use the fetched contract for
+that task.
+
+Establish the replay dataset and configuration identity before comparing points.
+Match the supplied dataset slug, model, hardware, framework, precision, topology,
+offload mode, concurrency, image, observation, producer, and snapshot identities.
+Do not infer values that the response omits. Closed-loop systems can progress
+through different requests during the same run window, so workload mix can drift,
+especially at low concurrency. If identity cannot be confirmed, describe the
+comparison as incomplete.
+In configuration tables, report `disagg`, `num_prefill_gpu`, and `num_decode_gpu`
+as separate source fields. With `disagg: false`, the roles can share the same GPU
+pool: prefill 8 and decode 8 do not establish a 16-GPU deployment. A deployment
+total requires verified allocation semantics; do not unconditionally sum the role
+counts. See the [topology guidance](powerx.md#export-and-provenance) when a
+user requests a derived total.
+For optional-field statistics needed by the requested analysis, count distinct
+known values separately from missing or null rows. Report both populations and
+keep a returned zero as a known value.
+
+Keep each aggregate group's `n` with that group. Equal numbers of non-null benchmark
+rows do not imply equal sample counts or sample-size ranges; compute and label
+those statistics separately for each group.
+
+For a queried, supported result ID, omission from a successful complete
+trace-availability response confirms **no stored trace** in that snapshot. The
+export records `status: no_stored_trace`, `value: false`, and
+`response_key_present: false`; this is not unknown availability. Keep it separate
+from nullable aggregates or an unsupported ID that was not queried.
+
+For a replayable contract 1 summary bundle:
+
+```bash
+mkdir -p evidence
+node .agents/skills/inferencex-api/scripts/inferencex.mjs agentx export \
+  --model DeepSeek-V4-Pro --hardware b300 --output-dir evidence/agentx \
+  --require-hardware b300
+```
+
+A valid empty selection exits 0; the explicit hardware predicate commits that
+bundle and exits 3 when no usable b300 summary exists. See the
+[CLI contract](cli.md) for exit and verification handling.
+
+This workflow reads existing observations and runs no new benchmark. AgentX does
+not evaluate model answer quality. If AgentX rows contain power fields, interpret
+them with the [PowerX validity and unit guidance](powerx.md): do not automatically
+apply `strictV2`, turn missing measurements into zero, mix per-GPU watts with
+whole-deployment energy, or rank energy.
+
+## Start with AgentX
+
+First discover the replay data using the installed
+[dataset cookbook](public-api-examples.md#dataset-discovery-and-conversation-inspection),
+then export available AgentX observations. Start with this request:
+
+> On InferenceX, list the available replay datasets and their exact slugs. Then
+> export the latest available AgentX summaries for DeepSeek-V4-Pro, raw model
+> dsv4, as JSON with the complete response evidence. Show up to five result IDs
+> with their actual measurement dates, hardware, configuration and trace
+> availability. Report the matching count before sampling. Explain which replay
+> dataset identities the responses establish and which are unknown.
+
+A dataset catalog entry alone does not prove that a benchmark used that dataset.
+Keep the exact returned slug and confirm the association from the selected
+observation's public metadata before comparing replay workloads. The summary
+exporter has no dataset filter; preserve unknown associations instead of selecting
+by a guessed name. A selected point's `benchmark_siblings.sku.dataset_slug` does
+not establish a dataset association for every sibling or exported row.
+
+From the project root, the equivalent summary export is:
+
+```bash
+mkdir -p evidence
+node .agents/skills/inferencex-api/scripts/inferencex.mjs agentx export \
+  --model DeepSeek-V4-Pro --raw-model dsv4 --format json \
+  --output-dir evidence/agentx
+```
+
+For Claude Code, replace `.agents/skills` with `.claude/skills`. Use a fresh evidence
+directory. The user then chooses one result ID from the output and asks (replace
+`<result ID>` with that exact ID):
+
+> Inspect AgentX result <result ID>. Check its trace availability first. If the
+> trace exists, summarize that point's request timeline, latency distributions
+> and server metrics. Preserve the dataset and configuration identity and
+> explain any missing information. Keep the original response evidence.
+
+Follow [the selected-point recipe](#diagnose-one-explicitly-selected-point) below.
+It keeps diagnostics on that result and stops when trace availability is absent.
+If no exported result advertises a trace, retain that outcome without scanning
+other points. These diagnostics describe replay serving performance, not answer
+quality, and do not create a new benchmark run.
+
+## Export AgentX summaries
+
+`inferencex agentx export` reads the complete benchmark response, selects AgentX
+observations, and joins only the bounded summary enrichments. A display model is
+required; `--date` adds an as-of cutoff, `--raw-model` selects one exact returned
+model key, and JSON is the default. Add `--format csv` when needed.
+
+Optional `--hardware`, `--framework`, `--precision`, `--spec-method`,
+`--offload-mode`, and `--concurrency` filters use exact, case-sensitive returned
+values. Concurrency must be a positive integer. No aliases or fuzzy matching are
+applied. Metadata marks every filter as applied or omitted and lists values present
+in the returned AgentX rows so an empty exact selection can be diagnosed without
+making claims about jobs or artifacts outside that response.
+
+The new `--output-dir` is the evidence bundle. It contains every decoded response,
+the result, and a manifest linking their hashes and request attempts.
+
+JSON retains every selected benchmark object separately from its `agentx`
+enrichment. CSV uses fixed columns and repeats package, request, and filter context
+on every row. The `metrics_json` cell contains the JSON-encoded `metrics` object,
+including any nested arrays or objects. Parse the CSV with a CSV parser first,
+then use `JSON.parse(row.metrics_json)` to read its metrics. Ordinary CSV cells are
+blank for missing or null values; within `metrics_json`, explicit `null` values
+and absent keys remain distinct. Real zero and `false` values remain explicit in
+both. JSON metadata and each populated CSV row record request, filter, and
+retrieval context; `manifest.json`
+always records normalized arguments, the request ledger, result hash, coverage,
+and policy, including for a header-only CSV. In JSON, `no_agentx_rows` means the
+complete benchmark response contained no AgentX observations;
+`no_matching_rows` means exact local filters excluded the returned AgentX
+observations. A header-only CSV does not encode that distinction in a data row;
+validate the bundle with `inferencex verify`, then inspect the saved benchmark
+response. Neither outcome says whether other benchmark jobs, failed runs, source
+artifacts, or data outside that response exist.
+
+### Read the enrichment and coverage states
+
+The status fields describe different objects:
+
+| Source field                                                    | Meaning                                                                                                                       |
+| --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `row.agentx.status = complete`                                  | Both the aggregate entry and derived-metric entry were returned for this result ID; individual values can be null.            |
+| `row.agentx.aggregates.status = available`                      | The aggregate response contains this ID, including entries whose groups are all null.                                         |
+| `metadata.enrichment_coverage.aggregates[group].available_rows` | Number of selected rows with a non-null distribution for this group; its `n` can be zero.                                     |
+| `manifest.coverage.hardware[].valid_records`                    | Number of rows with at least one recognized aggregate group whose `n > 0`. This is the hardware policy's usable-record count. |
+
+Trace availability is recorded separately. Keep each distribution's `n` with its
+statistics. A row can have both enrichment entries while only some metric groups
+contain samples.
+
+For `agentx.status = complete`, report “rows with both aggregate and derived-metric
+entries.” Use the existing per-group counts in `metadata.enrichment_coverage` to
+describe which optional groups have values, are null, or have missing entries.
+
+An unsupported raw ID remains in the export but is not sent to numeric enrichment
+endpoints. Do not use this summary workflow to bulk-read timelines, histograms, or
+server metrics.
+
+## Diagnose one explicitly selected point
+
+Use this recipe only after the user has selected one result ID from a summary or
+other public response. Replace `421` with that exact decimal string. It must convert
+losslessly to a positive JavaScript safe integer for the diagnostic URLs; keep the
+original string in the output, never round a larger identifier, and never expand the
+selection to sibling IDs.
+
+The recipe reads the current OpenAPI document once, then fetches sibling identity
+and trace availability. A missing availability key returns `trace_unavailable` and
+stops before all heavy trace operations. If availability advertises a trace, it
+reads exactly one timeline, one-ID histogram data, and aggregate server metrics.
+An HTTP error, malformed JSON, or invalid required response after that advertisement
+is a trace inconsistency and fails the recipe.
+
+Public timelines contain sanitized replay structure. They do not expose original
+prompts, code, or tool payloads. Preserve every phase, replay-lane field, and
+cancellation state returned by the API; do not reduce the timeline to successful
+main-agent requests. Timeline-level `startNs` and `endNs` are wall-clock nanosecond
+anchors. Per-request `credit`, `start`, `ack`, and `end` are nanosecond offsets from
+`timeline.startNs`. Keep those two timestamp roles separate. Retain the original
+response text before parsing: JavaScript `Number` can round large integer anchors.
+For anchor differences, parse the original JSON with an integer-preserving parser
+(Python's `json.load` or the raw-number reviver below), subtract the integer anchors,
+then convert the difference to seconds.
+Reserialized JavaScript numbers cannot recover the original digits.
+
+Inventory every returned scalar and nested server-metric series, including
+`promptTokensBySource`, using the recipe's sample summary. Inspect each series'
+fields before calculating statistics. `queueDepth` carries `running`, `waiting`,
+and `total`, while scalar series use `value`. Report that series' own sample,
+finite, nonzero, and missing counts; array lengths can differ. A nonzero fraction
+uses that field's finite count as its denominator, with missing samples reported
+separately. An empty series has no samples; zero-valued samples remain recorded
+observations. When relating a request group to metric windows, use the optional
+calculation below with that group's explicit identities. It counts each sample once
+across the union of the selected windows; summing per-request counts instead measures
+sample/request memberships. Retain exceptions and each series' own denominator.
+
+Compute phase totals per request before taking percentiles; separate phase
+percentiles are distributions, not additive components of the E2E percentile.
+For the slowest request in a phase, select the record with the largest `end - start`
+first, then read its IDs, ISL, OSL, and cancellation state from that record. Maxima
+of separate fields can belong to different requests.
+For timeline accounting, `sum(end - start)` is cumulative request latency and can
+exceed elapsed time when requests overlap. The union of `[start, end]` intervals
+is time with at least one request in flight. Neither measures GPU utilization or
+server busy time. Keep every phase and cancelled request in the default summary;
+label any narrower selection explicitly. A sampled KV-cache maximum or a slow
+first request describes that observation; it cannot establish that cache capacity
+was never limiting or that a cold cache caused the latency.
+
+```bash
+node --input-type=module <<'JS'
+import { summarizeTrace, renderTraceSummary, validateTimeline } from './.agents/skills/inferencex-api/scripts/trace-summary.mjs';
+import { createResponseCapture } from './.agents/skills/inferencex-api/scripts/capture-response.mjs';
+import { readFileSync } from 'node:fs';
+
+const selectedResultId = '421';
+const diagnosticId = /^(?:[1-9]\d*)$/u.test(selectedResultId) ? Number(selectedResultId) : null;
+if (!Number.isSafeInteger(diagnosticId) || diagnosticId <= 0 || String(diagnosticId) !== selectedResultId) {
+  throw new Error('Select one positive safe integer result ID before reading diagnostics');
+}
+
+const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+const finite = (value) => typeof value === 'number' && Number.isFinite(value);
+const { read: capture, requests } = createResponseCapture();
+
+async function read(path) {
+  const data = await capture(path);
+  const record = requests.at(-1);
+  record.body_utf8 = readFileSync(record.body_path, 'utf8');
+  return data;
+}
+
+const openapi = await read('/api/openapi.json');
+const operations = {
+  '/api/v1/benchmark-siblings': 'id',
+  '/api/v1/trace-availability': 'ids',
+  '/api/v1/request-timeline': 'id',
+  '/api/v1/trace-histograms': 'ids',
+  '/api/v1/trace-server-metrics': 'id',
+};
+if (!object(openapi) || Object.entries(operations).some(([path, parameter]) => {
+  const operation = openapi.paths?.[path]?.get;
+  return !operation || !operation.parameters?.some((item) =>
+    item.name === parameter && item.in === 'query' && item.required === true);
+})) throw new Error('Inspect the current AgentX diagnostic operations in OpenAPI');
+
+const id = String(diagnosticId);
+const siblingResponse = await read(`/api/v1/benchmark-siblings?id=${id}`);
+if (!object(siblingResponse) || !object(siblingResponse.sku) ||
+    !Array.isArray(siblingResponse.siblings) ||
+    siblingResponse.siblings.some((row) => !object(row))) {
+  throw new Error('Unexpected benchmark sibling response');
+}
+const selectedPoint = siblingResponse.siblings.find((row) => String(row.id) === selectedResultId);
+if (!selectedPoint) throw new Error('Sibling response does not identify the selected result');
+
+const availability = await read(`/api/v1/trace-availability?ids=${id}`);
+if (!object(availability) || Object.entries(availability).some(([key, value]) =>
+  key !== id || typeof value !== 'boolean')) {
+  throw new Error('Unexpected trace availability response');
+}
+const traceKeyPresent = Object.hasOwn(availability, id);
+const traceAvailable = traceKeyPresent && availability[id] === true;
+const common = () => ({
+  schema_version: 1,
+  metadata: {
+    selected_result_id: selectedResultId,
+    retrieved_at: new Date().toISOString(),
+    requests,
+    ran_new_benchmark: false,
+    event_timestamp_unit: 'nanoseconds',
+    event_timestamp_origin: 'offset from timeline.startNs; not wall-clock',
+  },
+  benchmark_siblings: siblingResponse,
+  selected_point: selectedPoint,
+  trace_availability: {
+    response: availability,
+    key_present: traceKeyPresent,
+    available: traceAvailable,
+  },
+});
+
+function writeDiagnostics(diagnostics) {
+  const trace_summary = summarizeTrace(diagnostics);
+  console.log(JSON.stringify({
+    ...diagnostics,
+    trace_summary,
+    trace_report_markdown: renderTraceSummary(trace_summary),
+  }, null, 2));
+}
+
+if (!traceAvailable) {
+  writeDiagnostics({
+    ...common(),
+    outcome: 'trace_unavailable',
+    timeline: null,
+    histograms: null,
+    server_metrics: null,
+  });
+} else {
+  try {
+    const timeline = await read(`/api/v1/request-timeline?id=${id}`);
+    validateTimeline(timeline);
+
+    const histograms = await read(`/api/v1/trace-histograms?ids=${id}`);
+    const histogram = object(histograms) ? histograms[id] : null;
+    if (!object(histogram) || Object.keys(histograms).length !== 1 ||
+        histogram.id !== diagnosticId ||
+        !Array.isArray(histogram.isl) || !histogram.isl.every(finite) ||
+        !Array.isArray(histogram.osl) || !histogram.osl.every(finite)) {
+      throw new Error('Unexpected one-result trace histogram response');
+    }
+
+    const serverMetrics = await read(`/api/v1/trace-server-metrics?id=${id}`);
+
+    writeDiagnostics({
+      ...common(),
+      outcome: 'trace_diagnostics',
+      timeline,
+      histograms,
+      server_metrics: serverMetrics,
+    });
+  } catch (error) {
+    throw new Error(
+      `Trace availability inconsistency for result ${id}: ${error.message}`,
+      { cause: error },
+    );
+  }
+}
+JS
+```
+
+The recipe calls the installed offline helper and emits `trace_summary` plus
+`trace_report_markdown`. Save the JSON output with the analysis. Reuse the generated
+Markdown conclusion in the final answer, including its exact global/per-phase scope,
+request identity, phase, units, and value; do not relabel a phase maximum as the
+longest request in the entire trace. The summary includes cancelled requests and
+uses the first request in original timeline order to break equal-duration ties.
+For Claude Code, replace `.agents/skills` with `.claude/skills` in the import.
+
+To recompute the same report offline from saved recipe output:
+
+```bash
+node .agents/skills/inferencex-api/scripts/trace-summary.mjs evidence/selected-point.json > evidence/selected-point-summary.json
+```
+
+This helper reads only the supplied regular file (up to 64 MiB) and ignores any
+previously saved summary. It uses the package's JSON error diagnostics on stderr.
+It preserves unavailable traces separately from valid empty timelines; malformed
+scope, timeline events, or required server-metric structures fail instead of
+producing a no-trace result. It uses safe relative request offsets for duration
+calculations and does not subtract the rounded JavaScript wall-clock anchors.
+
+`benchmark_siblings.sku` and
+`selected_point` retain every identity field the API supplied; absence remains
+absence. `metadata.requests[].body_utf8` retains response text before numeric
+parsing; use it when exact large-integer values matter. Preserve the distinction
+inside `trace_availability`: `key_present: false`
+means the response omitted the selected ID, while `key_present: true` with
+`available: false` means it explicitly returned `false`. Both produce
+`trace_unavailable`; neither means the benchmark never ran or that a source artifact
+never existed. Do not call the page-owned
+`/api/v1/request-chart-data` or `/api/v1/trace-server-metric-source` operations.
+Do not repeat this recipe across a result set; ask the user to choose another single
+ID first.
+
+### Requested queue-window analysis
+
+Use this only when the question requires queue samples during particular requests.
+Save the recipe output as `selected-point.json` and the chosen raw request identities
+(`cid`, `ri` when present, `ti`, `wid`) as an array in `selected-requests.json`.
+Select those identities from the requested conversation, phase, or slow-request
+group first. The output retains the matched rows and zero-based sample indices so
+subsequent queue statistics can use precisely that population. Equal timestamps
+remain separate observations.
+
+```bash
+node --input-type=module - selected-point.json selected-requests.json <<'JS'
+import { readFileSync } from 'node:fs';
+const capture = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+const identities = JSON.parse(readFileSync(process.argv[3], 'utf8'));
+const raw = (path) => JSON.parse(capture.metadata.requests.find(({ query_url }) =>
+  new URL(query_url).pathname === path).body_utf8,
+  (key, value, context) => key === 'startNs' ? BigInt(context.source) : value);
+const timeline = raw('/api/v1/request-timeline');
+const metrics = raw('/api/v1/trace-server-metrics');
+const selected = identities.map((identity) => {
+  const matches = timeline.requests.filter((row) =>
+    ['cid', 'ri', 'ti', 'wid'].every((key) => row[key] === identity[key]));
+  if (matches.length !== 1) throw new Error('Each identity must match exactly one captured request');
+  return matches[0];
+});
+const offsetS = Number(metrics.startNs - timeline.startNs) / 1e9;
+const inside = [];
+let invalid = 0;
+for (const [index, sample] of metrics.queueDepth.entries()) {
+  if (!Number.isFinite(sample.t)) { invalid++; continue; }
+  const t = offsetS + sample.t;
+  if (selected.some(({ start, end }) => start / 1e9 <= t && t <= end / 1e9)) inside.push(index);
+}
+console.log(JSON.stringify({
+  selected_requests: selected,
+  inclusion_rule: 'start <= (metrics.startNs - timeline.startNs) / 1e9 + t <= end; start/end in seconds',
+  series: 'queueDepth',
+  sample_count: metrics.queueDepth.length,
+  inside_sample_indices: inside,
+  inside_sample_count: inside.length,
+  outside_sample_count: metrics.queueDepth.length - inside.length - invalid,
+  invalid_timestamp_sample_count: invalid,
+}, null, 2));
+JS
+```

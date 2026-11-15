@@ -1,0 +1,1410 @@
+'use client';
+
+import { useGlobalFilterSelection } from '@/providers/GlobalFilterContext';
+
+import { BarChart3, Table2 } from 'lucide-react';
+import Link from 'next/link';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+
+import {
+  getModelReleaseDate,
+  TCO_SOURCE_TITLE,
+  TCO_SOURCE_URL,
+} from '@semianalysisai/inferencex-constants';
+
+import type { HardwareConfig } from '@/components/inference/types';
+import {
+  includesJalapenoResult,
+  includesVeraRubinResult,
+  includesTpuv7Result,
+  JalapenoOfficialPreviewNotice,
+  VeraRubinOfficialPreviewNotice,
+  Tpuv7OfficialPreviewNotice,
+} from '@/components/ui/official-preview-notice';
+import { Button } from '@/components/ui/button';
+import { Card } from '@/components/ui/card';
+import { ControlPanel } from '@/components/ui/control-panel';
+import { type DataTableColumn, DataTable } from '@/components/ui/data-table';
+import { ExternalLinkIcon } from '@/components/ui/external-link-icon';
+import { Input } from '@/components/ui/input';
+import { LabelWithTooltip } from '@/components/ui/label-with-tooltip';
+import { ChartButtons } from '@/components/ui/chart-buttons';
+import { DashboardSectionHeader } from '@/components/ui/dashboard-section-header';
+import { Heading } from '@/components/ui/heading';
+import { ResultContext } from '@/components/ui/result-context';
+import { SegmentedToggle, type SegmentedToggleOption } from '@/components/ui/segmented-toggle';
+import { TooltipProvider } from '@/components/ui/tooltip';
+import { track } from '@/lib/analytics/analytics';
+import { selectionAnalyticsContext } from '@/lib/analytics/selection-context';
+import { exportToCsv } from '@/lib/export/csv-export';
+import { getGpuSpecs, getHardwareConfig, type TcoBasis } from '@/lib/catalog/constants';
+import {
+  getModelLabel,
+  getSequenceLabel,
+  Sequence,
+  type Model,
+  type Percentile,
+} from '@/lib/catalog/data-mappings';
+import { readUrlParams, writeUrlParams } from '@/lib/routing/url-state';
+import { useLocale } from '@/lib/i18n/use-locale';
+import { getDisplayLabel } from '@/lib/shared/utils';
+
+import { buildFleetSchedule, formatCompact } from './fleet';
+import FleetLifecycleChart, {
+  type LifecycleChartSeries,
+  type LifecycleMetric,
+} from './FleetLifecycleChart';
+import { mergeProgressionsByChip, type ChipProgression } from './historical-best';
+import {
+  availabilityFromInterrupts,
+  breakEvenPricePerMTok,
+  computeLifecycle,
+  effectiveTokPerSec,
+  LIFECYCLE_DEFAULTS,
+  MS_PER_MONTH,
+  type LifecycleAssumptions,
+  type LifecycleSeries,
+} from './lifecycle';
+import { getCostProviderLabel } from './ThroughputBarChart';
+import type { CalculatorMode, CostProvider, CostType, InterpolatedResult } from './types';
+import { useHistoricalBest } from './useHistoricalBest';
+
+interface FleetLifecycleProps {
+  hardwareConfig: HardwareConfig;
+  costProvider: CostProvider;
+  costType: CostType;
+  targetValue: number;
+  mode: CalculatorMode;
+  visibleHwKeys: Set<string>;
+  selectedModel: Model;
+  selectedSequence: Sequence;
+  selectedPrecisions: string[];
+  selectedPercentile?: Percentile;
+  mwInput: string;
+  onMwInputChange: (raw: string) => void;
+  colorResolver: (hwKey: string) => string;
+}
+
+type LifecycleView = 'chart' | 'table';
+
+interface CsvAssumptions {
+  tcoBasis: TcoBasis;
+  priceInput: string;
+  outputPriceInput: string;
+  rampInput: string;
+  mtbiInput: string;
+  recoveryInput: string;
+  horizonInput: string;
+  mw: number | null;
+}
+
+const LIFECYCLE_VIEW_OPTIONS: SegmentedToggleOption<LifecycleView>[] = [
+  {
+    value: 'chart',
+    label: 'Chart',
+    icon: <BarChart3 className="size-3.5" />,
+    testId: 'calculator-lifecycle-chart-view-btn',
+  },
+  {
+    value: 'table',
+    label: 'Table',
+    icon: <Table2 className="size-3.5" />,
+    testId: 'calculator-lifecycle-table-view-btn',
+  },
+];
+
+const STRINGS = {
+  en: {
+    title: 'Fleet lifecycle',
+    fleetSizingGroup: 'Fleet sizing',
+    assumptionsGroup: 'Fleet economics & assumptions',
+    viewChart: 'Chart',
+    viewTable: 'Table',
+    viewAria: 'View mode',
+    captionTarget: (target: number) => `${target.toFixed(0)} tok/s/user`,
+    captionPrices: (input: string, output: string, cachedPct: string | null) =>
+      `$${input} in / $${output} out per M tok${cachedPct === null ? '' : `, cached ${cachedPct}%`}`,
+    description:
+      'A fixed fleet, from the day the model shipped. The chips never change. The software serving them does, so each rollout is a config that beat every config before it, climbing from what the fleet already served to its own numbers. The gap to the cost line is the return on that work.',
+    tooSmall:
+      'This power budget is too small to power a single chip of the shown hardware. Try a larger value.',
+    mwLabel: 'Facility power (MW)',
+    mwTooltip:
+      'Total facility power budget in megawatts. Chip count uses all-in power per chip (host, networking, cooling) from the SemiAnalysis Datacenter Industry Model, not bare TDP.',
+    mwPlaceholder: 'e.g. 10',
+    colChips: 'Chips',
+    colUsers: 'Concurrent users now',
+    needMw: 'Enter a facility power budget to project lifecycle economics',
+    noReleaseDate:
+      'No release date is on file for this model, so the timeline is anchored to its first benchmark run instead.',
+    loading: 'Loading run history…',
+    errorPrefix: 'Could not load run history: ',
+    noneMeasured:
+      'No chip was measured at this interactivity on any run date. Move the target interactivity slider into a measured range. The ranges each chip has been measured over are listed below.',
+    priceLabel: 'Input, output price ($/M tok)',
+    priceInputLabel: 'Input token price, $ per million',
+    outputPriceInputLabel: 'Output token price, $ per million',
+    priceTooltip:
+      "Sale price of input and output tokens, set separately. Providers bill output at a multiple of input, and the two streams are wildly unequal: 8 input tokens per output token on a fixed 8k/1k sequence, around 130 on agentic traces. Revenue counts both, whichever token type the cost matrix above is set to. The pair defaults to the prices that exactly zero the cheapest visible fleet's margin at its latest config. This is the competitive floor, where that chip earns nothing and every pricier chip is underwater. It starts with output priced at 4x input, roughly matching major vendors. Break-even with two prices is a line rather than a point, so a reset scales both and keeps whatever ratio you have set. Everything above that line is your assumption, not a measurement.",
+    priceReset: 'Reset to break-even',
+    mtbiLabel: 'MTBI (days)',
+    mtbiTooltip:
+      'Mean time between interruptions. Combined with recovery time this becomes an availability haircut on revenue. Leave blank to model no interruptions.',
+    recoveryLabel: 'Recovery (hours)',
+    recoveryTooltip: 'Hours to restore service after one interruption.',
+    rampLabel: 'Ramp (months)',
+    rampTooltip:
+      'Months for a config to roll out across the fleet. Every config gets one: it climbs from whatever the fleet was already serving to the new config\u2019s numbers, and the first climbs from zero. Cost runs at full rate throughout because racks bill from the moment they are energised, not from the moment they are loaded. The first rollout therefore opens at a full day\u2019s cost against no revenue, which is the deepest the margin line ever goes. Your assumption, not a measurement; set it to 0 for configs that take effect instantly.',
+    horizonLabel: 'Horizon (months from release)',
+    horizonTooltip:
+      "How far past the model's release date to project. Past the last sweep, the latest config is held flat. That is what the fleet earns if optimisation stops, not a forecast of further gains.",
+    cacheLabel: 'Cached input (% of price)',
+    cacheTooltip:
+      'What a cached input token sells for, as a percentage of the price above. Agentic traces reuse enormous prefixes: a median 133 input tokens per output token, with a median 92% served from cache on these runs. Providers bill a cache read at a fraction of a fresh token, so charging full price for all of them overstates margin by close to an order of magnitude. The cached fraction is measured per config, not assumed; only the percentage is yours. Set it to 100 to bill every token the same. Fixed sequences record no cache hits at all, which is why this input only appears for agentic traces.',
+    singleRung:
+      'Every chip here has been measured on a single run date, so each line is one config held flat. The staircase this section exists to show needs several dates per config, and agentic trace history does not go back far enough yet. The levels are measured; the absence of steps is a gap in the history, not a finding about the hardware.',
+    colChip: 'Chip',
+    colConfigNow: 'Config now',
+    colFirst: 'First run',
+    colLatest: 'Latest best',
+    colSteps: 'Improvements',
+    colGain: 'Gain',
+    inputTokenPrefix: 'input ',
+    outputTokenPrefix: 'output ',
+    colTpPerMw: (tokenType: string) => `${tokenType}tok/s/MW now`,
+    csvAssumptions: ({
+      priceInput,
+      outputPriceInput,
+      rampInput,
+      mtbiInput,
+      recoveryInput,
+      horizonInput,
+      mw,
+      tcoBasis,
+    }: CsvAssumptions) =>
+      `Assumptions: input $${priceInput}/M tok, output $${outputPriceInput}/M tok, ramp ${rampInput} mo, MTBI ${mtbiInput} d, recovery ${recoveryInput} h, horizon ${horizonInput} mo, power ${mw ?? ''} MW, TCO basis ${tcoBasis}`,
+    colRevenue: 'Revenue $/day',
+    colCost: 'Cost $/day',
+    colMargin: 'Margin $/day',
+    colPayback: 'Payback',
+    colLifetime: 'Cumulative margin',
+    colAvailability: 'Availability',
+    never: 'Never',
+    monthsSuffix: 'mo',
+    unmeasuredTitle: 'Not measured at this interactivity',
+    unmeasuredIntro:
+      'These chips have run history for this scenario but no single run date was measured across the target interactivity, so no honest number exists for them. The nearest interactivity each one actually reached:',
+    unmeasuredRange: (below: number | null, above: number | null, dates: number) => {
+      const dateLabel = `${dates} run ${dates === 1 ? 'date' : 'dates'}`;
+      if (below === null && above === null) return `nothing measured (${dateLabel})`;
+      if (below === null)
+        return `nothing below; nearest above ${above!.toFixed(1)} tok/s/user (${dateLabel})`;
+      if (above === null)
+        return `nearest below ${below.toFixed(1)} tok/s/user; nothing above (${dateLabel})`;
+      return `nearest ${below.toFixed(1)} below and ${above.toFixed(1)} above, tok/s/user (${dateLabel})`;
+    },
+    unplottable: (chips: string) =>
+      `No fleet could be sized for ${chips} at this power budget. The chip has no registered power figure, or its measured throughput sizes to nothing. Listed rather than dropped so the chart is never quietly missing a chip.`,
+    note: 'Note:',
+    disagg:
+      ' A step can be won by a disaggregated configuration, and the handover is a like-for-like comparison: total tok/s/chip is reported per chip overall for both kinds, and prefill and decode chips are the same silicon, so neither the sizing nor the cost line moves at the switch. Where this section needs an input- or output-token figure, to rank a step or to price the two streams apart, it derives one from that total and the run’s measured token mix rather than reading the per-chip input and output rates directly. Those two are reported per prefill and per decode chip on a disaggregated run, which is why the throughput charts elsewhere caveat them as not apples-to-apples; deriving instead keeps every comparison here on one denominator. What the fleet does change is its shape. The winning config’s prefill:decode ratio is assumed to apply across the whole fleet from the moment that config rolls out. In practice, this is a redeployment that the ramp window stands in for, not a measurement. The config named on each step says which kind won it.',
+    hybrid:
+      " One line per chip, not per software config: at any moment it follows whichever framework, precision and speculative-decoding combination was ahead, so the config serving the fleet changes along the line and each step names the one that took over. Legend entries still filter configs, which removes them from candidacy. Each step is a measured run date whose interpolated throughput at the target beat every earlier date; a sweep that failed to beat the incumbent is not a step, because the fleet kept serving the config it already had. A config does not take effect the instant a sweep finds it, so each one rolls out over the ramp window, climbing from what the fleet already served to its own numbers. Power and $/chip/hr are today's values from the TCO model, and cost is flat throughout because no config moves either term. It is the same silicon either way. Reads outside a run's measured interactivity range are excluded rather than clamped.",
+    overlayExempt:
+      ' Unofficial runs loaded via a run link are not shown here because the run-history API serves ingested official results only.',
+    metricLabel: 'Y axis',
+    metricTooltip:
+      'What to plot. Margin is the per-day revenue minus the flat fleet cost, so the break-even rule shows which side of it a fleet is on. Margin/MW and Revenue/MW divide their daily rates by provisioned power. Revenue drops the cost term, which makes rollouts easier to compare across chips of very different cost, but a chip being higher no longer means it is more profitable. Cumulative Revenue is the running total taken in since launch, not a rate; it compounds that caveat, because the largest area under a revenue curve may still never have covered its cost.',
+    metricMargin: 'Margin',
+    metricMarginPerMw: 'Margin/MW',
+    metricRevenue: 'Revenue',
+    metricRevenuePerMw: 'Revenue/MW',
+    metricCumulativeRevenue: 'Cum. revenue',
+    chartY: 'Margin ($/day)',
+    chartYMarginPerMw: 'Margin ($/MW/day)',
+    chartYRevenue: 'Revenue ($/day)',
+    chartYRevenuePerMw: 'Revenue ($/MW/day)',
+    chartYCumulativeRevenue: 'Cumulative revenue ($)',
+    chartBreakEven: 'break-even',
+    tipDate: 'Measured',
+    tipConfig: 'Config',
+    tipMargin: 'Margin/day',
+    tipMarginPerMw: 'Margin/MW/day',
+    tipRevenue: 'Revenue/day',
+    tipRevenuePerMw: 'Revenue/MW/day',
+    tipCumulativeRevenue: 'Cumulative revenue',
+    tipCost: 'Cost/day',
+    tipCumulative: 'Cumulative margin',
+    tipSinceFirst: 'Since first run',
+    tipRunLink: 'Open run',
+    chartInstructions:
+      'Hover to read every chip at that date · Shift+Scroll to zoom horizontally · Drag to pan · Double-click to reset',
+    assumptions: (tier: string, chips: string, release: string) =>
+      `Anchored at the ${release} release. Fleet sized by facility power at ${chips}; cost = chips × ${tier} $/chip/hr, flat for the whole window. Revenue is priced on the selected token type and reduced by the availability haircut. Price, ramp, MTBI, recovery and horizon are your assumptions. The throughput steps are not.`,
+    source: 'Source: ',
+  },
+  zh: {
+    title: '集群生命周期',
+    fleetSizingGroup: '集群规模',
+    assumptionsGroup: '集群经济性与假设',
+    viewChart: '图表',
+    viewTable: '表格',
+    viewAria: '显示模式',
+    captionTarget: (target: number) => `${target.toFixed(0)} tok/s/用户`,
+    captionPrices: (input: string, output: string, cachedPct: string | null) =>
+      `输入 $${input} / 输出 $${output} 每百万 token${cachedPct === null ? '' : `，缓存 ${cachedPct}%`}`,
+    description:
+      '固定集群自模型发布之日起的表现。芯片始终不变，变化的是为其提供服务的软件。每次部署采用的配置都优于此前所有配置，并从集群当前服务水平逐步爬升至新配置水平。曲线与成本线之间的差距，就是这些优化工作的回报。',
+    tooSmall: '该功率预算不足以为所示任一芯片供电。请尝试更大的数值。',
+    mwLabel: '设施功率 (MW)',
+    mwTooltip:
+      '设施总功率预算（兆瓦）。芯片数量按每芯片全含功率（主机、网络、散热）计算，数据来自 SemiAnalysis Datacenter Industry Model，而非裸 TDP。',
+    mwPlaceholder: '如 10',
+    colChips: '芯片数',
+    colUsers: '当前并发用户数',
+    needMw: '输入设施功率预算，以测算生命周期经济性',
+    noReleaseDate: '该模型暂无发布日期记录，时间轴改以其首次基准测试运行为起点。',
+    loading: '正在加载运行历史……',
+    errorPrefix: '无法加载运行历史：',
+    noneMeasured:
+      '在任何运行日期下都没有芯片在该交互性下被实测过。请将目标交互性滑块移入已实测区间。各芯片的实测区间见下方列表。',
+    priceLabel: '输入、输出价格 ($/M tok)',
+    priceInputLabel: '输入 token 价格，$/百万',
+    outputPriceInputLabel: '输出 token 价格，$/百万',
+    priceTooltip:
+      'Token 售价，输入与输出分别设定。服务商对输出 token 的计价通常是输入的数倍，而两类 token 的数量极不均衡：固定 8k/1k 序列下每个输出 token 对应 8 个输入 token，agentic traces 下约为 130 个。无论上方成本矩阵选择哪种 token 类型，收入均同时计入两者。二者默认取使当前可见集群中成本最低者在其最新配置下利润恰好为零的价格，即竞争底线。该价格下这款芯片不赚不亏，而所有更贵的芯片均为亏损。初始比例为输出价格是输入价格的 4 倍，与主流厂商的定价大致相当。在双价格下保本点是一条直线而非一个点，因此重置会按你当前设定的比例同时缩放两个价格。高于该线的部分属于你的假设，而非实测值。',
+    priceReset: '重置为保本价',
+    mtbiLabel: '平均中断间隔（MTBI，天）',
+    mtbiTooltip:
+      '两次服务中断之间的平均间隔。与恢复时间一起用于计算可用率，并据此扣减收入。留空表示假设服务不会中断。',
+    recoveryLabel: '恢复时间 (小时)',
+    recoveryTooltip: '一次中断后恢复服务所需的小时数。',
+    rampLabel: '爬坡期 (月)',
+    rampTooltip:
+      '新配置在整个集群中部署完成所需的月数。每次部署新配置时，集群都会从当前运行水平逐步提升至新配置的水平；首次部署则从零开始。整个过程中成本始终按全额计算，因为机柜通电后即开始计费，不会等到负载开始运行才计费。因此，首次部署开始时还没有收入，却已需承担全天成本，此时每日利润处于整个周期的最低点。部署时长由你设定，并非实测数据；设为 0 表示新配置立即生效。',
+    horizonLabel: '测算期 (自发布起月数)',
+    horizonTooltip:
+      '自模型发布日期起向后测算的月数。在最后一次扫描之后，最新配置将保持不变。这代表若优化停止时集群的收益，而非对后续提升的预测。',
+    cacheLabel: '缓存输入 (占价格百分比)',
+    cacheTooltip:
+      '一个缓存输入 token 的售价，以上方价格的百分比表示。Agentic traces 会复用极长的前缀：中位数为每个输出 token 对应 133 个输入 token，其中中位数 92% 在本批运行中由缓存提供。服务商对缓存读取仅按新鲜 token 价格的一小部分计费，因此若对全部 token 按满价计费，将使利润被高估近一个数量级。缓存占比按各配置实测得出，并非假设；仅该百分比属于你的假设。设为 100 表示所有 token 同价。固定序列完全没有缓存命中记录，因此该输入项仅在 Agentic Traces 下出现。',
+    singleRung:
+      '此处每款芯片都只有单一运行日期的实测数据，因此每条线都是一个配置的水平延伸。本模块所要呈现的阶梯需要同一配置在多个日期上的数据，而 agentic traces 的历史尚不够长。图中的水平值是实测的；缺少台阶反映的是历史数据的空缺，而非关于硬件的结论。',
+    colChip: '芯片',
+    colConfigNow: '当前配置',
+    colFirst: '首次运行',
+    colLatest: '最新最佳',
+    colSteps: '提升次数',
+    colGain: '提升倍数',
+    inputTokenPrefix: '输入',
+    outputTokenPrefix: '输出',
+    colTpPerMw: (tokenType: string) => `当前${tokenType} tok/s/MW`,
+    csvAssumptions: ({
+      priceInput,
+      outputPriceInput,
+      rampInput,
+      mtbiInput,
+      recoveryInput,
+      horizonInput,
+      mw,
+      tcoBasis,
+    }: CsvAssumptions) =>
+      `假设：输入价格 $${priceInput}/M tok，输出价格 $${outputPriceInput}/M tok，爬坡期 ${rampInput} 个月，平均中断间隔（MTBI）${mtbiInput} 天，恢复时间 ${recoveryInput} 小时，测算期 ${horizonInput} 个月，设施功率 ${mw ?? ''} MW，TCO 口径：${tcoBasis === 'internal' ? '内部' : '外部'}`,
+    colRevenue: '收入 $/天',
+    colCost: '成本 $/天',
+    colMargin: '利润 $/天',
+    colPayback: '回本时间',
+    colLifetime: '累计利润',
+    colAvailability: '可用性',
+    never: '无法回本',
+    monthsSuffix: '个月',
+    unmeasuredTitle: '该交互性下无实测数据',
+    unmeasuredIntro:
+      '以下芯片在该场景下有运行历史，但没有任何单次运行的实测范围覆盖目标交互性，因此无法给出可靠数值。各自最接近的实测交互性：',
+    unmeasuredRange: (below: number | null, above: number | null, dates: number) => {
+      const dateLabel = `共 ${dates} 个运行日期`;
+      if (below === null && above === null) return `无实测数据（${dateLabel}）`;
+      if (below === null)
+        return `下方无实测；上方最近 ${above!.toFixed(1)} tok/s/user（${dateLabel}）`;
+      if (above === null)
+        return `下方最近 ${below.toFixed(1)} tok/s/user；上方无实测（${dateLabel}）`;
+      return `最近实测为下方 ${below.toFixed(1)}、上方 ${above.toFixed(1)} tok/s/user（${dateLabel}）`;
+    },
+    unplottable: (chips: string) =>
+      `在该功率预算下无法为 ${chips} 组建集群。该芯片缺少已登记的功耗数据，或其实测吞吐无法组成任何规模。此处列出而非直接剔除，以免图表静默遗漏芯片。`,
+    note: '注意：',
+    disagg:
+      '台阶可以由分离式配置取得，且该次交接是同类比较：两种部署方式的总 tok/s/chip 均按芯片总数报告，且预填充与解码使用的是同一款芯片，因此切换时集群规模与成本线均不发生变化。当本模块需要输入或输出 token 的单独数值时（用于台阶排序，或将两类 token 分别计价），它由该总量与该次运行实测的 token 构成比推导得出，而非直接读取每芯片的输入/输出速率。在分离式部署下，这两个速率分别按预填充芯片与解码芯片计算，这也正是别处吞吐图表标注其不可直接比较的原因；改为推导可使本模块的所有比较统一在同一分母上。真正改变的是集群形态。自该配置开始部署起，其预填充:解码比例被假定应用于整个集群。实际部署中，这相当于一次重新部署，由爬坡期窗口代为体现，并非实测值。每一级台阶标注的配置即说明其类型。',
+    hybrid:
+      '每款芯片一条曲线，而非每个软件配置一条：曲线在任一时刻都跟随当时领先的框架、精度与投机解码组合，因此服务集群的配置会沿曲线变化，每一级台阶都标注接管的配置。图例项仍可筛选配置，被隐藏的配置将不参与竞争。每一级台阶都是一个实测运行日期，其在目标交互性下的插值吞吐量优于此前所有日期；未能超越现有配置的扫描不构成台阶，因为集群仍在运行原有配置。配置不会在扫描发现的瞬间生效，因此每个配置都会在爬坡期内从集群当前已提供的水平爬升至其自身水平。功率与 $/chip/hr 为 TCO 模型的当前值，成本在整个期间保持水平，因为任何配置都不会改变这两项。两种情况下都是同一款芯片。超出某次运行实测交互性区间的结果会被排除而非钳制。',
+    overlayExempt:
+      '通过运行链接加载的非官方运行不会显示在此，因为运行历史 API 仅提供已入库的官方结果。',
+    metricLabel: 'Y 轴',
+    metricTooltip:
+      '选择绘制的内容。利润为日均收入减去固定的集群成本，因此保本线可显示集群位于其哪一侧。每 MW 利润和每 MW 收入分别将对应的日均指标除以已配置功率。收入不扣除成本，便于在成本差异很大的芯片之间比较推广曲线，但此时位置更高并不代表更赚钱。累计收入是自上线以来的累计总额，而非日均指标；它会进一步放大上述注意事项，因为收入曲线下面积最大的芯片仍可能从未收回成本。',
+    metricMargin: '利润',
+    metricMarginPerMw: '每 MW 利润',
+    metricRevenue: '收入',
+    metricRevenuePerMw: '每 MW 收入',
+    metricCumulativeRevenue: '累计收入',
+    chartY: '利润 ($/天)',
+    chartYMarginPerMw: '每 MW 利润 ($/MW/天)',
+    chartYRevenue: '收入 ($/天)',
+    chartYRevenuePerMw: '每 MW 收入 ($/MW/天)',
+    chartYCumulativeRevenue: '累计收入 ($)',
+    chartBreakEven: '保本线',
+    tipDate: '实测于',
+    tipConfig: '配置',
+    tipMargin: '每日利润',
+    tipMarginPerMw: '每 MW 每日利润',
+    tipRevenue: '每日收入',
+    tipRevenuePerMw: '每 MW 每日收入',
+    tipCumulativeRevenue: '累计收入',
+    tipCost: '每日成本',
+    tipCumulative: '累计利润',
+    tipSinceFirst: '相比首次运行',
+    tipRunLink: '查看运行',
+    chartInstructions:
+      '悬停可读取该日期下所有芯片的数值 · Shift+滚轮 横向缩放 · 拖动平移 · 双击重置',
+    assumptions: (tier: string, chips: string, release: string) =>
+      `以 ${release} 发布日期为起点。集群规模按 ${chips} 的设施功率测算；成本 = 芯片数 × ${tier} $/chip/hr，在整个测算期内保持不变。收入按所选 token 类型计价，并扣除可用性折损。价格、爬坡期、平均中断间隔、恢复时间与测算期为你的假设。吞吐量台阶不是假设。`,
+    source: '来源：',
+  },
+} as const;
+
+const DEFAULTS = LIFECYCLE_DEFAULTS;
+
+function formatPrice(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0';
+  return value < 0.0001 ? value.toPrecision(3) : value.toFixed(4);
+}
+
+function formatCaptionPrice(value: number): string {
+  const fixed = formatPrice(value);
+  return fixed.includes('.') ? fixed.replace(/\.?0+$/u, '') : fixed;
+}
+
+function parseNonNegative(raw: string): number | null {
+  const parsed = parseFloat(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function initialPriceInputs(params: ReturnType<typeof readUrlParams>): {
+  input: string;
+  output: string;
+  edited: boolean;
+} {
+  let input = params.c_price ?? '';
+  let output = params.c_oprice ?? '';
+  const parsedInput = parseNonNegative(input);
+  const parsedOutput = parseNonNegative(output);
+
+  if (input && !output && parsedInput !== null) {
+    output = formatPrice(parsedInput * DEFAULTS.outputPriceMultiple);
+  } else if (!input && output && parsedOutput !== null) {
+    input = formatPrice(parsedOutput / DEFAULTS.outputPriceMultiple);
+  }
+
+  return { input, output, edited: Boolean(input || output) };
+}
+
+function getLabel(hwKey: string, hardwareConfig: HardwareConfig): string {
+  const config = hardwareConfig[hwKey] || getHardwareConfig(hwKey);
+  return config ? getDisplayLabel(config) : hwKey;
+}
+
+function configSuffix(hwKey: string, baseGpu: string, hardwareConfig: HardwareConfig): string {
+  if (hwKey === baseGpu) return '—';
+  const label = getLabel(hwKey, hardwareConfig);
+  const parenthetical = /\((?<inner>[^)]*)\)/u.exec(label);
+  if (parenthetical?.groups?.inner) return parenthetical.groups.inner;
+  const suffix = hwKey.slice(baseGpu.length).replace(/^_/u, '').replaceAll('_', ', ');
+  return suffix || '—';
+}
+
+function formatMoney(value: number): string {
+  const abs = Math.abs(value);
+  const sign = value < 0 ? '-' : '';
+  if (abs >= 1e12) return `${sign}$${(abs / 1e12).toFixed(2)}T`;
+  if (abs >= 1e9) return `${sign}$${(abs / 1e9).toFixed(2)}B`;
+  if (abs >= 1e6) return `${sign}$${(abs / 1e6).toFixed(2)}M`;
+  if (abs >= 1e3) return `${sign}$${(abs / 1e3).toFixed(1)}k`;
+  return `${sign}$${abs.toFixed(0)}`;
+}
+
+function configLabel(result: InterpolatedResult): string {
+  const point = result.nearestPoints[0];
+  if (!point) return '';
+  const parts = [point.precision?.toUpperCase()].filter(Boolean) as string[];
+  if (point.disagg) parts.push('disagg');
+  if (result.concurrency > 0) parts.push(`conc ${result.concurrency}`);
+  return parts.join(' · ');
+}
+
+function runLink(date: string, runUrls: string[]) {
+  if (runUrls.length === 0) return <>{date}</>;
+  return (
+    <Link href={runUrls[0]!} target="_blank" className="underline hover:text-foreground">
+      {date}
+      <ExternalLinkIcon />
+    </Link>
+  );
+}
+
+interface LifecycleRow {
+  progression: ChipProgression;
+  label: string;
+  configNow: string;
+  colorKey: string;
+  tpPerMw: number;
+  gpus: number;
+  concurrentUsersNow: number;
+  disagg: boolean;
+  series: LifecycleSeries;
+}
+
+export default function FleetLifecycle({
+  hardwareConfig,
+  costProvider,
+  costType,
+  targetValue,
+  mode,
+  visibleHwKeys,
+  selectedModel,
+  selectedSequence,
+  selectedPrecisions,
+  selectedPercentile,
+  mwInput,
+  onMwInputChange,
+  colorResolver,
+}: FleetLifecycleProps) {
+  const { tcoBasis } = useGlobalFilterSelection();
+  const locale = useLocale();
+  const t = STRINGS[locale];
+  const mw = useMemo(() => {
+    const parsed = parseNonNegative(mwInput);
+    return parsed !== null && parsed > 0 ? parsed : null;
+  }, [mwInput]);
+
+  const historical = useHistoricalBest({
+    tcoBasis,
+    model: selectedModel,
+    sequence: selectedSequence,
+    precisions: selectedPrecisions,
+    targetValue,
+    mode,
+    costProvider,
+    costType,
+    percentile: selectedPercentile,
+    enabled: Boolean(mw),
+  });
+
+  const [mtbiInput, setMtbiInput] = useState(
+    () => readUrlParams().c_mtbi ?? String(DEFAULTS.mtbiDays),
+  );
+  const [recoveryInput, setRecoveryInput] = useState(
+    () => readUrlParams().c_rec ?? String(DEFAULTS.recoveryHours),
+  );
+  const [rampInput, setRampInput] = useState(
+    () => readUrlParams().c_ramp ?? String(DEFAULTS.rampMonths),
+  );
+  const [cacheInput, setCacheInput] = useState(
+    () => readUrlParams().c_cache ?? String(DEFAULTS.cachedInputPct),
+  );
+  const isAgentic = selectedSequence === Sequence.AgenticTraces;
+  const cacheReadRatio = isAgentic
+    ? Math.min(1, (parseNonNegative(cacheInput) ?? DEFAULTS.cachedInputPct) / 100)
+    : 1;
+
+  const [horizonInput, setHorizonInput] = useState(() => readUrlParams().c_life ?? '');
+  const horizonEdited = useRef(Boolean(readUrlParams().c_life));
+  const [yMetric, setYMetric] = useState<LifecycleMetric>(() => {
+    const seeded = readUrlParams().c_ly;
+    return seeded === 'revenue' ||
+      seeded === 'revenuePerMw' ||
+      seeded === 'cumulativeRevenue' ||
+      seeded === 'marginPerMw'
+      ? seeded
+      : 'margin';
+  });
+  const [initialPrices] = useState(() => initialPriceInputs(readUrlParams()));
+  const [priceInput, setPriceInput] = useState(initialPrices.input);
+  const [outputPriceInput, setOutputPriceInput] = useState(initialPrices.output);
+  const priceEdited = useRef(initialPrices.edited);
+  const [seedMultiple, setSeedMultiple] = useState(() => {
+    const input = parseNonNegative(initialPrices.input);
+    const output = parseNonNegative(initialPrices.output);
+    if (input !== null && input > 0 && output !== null && output > 0) return output / input;
+    return DEFAULTS.outputPriceMultiple;
+  });
+
+  const releaseDate = getModelReleaseDate(selectedModel);
+  const visibleHistoricalProgressions = useMemo(
+    () => historical.progressions.filter((progression) => visibleHwKeys.has(progression.hwKey)),
+    [historical.progressions, visibleHwKeys],
+  );
+  const visibleProgressions = useMemo(
+    () => mergeProgressionsByChip(visibleHistoricalProgressions),
+    [visibleHistoricalProgressions],
+  );
+  const showsJalapenoPreview = includesJalapenoResult(
+    visibleHistoricalProgressions.map((progression) => progression.hwKey),
+  );
+  const showsVeraRubinPreview = includesVeraRubinResult(
+    visibleHistoricalProgressions.map((progression) => progression.hwKey),
+  );
+  const showsTpuv7Preview = includesTpuv7Result(
+    visibleHistoricalProgressions.map((progression) => progression.hwKey),
+  );
+
+  const anchorDate = useMemo(() => {
+    if (releaseDate) return releaseDate;
+    let earliest: string | null = null;
+    for (const p of visibleProgressions) {
+      const first = p.steps[0]?.date;
+      if (first && (earliest === null || first < earliest)) earliest = first;
+    }
+    return earliest;
+  }, [releaseDate, visibleProgressions]);
+
+  const anchorMs = useMemo(
+    () => (anchorDate ? Date.parse(`${anchorDate}T00:00:00Z`) : Number.NaN),
+    [anchorDate],
+  );
+
+  const visibleUnmeasured = useMemo(
+    () => historical.unmeasured.filter((entry) => visibleHwKeys.has(entry.hwKey)),
+    [historical.unmeasured, visibleHwKeys],
+  );
+
+  const measuredMonths = useMemo(() => {
+    if (!Number.isFinite(anchorMs)) return null;
+    let latest = -Infinity;
+    for (const p of visibleProgressions) {
+      const last = p.steps.at(-1)?.date;
+      if (!last) continue;
+      latest = Math.max(latest, (Date.parse(`${last}T00:00:00Z`) - anchorMs) / MS_PER_MONTH);
+    }
+    return Number.isFinite(latest) ? latest : null;
+  }, [anchorMs, visibleProgressions]);
+
+  useEffect(() => {
+    if (horizonEdited.current || measuredMonths === null) return;
+    setHorizonInput(String(Math.max(1, Math.ceil(measuredMonths + 2))));
+  }, [measuredMonths]);
+
+  const horizonMonths = parseNonNegative(horizonInput) ?? 0;
+
+  const { fleets, unplottable } = useMemo(() => {
+    if (!mw || !Number.isFinite(anchorMs)) return { fleets: [], unplottable: [] };
+    const absent: string[] = [];
+    const sized = visibleProgressions.flatMap((progression) => {
+      const fleet = buildFleetSchedule(progression.steps, {
+        mw,
+        specs: getGpuSpecs(progression.baseGpu, tcoBasis),
+        costProvider,
+        costType,
+        interactivity: targetValue,
+        anchorMs,
+        cacheReadRatio,
+      });
+      if (!fleet) {
+        absent.push(progression.baseGpu);
+        return [];
+      }
+      return [{ progression, ...fleet }];
+    });
+    return { fleets: sized, unplottable: absent };
+  }, [
+    mw,
+    anchorMs,
+    visibleProgressions,
+    costProvider,
+    costType,
+    targetValue,
+    cacheReadRatio,
+    tcoBasis,
+  ]);
+
+  const availability = useMemo(
+    () =>
+      availabilityFromInterrupts(
+        parseNonNegative(mtbiInput) ?? 0,
+        parseNonNegative(recoveryInput) ?? 0,
+      ),
+    [mtbiInput, recoveryInput],
+  );
+
+  const breakEven = useMemo(() => {
+    let cheapest: number | null = null;
+    for (const { steps, costPerHour } of fleets) {
+      const latest = steps.at(-1);
+      if (!latest) continue;
+      const price = breakEvenPricePerMTok(
+        costPerHour,
+        effectiveTokPerSec(latest.billableInputTokPerSec, latest.outputTokPerSec, seedMultiple),
+        availability,
+      );
+      if (price === null) continue;
+      if (cheapest === null || price < cheapest) cheapest = price;
+    }
+    return cheapest;
+  }, [fleets, availability, seedMultiple]);
+
+  useEffect(() => {
+    if (priceEdited.current || breakEven === null) return;
+    setPriceInput(formatPrice(breakEven));
+    setOutputPriceInput(formatPrice(breakEven * seedMultiple));
+  }, [breakEven, seedMultiple]);
+
+  const assumptions = useMemo<LifecycleAssumptions>(
+    () => ({
+      mtbiDays: parseNonNegative(mtbiInput) ?? 0,
+      recoveryHours: parseNonNegative(recoveryInput) ?? 0,
+      inputPricePerMTok: parseNonNegative(priceInput) ?? 0,
+      outputPricePerMTok: parseNonNegative(outputPriceInput) ?? 0,
+      rampMonths: parseNonNegative(rampInput) ?? 0,
+    }),
+    [mtbiInput, recoveryInput, priceInput, outputPriceInput, rampInput],
+  );
+
+  const rows = useMemo<LifecycleRow[]>(
+    () =>
+      fleets.flatMap(
+        ({ progression, steps, costPerHour, provisionedMw, gpus, concurrentUsersNow }) => {
+          const series = computeLifecycle({
+            steps,
+            costPerHour,
+            provisionedMw,
+            horizonMonths,
+            assumptions,
+          });
+          if (!series) return [];
+          const latest = progression.steps.at(-1)!;
+          const latestHwKey = latest.result.hwKey ?? progression.baseGpu;
+          return [
+            {
+              progression,
+              label: getLabel(progression.baseGpu, hardwareConfig),
+              configNow: configSuffix(latestHwKey, progression.baseGpu, hardwareConfig),
+              colorKey: latestHwKey,
+              tpPerMw: latest.rankValue,
+              gpus,
+              concurrentUsersNow,
+              disagg: progression.disagg,
+              series,
+            },
+          ];
+        },
+      ),
+    [fleets, horizonMonths, assumptions, hardwareConfig],
+  );
+
+  const hasDisagg = useMemo(() => rows.some((r) => r.disagg), [rows]);
+
+  const allSingleRung = useMemo(
+    () => rows.length > 0 && rows.every((r) => r.progression.steps.length < 2),
+    [rows],
+  );
+
+  const [view, setView] = useState<LifecycleView>('chart');
+
+  const viewOptions = useMemo<SegmentedToggleOption<LifecycleView>[]>(
+    () =>
+      LIFECYCLE_VIEW_OPTIONS.map((option) => ({
+        ...option,
+        label: option.value === 'chart' ? t.viewChart : t.viewTable,
+      })),
+    [t],
+  );
+
+  const handleViewChange = useCallback((value: LifecycleView) => {
+    setView(value);
+    track('calculator_lifecycle_view_changed', { view: value });
+  }, []);
+  const chartData = useMemo<LifecycleChartSeries[]>(
+    () =>
+      rows.map((r) => {
+        const stepInfo = new Map<
+          number,
+          { date: string; config: string; factor: number; runUrls: string[] }
+        >();
+        for (const step of r.progression.steps) {
+          const month = (Date.parse(`${step.date}T00:00:00Z`) - anchorMs) / MS_PER_MONTH;
+          const hwKey = step.result.hwKey ?? r.progression.baseGpu;
+          const software = configSuffix(hwKey, r.progression.baseGpu, hardwareConfig);
+          const detail = configLabel(step.result);
+          stepInfo.set(month, {
+            date: step.date,
+            config: [software === '—' ? '' : software, detail].filter(Boolean).join(' · '),
+            factor: step.factorOverFirst,
+            runUrls: step.runUrls,
+          });
+        }
+        return {
+          key: r.progression.key,
+          label: r.label,
+          color: colorResolver(r.colorKey),
+          series: r.series,
+          stepInfo,
+        };
+      }),
+    [rows, colorResolver, anchorMs],
+  );
+
+  const tokenTypeLabel =
+    costType === 'input' ? t.inputTokenPrefix : costType === 'output' ? t.outputTokenPrefix : '';
+
+  const handleAssumption = useCallback(
+    (
+      setter: (v: string) => void,
+      param: 'c_mtbi' | 'c_rec' | 'c_life' | 'c_ramp' | 'c_cache',
+      event: string,
+    ) =>
+      (e: React.ChangeEvent<HTMLInputElement>) => {
+        const raw = e.target.value;
+        setter(raw);
+        writeUrlParams({ [param]: parseNonNegative(raw) === null ? '' : raw });
+        track(event, { value: raw });
+      },
+    [],
+  );
+
+  const handleMetricChange = useCallback((value: LifecycleMetric) => {
+    setYMetric(value);
+    writeUrlParams({ c_ly: value === 'margin' ? '' : value });
+    track('calculator_lifecycle_metric_set', { value });
+  }, []);
+
+  const handlePriceChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const raw = e.target.value;
+      priceEdited.current = true;
+      setPriceInput(raw);
+      const input = parseNonNegative(raw);
+      const output = parseNonNegative(outputPriceInput);
+      if (input !== null && input > 0 && output !== null && output > 0) {
+        setSeedMultiple(output / input);
+      }
+      writeUrlParams({ c_price: parseNonNegative(raw) === null ? '' : raw });
+      track('calculator_lifecycle_price_set', { value: raw });
+    },
+    [outputPriceInput],
+  );
+
+  const handleOutputPriceChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const raw = e.target.value;
+      priceEdited.current = true;
+      setOutputPriceInput(raw);
+      const input = parseNonNegative(priceInput);
+      const output = parseNonNegative(raw);
+      if (input !== null && input > 0 && output !== null && output > 0) {
+        setSeedMultiple(output / input);
+      }
+      writeUrlParams({ c_oprice: parseNonNegative(raw) === null ? '' : raw });
+      track('calculator_lifecycle_output_price_set', { value: raw });
+    },
+    [priceInput],
+  );
+
+  const handlePriceReset = useCallback(() => {
+    priceEdited.current = false;
+    if (breakEven !== null) {
+      setPriceInput(formatPrice(breakEven));
+      setOutputPriceInput(formatPrice(breakEven * seedMultiple));
+    }
+    writeUrlParams({ c_price: '', c_oprice: '' });
+    track('calculator_lifecycle_price_reset', {});
+  }, [breakEven, seedMultiple]);
+
+  const handleExportCsv = useCallback(() => {
+    const headers = [
+      t.colChip,
+      t.colConfigNow,
+      t.colFirst,
+      t.colLatest,
+      t.colSteps,
+      t.colGain,
+      t.colChips,
+      t.colTpPerMw(tokenTypeLabel),
+      t.colUsers,
+      t.colRevenue,
+      t.colCost,
+      t.colMargin,
+      t.colPayback,
+      t.colLifetime,
+      t.colAvailability,
+    ];
+    const body = rows.map((r) => [
+      r.label,
+      r.configNow,
+      r.progression.steps[0]?.date ?? '',
+      r.progression.steps.at(-1)?.date ?? '',
+      r.series.improvementCount,
+      r.series.improvementFactor,
+      r.gpus,
+      r.tpPerMw,
+      r.concurrentUsersNow,
+      r.series.revenuePerDay,
+      r.series.costPerDay,
+      r.series.marginPerDay,
+      r.series.paybackMonth ?? '',
+      r.series.lifetimeMargin,
+      r.series.availability,
+    ]);
+    exportToCsv(`InferenceX_fleet_lifecycle_${selectedModel}`, headers, body, [
+      t.csvAssumptions({
+        priceInput,
+        outputPriceInput,
+        rampInput,
+        mtbiInput,
+        recoveryInput,
+        horizonInput,
+        mw,
+        tcoBasis,
+      }),
+    ]);
+  }, [
+    rows,
+    t,
+    tokenTypeLabel,
+    selectedModel,
+    priceInput,
+    outputPriceInput,
+    rampInput,
+    mtbiInput,
+    recoveryInput,
+    horizonInput,
+    mw,
+    tcoBasis,
+  ]);
+
+  const captionPrices = useMemo(() => {
+    const input = parseNonNegative(priceInput);
+    const output = parseNonNegative(outputPriceInput);
+    if (input === null || output === null) return null;
+    return t.captionPrices(
+      formatCaptionPrice(input),
+      formatCaptionPrice(output),
+      isAgentic ? String(Math.round(cacheReadRatio * 100)) : null,
+    );
+  }, [priceInput, outputPriceInput, isAgentic, cacheReadRatio, t]);
+
+  const caption = (
+    <>
+      <Heading as="h2" level="card" className="md:pr-64">
+        {t.title}
+      </Heading>
+      <p className="text-sm text-muted-foreground mb-2">
+        {getModelLabel(selectedModel)} · {getSequenceLabel(selectedSequence, locale)} ·{' '}
+        {t.captionTarget(targetValue)}
+        {mw ? ` · ${mw} MW` : ''}
+      </p>
+      {showsJalapenoPreview && <JalapenoOfficialPreviewNotice />}
+      {showsVeraRubinPreview && <VeraRubinOfficialPreviewNotice />}
+      {showsTpuv7Preview && <Tpuv7OfficialPreviewNotice />}
+    </>
+  );
+
+  const footer = (
+    <div className="mt-3">
+      <ResultContext
+        locale={locale}
+        layout="footer"
+        source="SemiAnalysis InferenceX™"
+        costBasis={captionPrices ?? undefined}
+        metaEnd={
+          <span>
+            {t.source}
+            <Link
+              target="_blank"
+              className="text-brand hover:underline"
+              href="https://semianalysis.com/datacenter-industry-model/"
+            >
+              SemiAnalysis Datacenter Industry Model
+              <ExternalLinkIcon />
+            </Link>
+            {' & '}
+            <Link target="_blank" className="text-brand hover:underline" href={TCO_SOURCE_URL}>
+              {TCO_SOURCE_TITLE}
+              <ExternalLinkIcon />
+            </Link>
+          </span>
+        }
+      />
+    </div>
+  );
+
+  const columns = useMemo<DataTableColumn<LifecycleRow>[]>(
+    () => [
+      {
+        header: t.colChip,
+        cell: (r) => r.label,
+        sortValue: (r) => r.label,
+        className: 'font-medium whitespace-nowrap',
+      },
+      {
+        header: t.colConfigNow,
+        cell: (r) => <span className="whitespace-nowrap">{r.configNow}</span>,
+        sortValue: (r) => r.configNow,
+        className: 'text-muted-foreground',
+      },
+      {
+        header: t.colFirst,
+        cell: (r) => {
+          const first = r.progression.steps[0]!;
+          return <span className="whitespace-nowrap">{runLink(first.date, first.runUrls)}</span>;
+        },
+        sortValue: (r) => r.progression.steps[0]!.date,
+      },
+      {
+        header: t.colLatest,
+        cell: (r) => {
+          const latest = r.progression.steps.at(-1)!;
+          return <span className="whitespace-nowrap">{runLink(latest.date, latest.runUrls)}</span>;
+        },
+        sortValue: (r) => r.progression.steps.at(-1)!.date,
+      },
+      {
+        header: t.colSteps,
+        align: 'right',
+        cell: (r) => String(r.series.improvementCount),
+        sortValue: (r) => r.series.improvementCount,
+        className: 'tabular-nums',
+      },
+      {
+        header: t.colGain,
+        align: 'right',
+        cell: (r) => `${r.series.improvementFactor.toFixed(2)}×`,
+        sortValue: (r) => r.series.improvementFactor,
+        className: 'tabular-nums',
+      },
+      {
+        header: t.colChips,
+        align: 'right',
+        cell: (r) => formatCompact(r.gpus, 0),
+        sortValue: (r) => r.gpus,
+        className: 'tabular-nums',
+      },
+      {
+        header: t.colTpPerMw(tokenTypeLabel),
+        align: 'right',
+        cell: (r) => formatCompact(r.tpPerMw),
+        sortValue: (r) => r.tpPerMw,
+        className: 'tabular-nums',
+      },
+      {
+        header: t.colUsers,
+        align: 'right',
+        cell: (r) => formatCompact(r.concurrentUsersNow, 0),
+        sortValue: (r) => r.concurrentUsersNow,
+        className: 'tabular-nums',
+      },
+      {
+        header: t.colRevenue,
+        align: 'right',
+        cell: (r) => formatMoney(r.series.revenuePerDay),
+        sortValue: (r) => r.series.revenuePerDay,
+        className: 'tabular-nums',
+      },
+      {
+        header: t.colCost,
+        align: 'right',
+        cell: (r) => formatMoney(r.series.costPerDay),
+        sortValue: (r) => r.series.costPerDay,
+        className: 'tabular-nums',
+      },
+      {
+        header: t.colMargin,
+        align: 'right',
+        cell: (r) => formatMoney(r.series.marginPerDay),
+        sortValue: (r) => r.series.marginPerDay,
+        className: 'tabular-nums',
+      },
+      {
+        header: t.colPayback,
+        align: 'right',
+        cell: (r) =>
+          r.series.paybackMonth === null ? (
+            <span className="text-muted-foreground">{t.never}</span>
+          ) : (
+            `${r.series.paybackMonth.toFixed(1)} ${t.monthsSuffix}`
+          ),
+        sortValue: (r) => r.series.paybackMonth ?? Infinity,
+        className: 'tabular-nums',
+      },
+      {
+        header: t.colLifetime,
+        align: 'right',
+        cell: (r) => formatMoney(r.series.lifetimeMargin),
+        sortValue: (r) => r.series.lifetimeMargin,
+        className: 'tabular-nums',
+      },
+      {
+        header: t.colAvailability,
+        align: 'right',
+        cell: (r) => `${(r.series.availability * 100).toFixed(2)}%`,
+        sortValue: (r) => r.series.availability,
+        className: 'tabular-nums',
+      },
+    ],
+    [t, tokenTypeLabel],
+  );
+
+  const assumptionInputs = [
+    {
+      id: 'calc-lifecycle-horizon',
+      label: t.horizonLabel,
+      tooltip: t.horizonTooltip,
+      value: horizonInput,
+      onChange: (e: React.ChangeEvent<HTMLInputElement>) => {
+        horizonEdited.current = true;
+        handleAssumption(setHorizonInput, 'c_life', 'calculator_lifecycle_horizon_set')(e);
+      },
+    },
+    {
+      id: 'calc-lifecycle-ramp',
+      label: t.rampLabel,
+      tooltip: t.rampTooltip,
+      value: rampInput,
+      onChange: handleAssumption(setRampInput, 'c_ramp', 'calculator_lifecycle_ramp_set'),
+    },
+    ...(isAgentic
+      ? [
+          {
+            id: 'calc-lifecycle-cache',
+            label: t.cacheLabel,
+            tooltip: t.cacheTooltip,
+            value: cacheInput,
+            onChange: handleAssumption(setCacheInput, 'c_cache', 'calculator_lifecycle_cache_set'),
+          },
+        ]
+      : []),
+    {
+      id: 'calc-lifecycle-mtbi',
+      label: t.mtbiLabel,
+      tooltip: t.mtbiTooltip,
+      value: mtbiInput,
+      onChange: handleAssumption(setMtbiInput, 'c_mtbi', 'calculator_lifecycle_mtbi_set'),
+    },
+    {
+      id: 'calc-lifecycle-recovery',
+      label: t.recoveryLabel,
+      tooltip: t.recoveryTooltip,
+      value: recoveryInput,
+      onChange: handleAssumption(setRecoveryInput, 'c_rec', 'calculator_lifecycle_recovery_set'),
+    },
+  ];
+
+  const showAssumptions = Boolean(mw) && !historical.error && !historical.loading;
+  const assumptionsPanel = (
+    <ControlPanel
+      legend={t.assumptionsGroup}
+      className="items-end sm:grid-cols-2 lg:col-span-9 xl:col-span-10 xl:grid-cols-4"
+    >
+      <div className="flex flex-col space-y-1.5">
+        <LabelWithTooltip
+          htmlFor="calc-lifecycle-price"
+          label={t.priceLabel}
+          tooltip={t.priceTooltip}
+        />
+        <div className="flex items-center gap-2">
+          <Input
+            id="calc-lifecycle-price"
+            data-testid="calc-lifecycle-price-input"
+            type="number"
+            min={0}
+            step="any"
+            value={priceInput}
+            onChange={handlePriceChange}
+            aria-label={t.priceInputLabel}
+            className="w-24"
+          />
+          <Input
+            id="calc-lifecycle-output-price"
+            data-testid="calc-lifecycle-output-price-input"
+            type="number"
+            min={0}
+            step="any"
+            value={outputPriceInput}
+            onChange={handleOutputPriceChange}
+            aria-label={t.outputPriceInputLabel}
+            className="w-24"
+          />
+          {priceEdited.current && breakEven !== null && (
+            <Button
+              type="button"
+              variant="link"
+              size="sm"
+              onClick={handlePriceReset}
+              data-testid="calc-lifecycle-price-reset"
+              className="shrink-0 text-muted-foreground hover:text-foreground"
+            >
+              {t.priceReset}
+            </Button>
+          )}
+        </div>
+      </div>
+      <div className="flex flex-col space-y-1.5 sm:col-span-2">
+        <LabelWithTooltip label={t.metricLabel} tooltip={t.metricTooltip} />
+        <SegmentedToggle<LifecycleMetric>
+          value={yMetric}
+          onValueChange={handleMetricChange}
+          ariaLabel={t.metricLabel}
+          size="default"
+          className="self-start"
+          testId="calc-lifecycle-metric"
+          options={[
+            { value: 'margin', label: t.metricMargin, testId: 'calc-lifecycle-metric-margin' },
+            {
+              value: 'marginPerMw',
+              label: t.metricMarginPerMw,
+              testId: 'calc-lifecycle-metric-margin-per-mw',
+            },
+            {
+              value: 'revenue',
+              label: t.metricRevenue,
+              testId: 'calc-lifecycle-metric-revenue',
+            },
+            {
+              value: 'revenuePerMw',
+              label: t.metricRevenuePerMw,
+              testId: 'calc-lifecycle-metric-revenue-per-mw',
+            },
+            {
+              value: 'cumulativeRevenue',
+              label: t.metricCumulativeRevenue,
+              testId: 'calc-lifecycle-metric-cumulative-revenue',
+            },
+          ]}
+        />
+      </div>
+      {assumptionInputs.map((input) => (
+        <div key={input.id} className="flex flex-col space-y-1.5">
+          <LabelWithTooltip htmlFor={input.id} label={input.label} tooltip={input.tooltip} />
+          <Input
+            id={input.id}
+            data-testid={`${input.id}-input`}
+            type="number"
+            min={0}
+            step={input.id === 'calc-lifecycle-ramp' ? 0.25 : 'any'}
+            value={input.value}
+            onChange={input.onChange}
+            className="w-32"
+          />
+        </div>
+      ))}
+    </ControlPanel>
+  );
+
+  const body = () => {
+    if (!mw) {
+      return (
+        <p className="text-sm text-muted-foreground" data-testid="calculator-lifecycle-empty">
+          {t.needMw}
+        </p>
+      );
+    }
+    if (historical.error) {
+      return (
+        <p className="text-sm text-muted-foreground" data-testid="calculator-lifecycle-error">
+          {t.errorPrefix}
+          {historical.error}
+        </p>
+      );
+    }
+    if (historical.loading) {
+      return (
+        <p className="text-sm text-muted-foreground" data-testid="calculator-lifecycle-loading">
+          {t.loading}
+        </p>
+      );
+    }
+
+    return (
+      <>
+        {rows.length > 0 && Number.isFinite(anchorMs) ? (
+          <figure data-testid="calculator-lifecycle-figure" className="relative min-w-0">
+            <ChartButtons
+              className="md:absolute md:right-0 md:top-0 md:z-10 md:mb-0"
+              chartId="fleet-lifecycle"
+              analyticsPrefix="calculator_lifecycle"
+              analyticsContext={selectionAnalyticsContext({
+                model: selectedModel,
+                sequence: selectedSequence,
+                precisions: selectedPrecisions,
+                gpuCount: visibleHwKeys.size,
+              })}
+              zoomResetEvent="d3chart_zoom_reset_fleet-lifecycle"
+              onExportCsv={handleExportCsv}
+              exportFileName={`InferenceX_fleet_lifecycle_${selectedModel}`}
+              hideImageExport={view === 'table'}
+              leadingControls={
+                <SegmentedToggle
+                  value={view}
+                  options={viewOptions}
+                  onValueChange={handleViewChange}
+                  ariaLabel={t.viewAria}
+                  testId="calculator-lifecycle-view-toggle"
+                  className="shrink-0"
+                />
+              }
+            />
+            {view === 'table' ? (
+              <>
+                <figcaption>{caption}</figcaption>
+                <DataTable
+                  data={rows}
+                  columns={columns}
+                  testId="calculator-lifecycle-table"
+                  analyticsPrefix="calculator_lifecycle_table"
+                  searchable={false}
+                />
+                {footer}
+              </>
+            ) : (
+              <FleetLifecycleChart
+                data={chartData}
+                metric={yMetric}
+                anchorMs={anchorMs}
+                yLabel={
+                  yMetric === 'revenue'
+                    ? t.chartYRevenue
+                    : yMetric === 'revenuePerMw'
+                      ? t.chartYRevenuePerMw
+                      : yMetric === 'cumulativeRevenue'
+                        ? t.chartYCumulativeRevenue
+                        : yMetric === 'marginPerMw'
+                          ? t.chartYMarginPerMw
+                          : t.chartY
+                }
+                caption={caption}
+                footer={footer}
+                breakEvenLabel={t.chartBreakEven}
+                instructions={t.chartInstructions}
+                labels={{
+                  date: t.tipDate,
+                  config: t.tipConfig,
+                  marginPerDay: t.tipMargin,
+                  marginPerMw: t.tipMarginPerMw,
+                  revenuePerDay: t.tipRevenue,
+                  revenuePerMw: t.tipRevenuePerMw,
+                  cumulativeRevenue: t.tipCumulativeRevenue,
+                  costPerDay: t.tipCost,
+                  cumulative: t.tipCumulative,
+                  runLink: t.tipRunLink,
+                  sinceFirst: t.tipSinceFirst,
+                }}
+              />
+            )}
+          </figure>
+        ) : (
+          <p className="text-sm text-muted-foreground" data-testid="calculator-lifecycle-none">
+            {unplottable.length > 0 ? t.tooSmall : t.noneMeasured}
+          </p>
+        )}
+
+        {visibleUnmeasured.length > 0 && (
+          <div
+            className="text-xs text-muted-foreground"
+            data-testid="calculator-lifecycle-unmeasured"
+          >
+            <span className="font-medium text-foreground">{t.unmeasuredTitle}.</span>{' '}
+            {t.unmeasuredIntro}
+            <ul className="mt-1 list-disc pl-5">
+              {visibleUnmeasured.map((u) => (
+                <li key={u.hwKey}>
+                  {getLabel(u.hwKey, hardwareConfig)}:{' '}
+                  {t.unmeasuredRange(u.nearestBelow, u.nearestAbove, u.datesConsidered)}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {unplottable.length > 0 && (
+          <p
+            className="text-muted-foreground text-xs"
+            data-testid="calculator-lifecycle-unplottable"
+          >
+            <span className="font-medium text-foreground">{t.note}</span>{' '}
+            {t.unplottable(unplottable.map((gpu) => getLabel(gpu, hardwareConfig)).join(', '))}
+          </p>
+        )}
+
+        {allSingleRung && (
+          <p
+            className="text-xs text-muted-foreground"
+            data-testid="calculator-lifecycle-single-rung"
+          >
+            <span className="font-medium text-foreground">{t.note}</span> {t.singleRung}
+          </p>
+        )}
+
+        {!releaseDate && rows.length > 0 && (
+          <p
+            className="text-muted-foreground text-xs"
+            data-testid="calculator-lifecycle-no-release"
+          >
+            <span className="font-medium text-foreground">{t.note}</span> {t.noReleaseDate}
+          </p>
+        )}
+
+        {hasDisagg && (
+          <p className="text-xs text-muted-foreground">
+            <span className="font-medium text-foreground">{t.note}</span>
+            {t.disagg}
+          </p>
+        )}
+
+        <p className="text-xs text-muted-foreground">
+          <span className="font-medium text-foreground">{t.note}</span>
+          {t.hybrid}
+          {t.overlayExempt}
+        </p>
+
+        <div>
+          <p className="text-xs text-muted-foreground mt-1">
+            {t.assumptions(
+              getCostProviderLabel(costProvider, locale),
+              `${mw} MW`,
+              anchorDate ?? '—',
+            )}
+          </p>
+        </div>
+      </>
+    );
+  };
+
+  return (
+    <TooltipProvider delayDuration={0}>
+      <section data-testid="calculator-lifecycle-section">
+        <Card className="gap-4">
+          <DashboardSectionHeader level="card" title={t.title} description={t.description} />
+          <div className="grid min-w-0 items-start gap-x-6 gap-y-4 lg:grid-cols-12">
+            <ControlPanel legend={t.fleetSizingGroup} className="lg:col-span-3 xl:col-span-2">
+              <div className="flex min-w-0 flex-col space-y-1.5">
+                <LabelWithTooltip htmlFor="calc-fleet-mw" label={t.mwLabel} tooltip={t.mwTooltip} />
+                <Input
+                  id="calc-fleet-mw"
+                  data-testid="calc-fleet-mw-input"
+                  type="number"
+                  min={0}
+                  step="any"
+                  placeholder={t.mwPlaceholder}
+                  value={mwInput}
+                  onChange={(e) => onMwInputChange(e.target.value)}
+                  onBlur={() => track('calculator_fleet_mw_set', { mw: mwInput })}
+                  className="w-full sm:w-32"
+                />
+              </div>
+            </ControlPanel>
+            {showAssumptions && assumptionsPanel}
+          </div>
+          {body()}
+        </Card>
+      </section>
+    </TooltipProvider>
+  );
+}

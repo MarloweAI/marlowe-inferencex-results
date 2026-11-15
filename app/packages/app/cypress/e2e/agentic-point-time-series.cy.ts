@@ -1,0 +1,1063 @@
+import { expectNoPageOverflow, unlockAgenticGate } from '../support/e2e';
+
+const timelineRequest = (
+  index: number,
+  ttftMs: number,
+  tpotMs: number,
+  overrides: Record<string, unknown> = {},
+) => ({
+  cid: 'conversation-1',
+  ri: 0,
+  ti: index,
+  wid: 'worker-1',
+  ad: 0,
+  phase: 'profiling',
+  credit: index * 1_000_000_000,
+  start: index * 1_000_000_000,
+  ack: null,
+  end: (index + 1) * 1_000_000_000,
+  ttftMs,
+  tpotMs,
+  isl: 1024,
+  osl: 128,
+  cancelled: false,
+  ...overrides,
+});
+
+const requestChartPayload = (requests: ReturnType<typeof timelineRequest>[]) => {
+  const cids = [...new Set(requests.map((request) => request.cid))];
+  const phases = [...new Set(requests.map((request) => request.phase))];
+  return {
+    version: 602,
+    timelineVersion: 6,
+    startNs: 0,
+    endNs: 7_000_000_000,
+    durationS: 7,
+    cids,
+    phases,
+    requests: requests.map((request) => [
+      cids.indexOf(request.cid),
+      phases.indexOf(request.phase),
+      Math.round(request.start / 1_000),
+      Math.round(request.end / 1_000),
+      request.ttftMs,
+      request.tpotMs,
+      request.isl,
+      request.osl,
+      request.cancelled ? 1 : 0,
+    ]),
+  };
+};
+
+const benchmarkSiblings = {
+  sku: {
+    hardware: 'b300',
+    framework: 'vllm',
+    model: 'kimik3',
+    precision: 'fp4',
+    spec_method: 'mtp',
+    benchmark_type: 'agentic_traces',
+    github_run_id: 31893747354,
+    date: '2026-08-15',
+    dataset_slug: 'fixture-dataset',
+  },
+  siblings: [
+    {
+      id: 206885,
+      conc: 8,
+      offload_mode: 'off',
+      decode_tp: 8,
+      decode_ep: 1,
+      decode_pp: 1,
+      decode_dcp_size: 8,
+      decode_pcp_size: 1,
+      decode_dp_attention: false,
+      decode_num_workers: 0,
+      prefill_tp: 8,
+      prefill_ep: 1,
+      prefill_pp: 1,
+      prefill_dcp_size: 8,
+      prefill_pcp_size: 1,
+      prefill_dp_attention: false,
+      prefill_num_workers: 0,
+      num_prefill_gpu: 8,
+      num_decode_gpu: 8,
+      disagg: false,
+      is_multinode: false,
+      tput_per_gpu: 1.2,
+      total_requests: 395,
+      is_current: true,
+      has_trace: true,
+    },
+  ],
+};
+
+describe('Agentic point request metric time series', () => {
+  beforeEach(() => {
+    cy.viewport(1440, 900);
+    const requests = [
+      timelineRequest(0, 100, 10),
+      timelineRequest(1, 200, 20),
+      timelineRequest(2, 400, 25),
+      timelineRequest(3, 800, 40),
+      timelineRequest(4, 1600, 80, { ri: 1 }),
+      timelineRequest(5, 3200, 160, { phase: 'warmup' }),
+      timelineRequest(6, 6400, 320, { cancelled: true }),
+      timelineRequest(7, 0, 0, {
+        cid: 'conversation-1::sa:subagent_001_abcd',
+        credit: 1_100_000_000,
+        start: 1_100_000_000,
+        end: 1_900_000_000,
+        ttftMs: null,
+        tpotMs: null,
+        isl: null,
+        osl: null,
+      }),
+      timelineRequest(8, 0, 0, {
+        cid: 'conversation-1::sa:subagent_001_abcd:aux:011',
+        credit: 1_200_000_000,
+        start: 1_200_000_000,
+        end: 1_800_000_000,
+        ttftMs: null,
+        tpotMs: null,
+        isl: null,
+        osl: null,
+      }),
+    ];
+    cy.intercept('GET', '/api/v1/trace-histograms*', { body: {} });
+    cy.intercept('GET', '/api/v1/trace-server-metrics*', { body: null });
+    cy.intercept('GET', '/api/v1/benchmark-siblings*', { body: benchmarkSiblings });
+    cy.intercept('GET', '/api/v1/request-chart-data*', {
+      body: requestChartPayload(requests),
+    }).as('requestChartData');
+    cy.intercept('GET', '/api/v1/request-timeline*', {
+      body: {
+        version: 6,
+        startNs: 0,
+        endNs: 7_000_000_000,
+        durationS: 7,
+        requests,
+      },
+    });
+    cy.visit('/infx/inference/agentic/206885', { onBeforeLoad: unlockAgenticGate });
+    cy.wait('@requestChartData');
+  });
+
+  it('opens the stored server log and loads it incrementally', () => {
+    const longServerLogPath =
+      'agentic/conc_1152/aiperf_artifacts/logs/aiperf/2026-08-20/server.log';
+    const firstChunk = `INFO server ready\n${'trace line\n'.repeat(4_000)}`;
+    const searchMatchOffset = 70_027;
+    const searchJumpOffset = searchMatchOffset - 16 * 1024;
+    const routerJumpChunk = `${'context line\n'.repeat(1_260)}${'x'.repeat(
+      searchMatchOffset - searchJumpOffset - 'context line\n'.length * 1_260,
+    )}router ready for requests\n`;
+    cy.intercept(
+      { method: 'GET', pathname: '/api/v1/server-log-files' },
+      {
+        body: [longServerLogPath, 'results/benchmark.log', 'results/router.log'],
+      },
+    ).as('serverLogFiles');
+    cy.intercept({ method: 'GET', pathname: '/api/v1/server-log' }, (request) => {
+      const params = new URL(request.url).searchParams;
+      const offset = Number(params.get('offset') ?? 0);
+      const fileName = params.get('file') ?? longServerLogPath;
+      if (fileName === longServerLogPath && offset === 0) {
+        request.alias = 'serverLogInitialChunk';
+      } else if (fileName === longServerLogPath && offset === 31) {
+        request.alias = 'serverLogNextChunk';
+      } else if (fileName === 'results/router.log' && offset === searchJumpOffset) {
+        request.alias = 'serverLogJumpChunk';
+      } else if (fileName === 'results/router.log' && offset === 0) {
+        request.alias = 'serverLogRouterStart';
+      }
+      request.reply({
+        body:
+          fileName === 'results/router.log'
+            ? {
+                id: 206885,
+                fileName,
+                serverLog: offset === searchJumpOffset ? routerJumpChunk : 'INFO router ready\n',
+                offset,
+                nextOffset: null,
+              }
+            : offset === 0
+              ? {
+                  id: 206885,
+                  fileName,
+                  serverLog: `\u001B[32m${firstChunk}\u001B[0m`,
+                  offset: 0,
+                  nextOffset: 31,
+                }
+              : {
+                  id: 206885,
+                  fileName,
+                  serverLog: 'INFO benchmark complete\n',
+                  offset,
+                  nextOffset: null,
+                },
+      });
+    }).as('serverLogChunk');
+    cy.intercept({ method: 'GET', pathname: '/api/v1/server-log-search' }, (request) => {
+      expect(new URL(request.url).searchParams.get('q')).to.equal('router ready');
+      request.reply({
+        body: {
+          id: 206885,
+          query: 'router ready',
+          matches: [
+            {
+              fileName: 'results/router.log',
+              offset: searchMatchOffset,
+              before: 'INFO ',
+              match: 'router ready',
+              after: ' for requests',
+            },
+          ],
+          truncated: false,
+          incomplete: true,
+        },
+      });
+    }).as('serverLogSearch');
+    cy.intercept(
+      {
+        method: 'GET',
+        pathname: '/api/v1/server-log',
+        query: {
+          id: '206885',
+          file: longServerLogPath,
+          download: '1',
+        },
+      },
+      {
+        headers: {
+          'content-disposition': 'attachment; filename="server.log"',
+          'content-type': 'text/plain; charset=utf-8',
+        },
+        body: firstChunk,
+      },
+    ).as('serverLogDownload');
+    cy.viewport(480, 900);
+    cy.get('[data-testid="detail-view-logs"]').click();
+    cy.location('search').should('contain', 'view=logs');
+    cy.wait('@serverLogFiles');
+    cy.wait('@serverLogInitialChunk');
+
+    cy.get('[data-testid="agentic-server-log-viewer"]')
+      .should('contain.text', 'Log files')
+      .and('contain.text', longServerLogPath)
+      .then(($viewer) => {
+        cy.get('#agentic-log-file').then(($trigger) => {
+          const viewerBounds = $viewer[0].getBoundingClientRect();
+          const triggerBounds = $trigger[0].getBoundingClientRect();
+          expect(triggerBounds.left).to.be.at.least(viewerBounds.left);
+          expect(triggerBounds.right).to.be.at.most(viewerBounds.right);
+        });
+      });
+    cy.get('[data-testid="server-log-content"]')
+      .should('contain.text', 'INFO server ready')
+      .and('not.contain.text', '\u001B[32m');
+
+    cy.get('[data-testid="server-log-search"]').type('router ready');
+    cy.wait('@serverLogSearch');
+    cy.get('[data-testid="server-log-search-results"]')
+      .should('contain.text', '1 match')
+      .and('contain.text', 'results/router.log')
+      .and('contain.text', 'character 70,028')
+      .and('contain.text', 'INFO router ready for requests');
+    cy.get('[data-testid="server-log-search-incomplete"]').should(
+      'contain.text',
+      'Search stopped after the first 64 million characters',
+    );
+
+    cy.get('[data-testid="go-to-server-log-match"]').click();
+    cy.wait('@serverLogJumpChunk').then(({ request }) => {
+      const params = new URL(request.url).searchParams;
+      expect(params.get('file')).to.equal('results/router.log');
+      expect(params.get('offset')).to.equal(String(searchJumpOffset));
+    });
+    cy.get('#agentic-log-file').should('contain.text', 'results/router.log');
+    cy.get('[data-testid="server-log-jump-highlight"]')
+      .should('be.visible')
+      .and('have.text', 'router ready');
+
+    cy.get('#agentic-log-file').click();
+    cy.contains('[role="option"]', longServerLogPath).click();
+    cy.get('[data-testid="server-log-content"]').should('contain.text', 'INFO server ready');
+    cy.get('[data-testid="download-selected-server-log"]')
+      .should('have.attr', 'href')
+      .and('include', 'download=1');
+    cy.get('[data-testid="download-selected-server-log"]').click();
+    cy.wait('@serverLogDownload');
+
+    cy.get('[data-testid="server-log-content"]').scrollTo('bottom');
+    cy.wait('@serverLogNextChunk');
+    cy.get('[data-testid="server-log-content"]')
+      .should('contain.text', 'INFO server ready')
+      .and('contain.text', 'INFO benchmark complete');
+    cy.contains('End of stored log').should('be.visible');
+
+    cy.get('#agentic-log-file').click();
+    cy.contains('[role="option"]', 'results/router.log').click();
+    cy.wait('@serverLogRouterStart');
+    cy.get('[data-testid="server-log-content"]').should('contain.text', 'INFO router ready');
+
+    cy.viewport(1280, 720);
+    cy.get('[data-testid="detail-view-point"]').click();
+  });
+
+  it('keeps loaded log text visible when a later chunk fails', () => {
+    const retainedLog = `INFO retained after failure\n${'trace line\n'.repeat(2_000)}`;
+    let failedChunkAttempts = 0;
+    cy.intercept(
+      { method: 'GET', pathname: '/api/v1/server-log-files' },
+      { body: ['results/server.log', 'results/benchmark.log'] },
+    );
+    cy.intercept({ method: 'GET', pathname: '/api/v1/server-log' }, (request) => {
+      const params = new URL(request.url).searchParams;
+      const fileName = params.get('file');
+      const offset = Number(params.get('offset') ?? 0);
+      if (fileName !== 'results/benchmark.log') {
+        request.reply({
+          body: {
+            id: 206885,
+            fileName,
+            serverLog: 'INFO initial file\n',
+            offset,
+            nextOffset: null,
+          },
+        });
+        return;
+      }
+      request.alias = 'retainedLogChunk';
+      if (offset === 0) {
+        request.reply({
+          body: {
+            id: 206885,
+            fileName: 'results/benchmark.log',
+            serverLog: retainedLog,
+            offset: 0,
+            nextOffset: 28,
+          },
+        });
+      } else {
+        failedChunkAttempts += 1;
+        if (failedChunkAttempts === 2) request.alias = 'failedLogChunkSettled';
+        request.reply({ statusCode: 503, body: { error: 'temporary failure' } });
+      }
+    });
+
+    cy.contains('button', 'TP8/DCP8 · c=8').should('be.visible');
+    cy.get('[data-testid="detail-view-logs"]').click();
+    cy.location('search').should('contain', 'view=logs');
+    cy.get('#agentic-log-file').click();
+    cy.contains('[role="option"]', 'results/benchmark.log').click();
+    cy.wait('@retainedLogChunk');
+    cy.get('[data-testid="server-log-content"]').should(
+      'contain.text',
+      'INFO retained after failure',
+    );
+    cy.get('[data-testid="load-more-server-log"]').click();
+    cy.wait('@failedLogChunkSettled');
+    cy.contains('The next chunk could not be loaded').should('be.visible');
+    cy.get('[data-testid="server-log-content"]').should(
+      'contain.text',
+      'INFO retained after failure',
+    );
+    cy.get('[data-testid="detail-view-point"]').click();
+    cy.location('search').should('not.contain', 'view=logs');
+  });
+
+  it('renders rolling P90 interactivity and TTFT by default using profiling requests only', () => {
+    cy.get('[data-testid="interactivity-over-time-chart"]').within(() => {
+      cy.contains('h2', 'Interactivity over time').should('be.visible');
+      cy.get('[data-testid="interactivity-percentile-toggle"]')
+        .find('[role="tab"][aria-selected="true"]')
+        .should('have.text', 'P90');
+      cy.get('[data-testid="interactivity-point-count"]').should('have.text', '6 points');
+      cy.get('svg circle').should('have.length', 6);
+      cy.get('svg').should('contain.text', 'P90 (rolling 50 req)');
+      cy.get('svg').should('contain.text', '1 / cumulative P90 TPOT');
+      cy.get('svg path[stroke="#ef4444"]').should('have.length', 1);
+    });
+
+    cy.get('[data-testid="ttft-over-time-chart"]').within(() => {
+      cy.contains('h2', 'TTFT over time').should('be.visible');
+      cy.get('[data-testid="ttft-point-count"]').should('have.text', '6 points');
+      cy.get('svg circle').should('have.length', 6);
+      cy.get('svg').should('contain.text', 'TTFT (s)');
+      cy.get('svg').should('contain.text', 'Cumulative P90 TTFT');
+      cy.get('svg path[stroke="#ef4444"]').should('have.length', 1);
+    });
+
+    cy.get('[data-testid="detail-view-point"]').click();
+    cy.get('[data-testid="unique-input-inflight-chart"]').within(() => {
+      cy.get('svg').should('contain.text', 'Cumulative average');
+      cy.get('svg path[stroke="#ef4444"]').should('have.length', 1);
+    });
+  });
+
+  it('switches ISL and OSL cards from distributions to in-flight averages', () => {
+    cy.get('[data-testid="isl-metric-chart"]').within(() => {
+      cy.get('[data-testid="isl-metric-inflight"]').click();
+      cy.contains('h2', 'Average ISL in flight').should('be.visible');
+      cy.get('svg').should('contain.text', 'Average ISL in flight (30s avg)');
+    });
+    cy.get('[data-testid="osl-metric-chart"]').within(() => {
+      cy.get('[data-testid="osl-metric-inflight"]').click();
+      cy.contains('h2', 'Average OSL in flight').should('be.visible');
+      cy.contains('Retrospective: final observed OSL').should('be.visible');
+      cy.get('svg').should('contain.text', 'Average OSL in flight (30s avg)');
+    });
+  });
+
+  it('switches the TTFT chart to E2E request latency over time', () => {
+    cy.get('[data-testid="ttft-over-time-chart"]').within(() => {
+      cy.get('[data-testid="latency-metric-e2e"]').click();
+      cy.contains('h2', 'E2E latency over time').should('be.visible');
+      cy.get('[data-testid="e2e-point-count"]').should('have.text', '8 points');
+      cy.get('svg circle').should('have.length', 8);
+      cy.get('svg').should('contain.text', 'E2E latency (s)');
+      cy.get('svg').should('contain.text', 'Cumulative P90 E2E latency');
+
+      cy.get('[data-testid="latency-metric-ttft"]').click();
+      cy.contains('h2', 'TTFT over time').should('be.visible');
+    });
+  });
+
+  it('switches each chart independently from P90 to P75', () => {
+    cy.get('[data-testid="interactivity-over-time-chart"]').within(() => {
+      cy.contains('svg', 'P90 (rolling 50 req)')
+        .find('path')
+        .first()
+        .invoke('attr', 'd')
+        .as('p90Path');
+      cy.contains('button', 'P75').click();
+      cy.get('[data-testid="interactivity-percentile-toggle"]')
+        .find('[role="tab"][aria-selected="true"]')
+        .should('have.text', 'P75');
+      cy.get('svg').should('contain.text', '1 / cumulative P75 TPOT');
+      cy.contains('svg', 'P75 (rolling 50 req)')
+        .find('path')
+        .first()
+        .invoke('attr', 'd')
+        .then(function (p75Path) {
+          expect(p75Path).not.to.equal(this.p90Path);
+        });
+    });
+
+    cy.get('[data-testid="ttft-over-time-chart"]').within(() => {
+      cy.get('[data-testid="ttft-percentile-toggle"]')
+        .find('[role="tab"][aria-selected="true"]')
+        .should('have.text', 'P90');
+      cy.contains('button', 'P75').click();
+      cy.get('svg').should('contain.text', 'P75 (rolling 50 req)');
+      cy.get('svg').should('contain.text', 'Cumulative P75 TTFT');
+    });
+  });
+
+  it('switches the request activity card from queue depth to cumulative completions', () => {
+    cy.get('[data-testid="request-activity-chart"]').within(() => {
+      cy.contains('h2', 'Request queue depth').should('be.visible');
+      cy.get('[data-testid="request-activity-completed"]').click();
+      cy.contains('h2', 'Cumulative completed requests').should('be.visible');
+      cy.get('svg').should('contain.text', 'Completed requests');
+      cy.get('svg').should('contain.text', 'Requests');
+      cy.get('[data-testid="request-activity-queue"]').click();
+      cy.contains('h2', 'Request queue depth').should('be.visible');
+    });
+  });
+
+  it('shows total idle time on the request timeline (time-boundary phase slice, consistent with the charts)', () => {
+    cy.get('[data-testid="detail-view-timeline"]').click();
+    cy.location('search').should('contain', 'view=timeline');
+    cy.get('[data-testid="timeline-total-idle-time"]').should('have.text', 'idle 0ms (0.0%)');
+    cy.get('[data-timeline-row-kind="parent"]')
+      .should('have.length', 2)
+      .then(($rows) => {
+        expect($rows.eq(0)).to.contain.text('conversation-1 · replay 1');
+        expect($rows.eq(1)).to.contain.text('conversation-1 · replay 2');
+      });
+    cy.get('[data-timeline-row-kind="aux"]')
+      .should('have.css', 'padding-left', '24px')
+      .and('contain.text', 'aux 011 · parallel');
+  });
+
+  it('restores the request timeline view after browser Back from a dataset route', () => {
+    cy.get('[data-testid="detail-view-timeline"]').click();
+    cy.get('[data-testid="timeline-total-idle-time"]').should('be.visible');
+    cy.window().then((win) => {
+      win.history.pushState({}, '', '/infx/agentx/test-dataset/conversations/conversation-1');
+    });
+    cy.go('back');
+    cy.location('pathname').should('eq', '/infx/inference/agentic/206885');
+    cy.location('search').should('contain', 'view=timeline');
+    cy.get('[data-testid="detail-view-timeline"]').should('have.attr', 'aria-selected', 'true');
+    cy.get('[data-testid="timeline-total-idle-time"]').should('be.visible');
+  });
+
+  it('retries the failed log-file inventory, initial content, and search queries independently', () => {
+    let fileAttempts = 0;
+    let failFile = true;
+    let fileAttemptsBeforeRetry = 0;
+    let contentAttempts = 0;
+    let failContent = true;
+    let contentAttemptsBeforeRetry = 0;
+    let searchAttempts = 0;
+    let failSearch = true;
+    let searchAttemptsBeforeRetry = 0;
+    cy.intercept({ method: 'GET', pathname: '/api/v1/server-log-files' }, (request) => {
+      fileAttempts += 1;
+      request.reply(
+        failFile
+          ? { statusCode: 500, body: {} }
+          : { statusCode: 200, body: ['results/server.log'] },
+      );
+    });
+    cy.intercept({ method: 'GET', pathname: '/api/v1/server-log' }, (request) => {
+      contentAttempts += 1;
+      request.reply(
+        failContent
+          ? { statusCode: 500, body: {} }
+          : {
+              statusCode: 200,
+              body: {
+                id: 206885,
+                fileName: 'results/server.log',
+                serverLog: 'INFO recovered log\n',
+                offset: 0,
+                nextOffset: null,
+              },
+            },
+      );
+    });
+    cy.intercept({ method: 'GET', pathname: '/api/v1/server-log-search' }, (request) => {
+      searchAttempts += 1;
+      request.reply(
+        failSearch
+          ? { statusCode: 500, body: {} }
+          : {
+              statusCode: 200,
+              body: { id: 206885, query: 'recovered', matches: [], truncated: false },
+            },
+      );
+    }).as('retryServerLogSearch');
+    cy.visit('/zh/infx/inference/agentic/206885?view=logs&e2e=log-retries', {
+      onBeforeLoad: unlockAgenticGate,
+    });
+
+    cy.get('[data-testid="server-log-files-query-error"]')
+      .should('contain.text', '无法加载日志文件，请稍后重试。')
+      .and('contain.text', '重试');
+    cy.then(() => {
+      fileAttemptsBeforeRetry = fileAttempts;
+      failFile = false;
+    });
+    cy.get('[data-testid="server-log-files-query-error"]').contains('button', '重试').click();
+    cy.get('[data-testid="server-log-files-query-error"]').should('not.exist');
+    cy.wrap(null).should(() => expect(fileAttempts).to.be.greaterThan(fileAttemptsBeforeRetry));
+
+    cy.get('[data-testid="server-log-content-query-error"]')
+      .should('contain.text', '无法加载日志文件，请稍后重试。')
+      .and('contain.text', '重试');
+    cy.then(() => {
+      contentAttemptsBeforeRetry = contentAttempts;
+      failContent = false;
+    });
+    cy.get('[data-testid="server-log-content-query-error"]').contains('button', '重试').click();
+    cy.get('[data-testid="server-log-content"]').should('contain.text', 'INFO recovered log');
+    cy.wrap(null).should(() =>
+      expect(contentAttempts).to.be.greaterThan(contentAttemptsBeforeRetry),
+    );
+
+    cy.get('[data-testid="server-log-search"]').type('recovered');
+    cy.get('[data-testid="server-log-search-query-error"]').should('contain.text', '重试');
+    cy.then(() => {
+      searchAttemptsBeforeRetry = searchAttempts;
+      failSearch = false;
+    });
+    cy.get('[data-testid="server-log-search-query-error"]').contains('button', '重试').click();
+    cy.wait('@retryServerLogSearch');
+    cy.get('[data-testid="server-log-search-query-error"]').should('not.exist');
+    cy.get('[data-testid="server-log-search-results"]').should('contain.text', '0 处匹配');
+    cy.wrap(null).should(() => expect(searchAttempts).to.be.greaterThan(searchAttemptsBeforeRetry));
+  });
+
+  it('renders the complete Chinese detail, mobile, metadata, and timeline click path', () => {
+    cy.viewport(390, 900);
+    cy.visit('/zh/infx/inference/agentic/206885', { onBeforeLoad: unlockAgenticGate });
+
+    cy.get('link[rel="alternate"][hreflang="en"]')
+      .should('have.attr', 'href')
+      .and('include', '/infx/inference/agentic/206885');
+    cy.get('link[rel="alternate"][hreflang="zh-CN"]')
+      .should('have.attr', 'href')
+      .and('include', '/zh/infx/inference/agentic/206885');
+    cy.get('[data-testid="sibling-sort-select"]').should('be.visible');
+
+    cy.get('[data-testid="detail-view-timeline"]').click();
+    cy.get('[data-testid="timeline-total-idle-time"]').should('be.visible');
+    cy.get('[data-testid="request-timeline-svg"]').should('have.attr', 'role', 'img');
+    cy.get('[data-testid="request-timeline-scroll"]')
+      .scrollTo('right')
+      .should(($scroller) => {
+        expect($scroller[0].scrollLeft).to.be.greaterThan(0);
+      });
+    cy.get('[data-testid="request-timeline-svg"] a > rect').then(($rects) => {
+      const viewport = $rects[0].ownerDocument.documentElement;
+      const visibleRect = [...$rects].find((element) => {
+        const bounds = element.getBoundingClientRect();
+        const centerX = (bounds.left + bounds.right) / 2;
+        const centerY = (bounds.top + bounds.bottom) / 2;
+        return (
+          bounds.width > 0 &&
+          bounds.height > 0 &&
+          bounds.left >= 0 &&
+          bounds.right <= viewport.clientWidth &&
+          bounds.top >= 0 &&
+          bounds.bottom <= viewport.clientHeight &&
+          element.ownerDocument.elementFromPoint(centerX, centerY) === element
+        );
+      });
+      expect(Boolean(visibleRect), 'visible request timeline bar').to.equal(true);
+      cy.wrap(visibleRect!).trigger('mousemove', 'center', { scrollBehavior: false });
+    });
+    cy.get('[data-testid="request-timeline-tooltip"]')
+      .should('have.css', 'position', 'fixed')
+      .then(($tooltip) => {
+        const bounds = $tooltip[0].getBoundingClientRect();
+        expect(bounds.width).to.be.greaterThan(0);
+        expect(bounds.height).to.be.greaterThan(0);
+      });
+    expectNoPageOverflow();
+    cy.get('a[href^="/zh/infx/agentx/fixture-dataset/conversations/conversation-1"]')
+      .first()
+      .should('have.attr', 'href')
+      .and('include', 'turn=0');
+    cy.get('a[href^="/zh/infx/agentx/fixture-dataset/conversations/conversation-1"]')
+      .first()
+      .click();
+    cy.location('pathname').should(
+      'equal',
+      '/zh/infx/agentx/fixture-dataset/conversations/conversation-1',
+    );
+  });
+
+  it('keeps request-chart, aggregate, and timeline failures distinct and retryable', () => {
+    const retryRequests = [timelineRequest(0, 100, 10)];
+    let requestChartAttempts = 0;
+    let failRequestChart = true;
+    let requestChartAttemptsBeforeRetry = 0;
+    let aggregateAttempts = 0;
+    let failAggregate = true;
+    let aggregateAttemptsBeforeRetry = 0;
+    let timelineAttempts = 0;
+    let failTimeline = true;
+    let timelineAttemptsBeforeRetry = 0;
+
+    cy.intercept('GET', '/api/v1/request-chart-data*', (request) => {
+      requestChartAttempts += 1;
+      request.reply(
+        failRequestChart
+          ? { statusCode: 500, body: {} }
+          : { statusCode: 200, body: requestChartPayload(retryRequests) },
+      );
+    });
+    cy.intercept('GET', '/api/v1/agentic-aggregates*', (request) => {
+      aggregateAttempts += 1;
+      const values = { mean: 10, p50: 10, p75: 10, p90: 10, p95: 10, p99: 10, n: 1 };
+      request.reply(
+        failAggregate
+          ? { statusCode: 500, body: {} }
+          : {
+              statusCode: 200,
+              body: {
+                206885: {
+                  id: 206885,
+                  isl: values,
+                  osl: values,
+                  kvCacheUtil: null,
+                  prefixCacheHitRate: null,
+                },
+              },
+            },
+      );
+    });
+    cy.intercept('GET', '/api/v1/request-timeline*', (request) => {
+      timelineAttempts += 1;
+      request.reply(
+        failTimeline
+          ? { statusCode: 500, body: {} }
+          : {
+              statusCode: 200,
+              body: {
+                version: 6,
+                startNs: 0,
+                endNs: 1_000_000_000,
+                durationS: 1,
+                requests: retryRequests,
+              },
+            },
+      );
+    });
+
+    cy.visit('/zh/infx/inference/agentic/206885', { onBeforeLoad: unlockAgenticGate });
+    cy.get('[data-testid="agentic-request-charts-query-error"]')
+      .should('contain.text', '请求图表数据加载失败')
+      .and('contain.text', '重试');
+    cy.then(() => {
+      requestChartAttemptsBeforeRetry = requestChartAttempts;
+      failRequestChart = false;
+    });
+    cy.get('[data-testid="agentic-request-charts-query-error"]').contains('button', '重试').click();
+    cy.contains('h2', '输入序列长度分布').should('be.visible');
+    cy.then(() => expect(requestChartAttempts).to.be.greaterThan(requestChartAttemptsBeforeRetry));
+
+    cy.get('[data-testid="detail-view-aggregates"]').click();
+    cy.get('[data-testid="agentic-aggregates-query-error"]')
+      .should('contain.text', '跨配置聚合数据加载失败')
+      .and('contain.text', '重试');
+    cy.then(() => {
+      aggregateAttemptsBeforeRetry = aggregateAttempts;
+      failAggregate = false;
+    });
+    cy.get('[data-testid="agentic-aggregates-query-error"]').contains('button', '重试').click();
+    cy.contains('h2', '各配置的 ISL 分布').should('be.visible');
+    cy.then(() => expect(aggregateAttempts).to.be.greaterThan(aggregateAttemptsBeforeRetry));
+
+    cy.get('[data-testid="detail-view-timeline"]').click();
+    cy.get('[data-testid="agentic-timeline-query-error"]')
+      .should('contain.text', '请求时间线加载失败')
+      .and('contain.text', '重试');
+    cy.then(() => {
+      timelineAttemptsBeforeRetry = timelineAttempts;
+      failTimeline = false;
+    });
+    cy.get('[data-testid="agentic-timeline-query-error"]').contains('button', '重试').click();
+    cy.get('[data-testid="request-timeline-svg"]').should('be.visible');
+    cy.then(() => expect(timelineAttempts).to.be.greaterThan(timelineAttemptsBeforeRetry));
+  });
+
+  it('retries trace metadata and the missing SKU navigator with their own queries', () => {
+    let traceAttempts = 0;
+    let failTrace = true;
+    let traceAttemptsBeforeRetry = 0;
+    let siblingAttempts = 0;
+    let failSibling = true;
+    let siblingAttemptsBeforeRetry = 0;
+    cy.intercept('GET', '/api/v1/trace-server-metrics*', (request) => {
+      traceAttempts += 1;
+      request.reply(failTrace ? { statusCode: 500, body: {} } : { statusCode: 200, body: null });
+    });
+    cy.intercept('GET', '/api/v1/benchmark-siblings*', (request) => {
+      siblingAttempts += 1;
+      request.reply(
+        failSibling ? { statusCode: 500, body: {} } : { statusCode: 200, body: benchmarkSiblings },
+      );
+    });
+    cy.visit('/zh/infx/inference/agentic/206885', { onBeforeLoad: unlockAgenticGate });
+
+    cy.get('[data-testid="agentic-trace-query-error"]')
+      .should('contain.text', '无法加载基准测试数据点 #206885 的 trace 数据')
+      .and('contain.text', '重试');
+    cy.then(() => {
+      traceAttemptsBeforeRetry = traceAttempts;
+      failTrace = false;
+    });
+    cy.get('[data-testid="agentic-trace-query-error"]').contains('button', '重试').click();
+    cy.get('[data-testid="agentic-trace-query-error"]').should('not.exist');
+    cy.then(() => expect(traceAttempts).to.be.greaterThan(traceAttemptsBeforeRetry));
+
+    cy.get('[data-testid="agentic-siblings-query-error"]')
+      .should('contain.text', 'SKU 导航数据加载失败')
+      .and('contain.text', '重试');
+    cy.then(() => {
+      siblingAttemptsBeforeRetry = siblingAttempts;
+      failSibling = false;
+    });
+    cy.get('[data-testid="agentic-siblings-query-error"]').contains('button', '重试').click();
+    cy.contains('button', 'TP8/DCP8 · c=8').should('be.visible');
+    cy.then(() => expect(siblingAttempts).to.be.greaterThan(siblingAttemptsBeforeRetry));
+  });
+});
+
+describe('Agentic request timeline virtualization', () => {
+  const requests = Array.from({ length: 2_000 }, (_, index) =>
+    timelineRequest(index, 10, 10, {
+      cid: `conversation-${String(index).padStart(4, '0')}`,
+      credit: index * 1_000_000_000,
+      start: index * 1_000_000_000,
+      end: (index + 1) * 1_000_000_000,
+    }),
+  );
+
+  beforeEach(() => {
+    cy.intercept('GET', '/api/v1/trace-server-metrics*', { body: null });
+    cy.intercept('GET', '/api/v1/benchmark-siblings*', { statusCode: 404 });
+    cy.intercept('GET', '/api/v1/request-chart-data*', { statusCode: 404 });
+    cy.intercept('GET', '/api/v1/request-timeline*', {
+      body: {
+        version: 5,
+        startNs: 0,
+        endNs: 2_000_000_000_000,
+        durationS: 2_000,
+        requests,
+      },
+    });
+    cy.visit('/infx/inference/agentic/206885?view=timeline', { onBeforeLoad: unlockAgenticGate });
+  });
+
+  it('keeps row labels and SVG request bars bounded to the viewport', () => {
+    cy.get('[data-testid="request-timeline-scroll"]').should('be.visible');
+    cy.get('[data-timeline-row-kind]').should(($rows) => {
+      expect($rows.length).to.be.lessThan(40);
+    });
+    cy.get('[data-testid="request-timeline-svg"] rect').should(($bars) => {
+      expect($bars.length).to.be.lessThan(100);
+    });
+
+    cy.get('[data-testid="request-timeline-scroll"]').scrollTo('bottom');
+    cy.get('[data-timeline-row-kind]').should('contain.text', 'conversation-1999');
+    cy.get('[data-timeline-row-kind]').should(($rows) => {
+      expect($rows.length).to.be.lessThan(40);
+    });
+  });
+});
+
+const pointMeta = {
+  id: 206885,
+  hardware: 'gb200',
+  framework: 'dynamo-vllm',
+  model: 'deepseek-r1-0528',
+  precision: 'fp8',
+  spec_method: 'none',
+  disagg: true,
+  conc: 128,
+  offload_mode: 'on',
+  kv_offloading: 'dram',
+  kv_offload_backend: 'lmcache',
+  kv_offload_backend_version: '0.5.1',
+  kv_p2p_transfer: 'mooncake',
+  router_name: 'vllm-router',
+  router_version: '0.1.14',
+  isl: null,
+  osl: null,
+  benchmark_type: 'agentic_traces',
+  date: '2026-06-23',
+  run_url: null,
+  server_gpu_cache_hit_rate: 0.5,
+  server_cpu_cache_hit_rate: 0.42,
+};
+
+const sourceSeries = (source: Record<string, unknown>, prompt: number, generation: number) => ({
+  source,
+  kvCacheUsage: [
+    { t: 0, value: 0.25 },
+    { t: 1, value: 0.5 },
+  ],
+  prefixCacheHitRate: [{ t: 0, value: 0.5 }],
+  queueDepth: [{ t: 0, running: 2, waiting: 1, total: 3 }],
+  promptTokensBySource: { miss: [{ t: 0, value: prompt }] },
+  promptTps: [{ t: 0, value: prompt }],
+  generationTps: [{ t: 0, value: generation }],
+  prefixCacheHitsTps: [{ t: 0, value: prompt / 2 }],
+  hostKvCacheUsage: [],
+  kvCacheUsageByEngine: [],
+});
+
+describe('Agentic point orchestrator metric sources', () => {
+  beforeEach(() => {
+    const prefill = sourceSeries(
+      {
+        id: 'dynamo|prefill|prefill-a.internal.test:7500|prefill-a|0|0',
+        adapter: 'dynamo',
+        role: 'prefill',
+        endpointUrl: 'prefill-a.internal.test:7500',
+        nativeRole: 'prefill',
+        workerId: 'prefill-a',
+        dpRank: '0',
+        engine: '0',
+      },
+      100,
+      1,
+    );
+    const decode = sourceSeries(
+      {
+        id: 'dynamo|decode|decode-a.internal.test:7516|decode-a|0|0',
+        adapter: 'dynamo',
+        role: 'decode',
+        endpointUrl: 'decode-a.internal.test:7516',
+        nativeRole: 'backend',
+        workerId: 'decode-a',
+        dpRank: '0',
+        engine: '0',
+      },
+      300,
+      400,
+    );
+    cy.intercept('GET', '/api/v1/trace-histograms*', { body: {} });
+    cy.intercept('GET', '/api/v1/benchmark-siblings*', { statusCode: 404 });
+    cy.intercept('GET', '/api/v1/request-chart-data*', { statusCode: 404 });
+    cy.intercept('GET', '/api/v1/request-timeline*', { statusCode: 404 });
+    cy.intercept('GET', '/api/v1/trace-server-metric-source*', (request) => {
+      const source = new URL(request.url).searchParams.get('source');
+      request.reply({ body: source === decode.source.id ? decode : prefill });
+    });
+    cy.intercept('GET', '/api/v1/trace-server-metrics*', {
+      body: {
+        meta: pointMeta,
+        startNs: 0,
+        endNs: 2_000_000_000,
+        durationS: 2,
+        timeslicesCount: 2,
+        kvCacheUsage: prefill.kvCacheUsage,
+        prefixCacheHitRate: prefill.prefixCacheHitRate,
+        queueDepth: prefill.queueDepth,
+        promptTokensBySource: prefill.promptTokensBySource,
+        prefillTps: prefill.promptTps,
+        decodeTps: decode.generationTps,
+        prefixCacheHitsTps: prefill.prefixCacheHitsTps,
+        hostKvCacheUsage: [],
+        kvCacheUsageByEngine: [],
+        metricSources: [{ source: prefill.source }, { source: decode.source }],
+      },
+    });
+    cy.visit('/infx/inference/agentic/206885', { onBeforeLoad: unlockAgenticGate });
+  });
+
+  it('switches every server chart to an orchestrator-normalized worker', () => {
+    cy.get('[data-testid="metric-source-toolbar"]')
+      .should('have.css', 'position', 'sticky')
+      .and('have.css', 'top', '64px');
+    cy.get('[data-testid="metric-source-select"]').should('contain.text', 'All endpoints').click();
+    cy.contains('[role="option"]', 'Decode · decode-a').click();
+
+    cy.get('[data-testid="metric-source-select"]').should('contain.text', 'Decode · decode-a');
+    cy.contains('h2', 'Throughput · Decode · decode-a').should('be.visible');
+    cy.contains('svg', 'Decode (avg n=50)').should('be.visible');
+
+    cy.get('[data-testid="metric-source-select"]').click();
+    cy.contains('[role="option"]', 'Prefill · prefill-a').click();
+    cy.contains('h2', 'Throughput · Prefill · prefill-a').should('be.visible');
+  });
+
+  it('toggles input and decode independently while keeping one visible', () => {
+    cy.get('[data-testid="throughput-series-select"]').click();
+    cy.get('[data-testid="throughput-series-input"]')
+      .should('have.attr', 'aria-selected', 'true')
+      .and('not.have.attr', 'aria-disabled', 'true');
+    cy.get('[data-testid="throughput-series-decode"]')
+      .should('have.attr', 'aria-selected', 'true')
+      .and('not.have.attr', 'aria-disabled', 'true');
+    cy.contains('svg', 'Input (avg n=50)').should('be.visible');
+    cy.contains('svg', 'Decode (avg n=50)').should('be.visible');
+    cy.contains('svg', 'Total running avg (60s burn-in)').should('be.visible');
+
+    cy.get('[data-testid="throughput-series-input"]').click();
+    cy.get('[data-testid="throughput-series-select"]').click();
+    cy.get('[data-testid="throughput-series-input"]').should('have.attr', 'aria-selected', 'false');
+    cy.get('[data-testid="throughput-series-decode"]').should('have.attr', 'aria-disabled', 'true');
+    cy.contains('svg', 'Input (avg n=50)').should('not.exist');
+    cy.contains('svg', 'Total running avg (60s burn-in)').should('not.exist');
+
+    cy.get('[data-testid="throughput-series-input"]').click();
+    cy.get('[data-testid="throughput-series-select"]').click();
+    cy.get('[data-testid="throughput-series-decode"]').click();
+    cy.get('[data-testid="throughput-series-select"]').click();
+    cy.get('[data-testid="throughput-series-input"]').should('have.attr', 'aria-disabled', 'true');
+    cy.get('[data-testid="throughput-series-decode"]').should(
+      'have.attr',
+      'aria-selected',
+      'false',
+    );
+    cy.get('body').type('{esc}');
+  });
+
+  it('retries only the selected server-metrics source query', () => {
+    const decodeSource = {
+      id: 'dynamo|decode|decode-a.internal.test:7516|decode-a|0|0',
+      adapter: 'dynamo',
+      role: 'decode' as const,
+      endpointUrl: 'decode-a.internal.test:7516',
+      nativeRole: 'backend',
+      workerId: 'decode-a',
+      dpRank: '0',
+      engine: '0',
+    };
+    const recovered = sourceSeries(decodeSource, 300, 400);
+    let attempts = 0;
+    cy.intercept('GET', '/api/v1/trace-server-metric-source*', (request) => {
+      attempts += 1;
+      request.reply(
+        attempts <= 2 ? { statusCode: 500, body: {} } : { statusCode: 200, body: recovered },
+      );
+    });
+    cy.visit('/zh/infx/inference/agentic/206885', { onBeforeLoad: unlockAgenticGate });
+    cy.get('[data-testid="metric-source-select"]').click();
+    cy.contains('[role="option"]', '解码 · decode-a').click();
+
+    cy.get('[data-testid="agentic-metric-source-query-error"]')
+      .should('contain.text', '无法加载所选服务器指标来源')
+      .and('contain.text', '重试');
+    cy.get('[data-testid="agentic-metric-source-query-error"]').contains('button', '重试').click();
+    cy.get('[data-testid="agentic-metric-source-query-error"]').should('not.exist');
+    cy.contains('h2', '吞吐量 · 解码 · decode-a').should('be.visible');
+    cy.then(() => expect(attempts).to.equal(3));
+  });
+});
+
+const engineSeries = (engineLabel: string, value: number) => ({
+  engineLabel,
+  points: [
+    { t: 0, value },
+    { t: 1, value: value + 0.05 },
+  ],
+});
+
+describe('Agentic point per-engine KV overlay', () => {
+  beforeEach(() => {
+    cy.intercept('GET', '/api/v1/trace-histograms*', { body: {} });
+    cy.intercept('GET', '/api/v1/benchmark-siblings*', { statusCode: 404 });
+    cy.intercept('GET', '/api/v1/request-chart-data*', { statusCode: 404 });
+    cy.intercept('GET', '/api/v1/request-timeline*', { statusCode: 404 });
+    cy.intercept('GET', '/api/v1/trace-server-metrics*', {
+      body: {
+        meta: pointMeta,
+        startNs: 0,
+        endNs: 2_000_000_000,
+        durationS: 2,
+        timeslicesCount: 2,
+        kvCacheUsage: [
+          { t: 0, value: 0.3 },
+          { t: 1, value: 0.35 },
+        ],
+        prefixCacheHitRate: [],
+        queueDepth: [],
+        promptTokensBySource: {},
+        prefillTps: [],
+        decodeTps: [],
+        prefixCacheHitsTps: [],
+        hostKvCacheUsage: [],
+        kvCacheUsageByEngine: [
+          engineSeries('0', 0.2),
+          engineSeries('1', 0.4),
+          engineSeries('decode', 0.6),
+        ],
+        metricSources: [],
+      },
+    });
+    cy.visit('/infx/inference/agentic/206885', { onBeforeLoad: unlockAgenticGate });
+  });
+
+  it('draws one legend entry per engine and leaves named engines unprefixed', () => {
+    cy.contains('svg', 'KV cache (%)')
+      .first()
+      .within(() => {
+        cy.contains('text', 'DP 0').should('be.visible');
+        cy.contains('text', 'DP 1').should('be.visible');
+        cy.contains('text', 'decode').should('be.visible');
+        cy.contains('text', 'DP decode').should('not.exist');
+        cy.contains('text', 'Avg').should('be.visible');
+        cy.get('path[fill="none"]').should('have.length', 4);
+      });
+  });
+});

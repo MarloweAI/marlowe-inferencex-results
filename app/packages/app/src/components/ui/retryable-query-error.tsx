@@ -1,0 +1,44 @@
+'use client';
+
+import { track } from '@/lib/analytics/analytics';
+import { useLocale } from '@/lib/i18n/use-locale';
+
+import { Button } from './button';
+
+interface RetryableQueryErrorProps {
+  message: string;
+  analyticsEvent: string;
+  onRetry: () => void | Promise<unknown>;
+  testId: string;
+}
+
+export function RetryableQueryError({
+  message,
+  analyticsEvent,
+  onRetry,
+  testId,
+}: RetryableQueryErrorProps) {
+  const locale = useLocale();
+  return (
+    <div
+      data-testid={testId}
+      role="alert"
+      aria-live="assertive"
+      aria-atomic="true"
+      className="flex items-center justify-between gap-3 rounded-lg border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive"
+    >
+      <span>{message}</span>
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        onClick={() => {
+          track(analyticsEvent);
+          void onRetry();
+        }}
+      >
+        {locale === 'zh' ? '重试' : 'Retry'}
+      </Button>
+    </div>
+  );
+}

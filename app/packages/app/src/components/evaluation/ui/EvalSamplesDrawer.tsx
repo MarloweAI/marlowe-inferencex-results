@@ -1,0 +1,621 @@
+'use client';
+
+import { Check, ChevronLeft, ChevronRight, Search, Share2, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+
+import type { EvaluationChartData } from '@/components/evaluation/types';
+import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
+import { Button, buttonVariants } from '@/components/ui/button';
+import { useEvalSamples } from '@/hooks/api/use-eval-samples';
+import { track } from '@/lib/analytics/analytics';
+import { useDialogCloseTracking } from '@/lib/analytics/use-dialog-close-tracking';
+import { useSearchTracking } from '@/lib/analytics/use-search-tracking';
+import type { EvalSamplesFilter, EvalSamplesLiveContext } from '@/lib/api/api';
+import { buildShareUrl } from '@/lib/routing/url-state';
+import { useLocale } from '@/lib/i18n/use-locale';
+
+const PAGE_SIZE = 50;
+
+const STRINGS = {
+  en: {
+    title: 'Evaluation samples',
+    searchScope: 'Search this page only',
+    score: 'score',
+    filterAll: 'All',
+    filterPassed: 'Passed',
+    filterFailed: 'Failed',
+    searchPlaceholder: 'Search prompt or response',
+    searchAriaLabel: 'Search samples on this page',
+    liveUnavailable:
+      "Per-sample data isn't available for this unofficial run. The workflow URL is missing or malformed.",
+    unofficialNotice:
+      'Unofficial run. Samples stream live from the workflow artifact and may take a few seconds to load.',
+    loading: 'Loading samples…',
+    loadError: (err: string) => `Failed to load samples: ${err}`,
+    noData:
+      'No per-sample data available for this run yet. (Older runs may not have been re-ingested with samples enabled.)',
+    noMatch: (query: string) => `No samples on this page match “${query}”`,
+    noPrompt: '(no prompt)',
+    prompt: 'Prompt',
+    fullModelOutput: 'Full model output',
+    target: 'Target',
+    extractedAnswer: 'Extracted answer',
+    modelResponse: 'Model response',
+    metrics: 'Metrics',
+    empty: '(empty)',
+    fewShotExamples: (count: number) => `Few-shot examples (${count})`,
+    exampleQuestion: (n: number) => `Example ${n} · Question`,
+    exampleAnswer: (n: number) => `Example ${n} · Answer`,
+    pagination: (start: number, end: number, total: number) =>
+      total === 0 ? '0 of 0' : `${start}–${end} of ${total}`,
+    prevPage: 'Previous page',
+    nextPage: 'Next page',
+    shareSample: 'Share',
+    copied: 'Copied',
+  },
+  zh: {
+    title: '评估样本',
+    searchScope: '仅搜索当前页',
+    score: '得分',
+    filterAll: '全部',
+    filterPassed: '通过',
+    filterFailed: '未通过',
+    searchPlaceholder: '搜索提示词或响应',
+    searchAriaLabel: '在当前页面中搜索样本',
+    liveUnavailable: '此非官方运行的逐样本数据不可用。工作流 URL 缺失或格式错误。',
+    unofficialNotice: '非官方运行。样本从工作流产物实时加载，可能需要几秒钟。',
+    loading: '正在加载样本…',
+    loadError: (err: string) => `加载样本失败：${err}`,
+    noData: '此次运行暂无逐样本数据。（较早的运行可能未在启用样本功能后重新入库。）',
+    noMatch: (query: string) => `当前页面无匹配“${query}”的样本`,
+    noPrompt: '（无提示词）',
+    prompt: '提示词',
+    fullModelOutput: '完整模型输出',
+    target: '目标答案',
+    extractedAnswer: '提取的答案',
+    modelResponse: '模型响应',
+    metrics: '指标',
+    empty: '（空）',
+    fewShotExamples: (count: number) => `Few-shot 示例（${count}）`,
+    exampleQuestion: (n: number) => `示例 ${n} · 问题`,
+    exampleAnswer: (n: number) => `示例 ${n} · 答案`,
+    pagination: (start: number, end: number, total: number) =>
+      total === 0 ? '共 0 条' : `第 ${start}–${end} 条，共 ${total} 条`,
+    prevPage: '上一页',
+    nextPage: '下一页',
+    shareSample: '分享',
+    copied: '已复制',
+  },
+} as const;
+
+interface EvalSamplesDrawerProps {
+  row: EvaluationChartData | null;
+  onClose: () => void;
+  initialDocId?: number | null;
+}
+
+export default function EvalSamplesDrawer({
+  row,
+  onClose,
+  initialDocId = null,
+}: EvalSamplesDrawerProps) {
+  const open = row !== null;
+  const locale = useLocale();
+  const t = STRINGS[locale];
+  const [filter, setFilter] = useState<EvalSamplesFilter>('all');
+  const [page, setPage] = useState(0);
+  const [search, setSearch] = useState('');
+  useSearchTracking('evaluation_samples_searched', search);
+  useDialogCloseTracking(open, 'evaluation_samples_closed');
+  const [expanded, setExpanded] = useState<Set<number>>(new Set());
+  const [requestedDocId, setRequestedDocId] = useState<number | null>(initialDocId);
+  const [copiedTarget, setCopiedTarget] = useState<number | 'drawer' | null>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setFilter('all');
+    setPage(0);
+    setSearch('');
+    setExpanded(new Set());
+    setRequestedDocId(initialDocId);
+    setCopiedTarget(null);
+  }, [row?.evalResultId, open, initialDocId]);
+
+  const liveContext = useMemo<EvalSamplesLiveContext | null>(() => {
+    if (!row || row.evalResultId > 0) return null;
+    const runId = extractRunIdFromUrl(row.runUrl);
+    if (!runId) return null;
+    return {
+      runId,
+      task: row.benchmark,
+      model: row.model,
+      framework: row.framework,
+      hardware: row.hardware,
+      precision: row.precision,
+      specMethod: row.specDecode,
+      disagg: row.disagg,
+      conc: row.conc,
+    };
+  }, [row]);
+
+  const { data, isLoading, isError, error } = useEvalSamples({
+    evalResultId: row?.evalResultId ?? null,
+    liveContext,
+    filter,
+    offset: page * PAGE_SIZE,
+    limit: PAGE_SIZE,
+    docId: requestedDocId,
+  });
+
+  const filteredSamples = useMemo(() => {
+    if (!data) return [];
+    const q = search.trim().toLowerCase();
+    if (!q) return data.samples;
+    return data.samples.filter(
+      (s) =>
+        (s.prompt && s.prompt.toLowerCase().includes(q)) ||
+        (s.response && s.response.toLowerCase().includes(q)) ||
+        (s.target && s.target.toLowerCase().includes(q)),
+    );
+  }, [data, search]);
+
+  const total = data?.total ?? 0;
+  const passedTotal = data?.passedTotal ?? 0;
+  const failedTotal = data?.failedTotal ?? 0;
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const safePage = Math.min(page, totalPages - 1);
+
+  useEffect(() => {
+    if (requestedDocId === null || !data || data.offset === undefined) return;
+    if (!data.samples.some((sample) => sample.docId === requestedDocId)) return;
+    setPage(Math.floor(data.offset / PAGE_SIZE));
+    setExpanded(new Set([requestedDocId]));
+    requestAnimationFrame(() => {
+      bodyRef.current
+        ?.querySelector<HTMLElement>(`[data-eval-sample-id="${requestedDocId}"]`)
+        ?.scrollIntoView({ block: 'center' });
+    });
+    setRequestedDocId(null);
+  }, [data, requestedDocId]);
+
+  const handleFilterChange = (next: EvalSamplesFilter) => {
+    setFilter(next);
+    setPage(0);
+    track('evaluation_samples_filter_changed', { filter: next });
+  };
+
+  const handleToggleExpand = (docId: number) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(docId)) next.delete(docId);
+      else next.add(docId);
+      return next;
+    });
+    track('evaluation_samples_expanded', { doc_id: docId });
+  };
+
+  const handlePageChange = (delta: 1 | -1) => {
+    setPage((p) => Math.max(0, Math.min(totalPages - 1, p + delta)));
+    track('evaluation_samples_paged', { direction: delta > 0 ? 'next' : 'prev' });
+  };
+
+  const handleShare = async (docId?: number) => {
+    if (!row || row.evalResultId <= 0) return;
+    const url = new URL(buildShareUrl());
+    url.searchParams.set('eval', String(row.evalResultId));
+    if (docId === undefined) url.searchParams.delete('sample');
+    else url.searchParams.set('sample', String(docId));
+
+    try {
+      await navigator.clipboard.writeText(url.toString());
+    } catch {
+      const textArea = document.createElement('textarea');
+      textArea.value = url.toString();
+      document.body.append(textArea);
+      textArea.select();
+      document.execCommand('copy');
+      textArea.remove();
+    }
+
+    const target = docId ?? 'drawer';
+    setCopiedTarget(target);
+    setTimeout(() => setCopiedTarget((current) => (current === target ? null : current)), 2000);
+    track(docId === undefined ? 'evaluation_drawer_link_copied' : 'evaluation_sample_link_copied', {
+      eval_result_id: row.evalResultId,
+      ...(docId === undefined ? {} : { doc_id: docId }),
+    });
+  };
+
+  const isUnofficial = row !== null && row.evalResultId <= 0;
+  const liveUnavailable = isUnofficial && liveContext === null;
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(o) => {
+        if (!o) onClose();
+      }}
+    >
+      <DialogContent
+        data-testid="eval-samples-drawer"
+        className="
+          inset-x-0 bottom-0 top-auto left-auto translate-x-0 translate-y-0
+          w-auto max-w-none h-auto max-h-[85vh]
+          rounded-none rounded-t-xl border-t border-l-0 p-0
+          grid-rows-[auto_auto_1fr_auto] gap-0
+          data-[state=open]:zoom-in-100! data-[state=closed]:zoom-out-100!
+          data-[state=open]:slide-in-from-left-0! data-[state=open]:slide-in-from-bottom!
+          data-[state=closed]:slide-out-to-left-0! data-[state=closed]:slide-out-to-bottom!
+          sm:inset-x-auto sm:right-0 sm:top-0 sm:bottom-auto sm:left-auto
+          sm:w-[90vw] sm:max-w-4xl sm:h-screen sm:max-h-screen
+          sm:rounded-none sm:border-l sm:border-t-0
+          sm:data-[state=open]:slide-in-from-bottom-0! sm:data-[state=open]:slide-in-from-right!
+          sm:data-[state=closed]:slide-out-to-bottom-0! sm:data-[state=closed]:slide-out-to-right!
+        "
+        aria-describedby={undefined}
+      >
+        <div className="flex items-start gap-3 border-b border-border px-4 pt-3 pb-4 pr-12 sm:px-6 sm:pr-12">
+          <div className="min-w-0 flex-1 pt-1">
+            <DialogTitle className="text-base leading-snug">{t.title}</DialogTitle>
+            {row && (
+              <p className="mt-2 break-words font-mono text-xs leading-relaxed text-muted-foreground">
+                {row.configLabel.replaceAll('\n', ' ')}
+              </p>
+            )}
+            {row && (
+              <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground tabular-nums">
+                <span className="uppercase">{row.benchmark}</span>
+                <span className="font-medium text-foreground">
+                  {t.score} {(row.score * 100).toFixed(1)}%
+                </span>
+                <span>{row.date}</span>
+              </div>
+            )}
+          </div>
+          {row && row.evalResultId > 0 && (
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              onClick={() => handleShare()}
+              className="-mt-1.5 shrink-0 md:mt-0"
+              aria-label={t.shareSample}
+              title={t.shareSample}
+              data-testid="eval-drawer-share-button"
+            >
+              {copiedTarget === 'drawer' ? (
+                <Check className="size-3.5" />
+              ) : (
+                <Share2 className="size-3.5" />
+              )}
+              {copiedTarget === 'drawer' ? t.copied : t.shareSample}
+            </Button>
+          )}
+        </div>
+
+        <div className="flex flex-wrap items-start gap-2 border-b border-border bg-muted/20 px-4 py-3 sm:px-6">
+          <FilterChip
+            label={t.filterAll}
+            count={passedTotal + failedTotal}
+            active={filter === 'all'}
+            onClick={() => handleFilterChange('all')}
+          />
+          <FilterChip
+            label={t.filterPassed}
+            count={passedTotal}
+            active={filter === 'passed'}
+            onClick={() => handleFilterChange('passed')}
+            tone="passed"
+          />
+          <FilterChip
+            label={t.filterFailed}
+            count={failedTotal}
+            active={filter === 'failed'}
+            onClick={() => handleFilterChange('failed')}
+            tone="failed"
+          />
+          <div className="order-last w-full sm:order-none sm:ml-auto sm:min-w-0 sm:max-w-xs sm:flex-1">
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+              <input
+                type="text"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder={t.searchPlaceholder}
+                className="h-11 w-full rounded-md border border-border bg-background pl-9 pr-3 text-sm focus:outline-none md:h-8 md:text-xs"
+                aria-label={t.searchAriaLabel}
+                aria-describedby="eval-samples-search-scope"
+              />
+            </div>
+            <p id="eval-samples-search-scope" className="mt-1 text-2xs text-muted-foreground">
+              {t.searchScope}
+            </p>
+          </div>
+        </div>
+
+        <div ref={bodyRef} className="min-h-0 overflow-auto px-4 py-4 sm:px-6">
+          {liveUnavailable && (
+            <p className="rounded-md bg-warning/10 px-3 py-2 text-xs text-foreground">
+              {t.liveUnavailable}
+            </p>
+          )}
+          {!liveUnavailable && isUnofficial && (
+            <p className="mb-2 text-xs text-muted-foreground">{t.unofficialNotice}</p>
+          )}
+          {!liveUnavailable && isLoading && (
+            <p className="py-8 text-center text-sm text-muted-foreground">{t.loading}</p>
+          )}
+          {!liveUnavailable && isError && (
+            <p className="py-8 text-center text-sm text-destructive">
+              {t.loadError(String(error))}
+            </p>
+          )}
+          {!liveUnavailable && !isLoading && !isError && total === 0 && (
+            <p className="py-8 text-center text-sm text-muted-foreground">{t.noData}</p>
+          )}
+          {!liveUnavailable &&
+            !isLoading &&
+            !isError &&
+            filteredSamples.length === 0 &&
+            total > 0 && (
+              <p className="py-8 text-center text-sm text-muted-foreground">{t.noMatch(search)}</p>
+            )}
+          <ul className="space-y-2">
+            {filteredSamples.map((s) => (
+              <li
+                key={s.docId}
+                data-eval-sample-id={s.docId}
+                className="rounded-md border border-border/70 bg-card/30 transition-colors hover:bg-card/50"
+              >
+                <button
+                  type="button"
+                  onClick={() => handleToggleExpand(s.docId)}
+                  className="flex min-h-11 w-full items-center gap-3 rounded-md px-3 py-3 text-left focus-visible:outline-none"
+                  aria-expanded={expanded.has(s.docId)}
+                >
+                  <PassFailBadge
+                    passed={s.passed}
+                    label={s.passed ? t.filterPassed : t.filterFailed}
+                  />
+                  <span className="font-mono text-xs text-muted-foreground tabular-nums">
+                    #{s.docId}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate text-sm">{s.prompt ?? t.noPrompt}</span>
+                  <ChevronRight
+                    className={`size-4 shrink-0 text-muted-foreground transition-transform ${expanded.has(s.docId) ? 'rotate-90' : ''}`}
+                    aria-hidden="true"
+                  />
+                </button>
+                {expanded.has(s.docId) && (
+                  <div className="space-y-4 border-t border-border/50 px-3 py-4 text-xs">
+                    <FewShotBlock demonstrations={s.demonstrations} locale={locale} />
+                    <Block label={t.prompt} value={s.prompt} emptyText={t.empty} />
+                    {s.rawResponse !== null && s.rawResponse !== s.response ? (
+                      <>
+                        <Block
+                          label={t.fullModelOutput}
+                          value={s.rawResponse}
+                          emptyText={t.empty}
+                        />
+                        <div
+                          className="grid gap-3 sm:grid-cols-2"
+                          data-testid="eval-sample-answer-comparison"
+                        >
+                          <Block label={t.target} value={s.target} emptyText={t.empty} />
+                          <Block label={t.extractedAnswer} value={s.response} emptyText={t.empty} />
+                        </div>
+                      </>
+                    ) : (
+                      <div
+                        className="grid gap-3 sm:grid-cols-2"
+                        data-testid="eval-sample-answer-comparison"
+                      >
+                        <Block label={t.target} value={s.target} emptyText={t.empty} />
+                        <Block label={t.modelResponse} value={s.response} emptyText={t.empty} />
+                      </div>
+                    )}
+                    {Object.keys(s.metrics).length > 0 && (
+                      <Block
+                        label={t.metrics}
+                        value={Object.entries(s.metrics)
+                          .map(([k, v]) => `${k} = ${v}`)
+                          .join('\n')}
+                        emptyText={t.empty}
+                      />
+                    )}
+                    {row && row.evalResultId > 0 && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="xs"
+                        onClick={() => handleShare(s.docId)}
+                        aria-label={t.shareSample}
+                        title={t.shareSample}
+                        data-testid={`eval-sample-share-${s.docId}`}
+                      >
+                        {copiedTarget === s.docId ? (
+                          <Check className="size-3.5" />
+                        ) : (
+                          <Share2 className="size-3.5" />
+                        )}
+                        {copiedTarget === s.docId ? t.copied : t.shareSample}
+                      </Button>
+                    )}
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border px-4 py-3 text-xs text-muted-foreground tabular-nums sm:px-6">
+          <span>
+            {t.pagination(
+              safePage * PAGE_SIZE + 1,
+              Math.min((safePage + 1) * PAGE_SIZE, total),
+              total,
+            )}
+          </span>
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => handlePageChange(-1)}
+              disabled={safePage === 0}
+              className="flex size-11 items-center justify-center rounded-md hover:bg-muted focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-30 md:size-8"
+              aria-label={t.prevPage}
+            >
+              <ChevronLeft className="size-4" />
+            </button>
+            <span>
+              {safePage + 1} / {totalPages}
+            </span>
+            <button
+              type="button"
+              onClick={() => handlePageChange(1)}
+              disabled={safePage >= totalPages - 1}
+              className="flex size-11 items-center justify-center rounded-md hover:bg-muted focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-30 md:size-8"
+              aria-label={t.nextPage}
+            >
+              <ChevronRight className="size-4" />
+            </button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+interface FilterChipProps {
+  label: string;
+  count: number;
+  active: boolean;
+  onClick: () => void;
+  tone?: 'passed' | 'failed';
+}
+
+function extractRunIdFromUrl(url: string | undefined): string | null {
+  if (!url) return null;
+  const m = url.match(/\/actions\/runs\/(?<runId>\d+)/u);
+  return m?.groups?.runId ?? null;
+}
+
+function FilterChip({ label, count, active, onClick, tone }: FilterChipProps) {
+  const toneClass =
+    tone === 'passed'
+      ? active
+        ? 'border-success/30 text-success aria-pressed:bg-success/10 aria-pressed:text-success dark:aria-pressed:bg-success/10'
+        : 'hover:border-success/30 hover:text-success'
+      : tone === 'failed'
+        ? active
+          ? 'border-destructive/30 text-destructive aria-pressed:bg-destructive/10 aria-pressed:text-destructive dark:aria-pressed:bg-destructive/10'
+          : 'hover:border-destructive/30 hover:text-destructive'
+        : '';
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={buttonVariants({ variant: 'outline', size: 'xs', className: toneClass })}
+      aria-pressed={active}
+    >
+      {label}
+      <span className="tabular-nums text-muted-foreground">{count}</span>
+    </button>
+  );
+}
+
+function PassFailBadge({ passed, label }: { passed: boolean | null; label: string }) {
+  if (passed === null) {
+    return (
+      <span className="inline-flex size-4 shrink-0 items-center justify-center rounded-full border border-muted-foreground/30 text-3xs text-muted-foreground">
+        ?
+      </span>
+    );
+  }
+  const Icon = passed ? Check : X;
+  return (
+    <span
+      role="img"
+      aria-label={label}
+      className={`inline-flex size-4 shrink-0 items-center justify-center rounded-full border ${
+        passed
+          ? 'border-success/30 bg-success/10 text-success'
+          : 'border-destructive/30 bg-destructive/10 text-destructive'
+      }`}
+    >
+      <Icon className="size-2.5" strokeWidth={3} aria-hidden="true" />
+    </span>
+  );
+}
+
+function FewShotBlock({
+  demonstrations,
+  locale,
+}: {
+  demonstrations: { question: string; answer: string }[] | null;
+  locale: 'en' | 'zh';
+}) {
+  const [open, setOpen] = useState(true);
+  if (!demonstrations || demonstrations.length === 0) return null;
+  const demos = demonstrations;
+  const t = STRINGS[locale];
+  return (
+    <div className="rounded-sm border border-border/30 p-2">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 text-xs font-medium text-foreground transition-colors hover:text-muted-foreground"
+        aria-expanded={open}
+      >
+        <ChevronRight
+          className={`size-3.5 transition-transform ${open ? 'rotate-90' : ''}`}
+          aria-hidden="true"
+        />
+        {t.fewShotExamples(demos.length)}
+      </button>
+      {open && (
+        <div className="mt-2 space-y-2">
+          {demos.map((d, i) => (
+            <div
+              // eslint-disable-next-line react/no-array-index-key -- demo order is the only stable identifier
+              key={i}
+              className="border-t border-border/20 pt-2"
+            >
+              <div className="mb-1 text-xs font-medium text-muted-foreground">
+                {t.exampleQuestion(i + 1)}
+              </div>
+              <pre className="mb-2 whitespace-pre-wrap font-mono text-2xs leading-snug wrap-break-word">
+                {d.question}
+              </pre>
+              <div className="mb-1 text-xs font-medium text-muted-foreground">
+                {t.exampleAnswer(i + 1)}
+              </div>
+              <pre className="whitespace-pre-wrap font-mono text-2xs leading-snug wrap-break-word">
+                {d.answer}
+              </pre>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Block({
+  label,
+  value,
+  emptyText,
+}: {
+  label: string;
+  value: string | null;
+  emptyText: string;
+}) {
+  return (
+    <div className="min-w-0">
+      <div className="mb-2 text-xs font-medium text-muted-foreground">{label}</div>
+      <pre className="max-h-72 overflow-auto whitespace-pre-wrap rounded-sm border border-border/50 bg-muted/30 p-3 font-mono text-xs leading-relaxed wrap-break-word">
+        {value ?? <span className="text-muted-foreground">{emptyText}</span>}
+      </pre>
+    </div>
+  );
+}

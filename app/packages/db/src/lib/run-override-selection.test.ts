@@ -1,0 +1,234 @@
+import { describe, expect, it } from 'vitest';
+
+import {
+  BENCHMARK_POINT_BACKFILLS,
+  CHANGELOG_BACKFILLS,
+  CONCLUSION_OVERRIDES,
+  PURGED_BENCHMARK_POINTS,
+  PURGED_RUN_ATTEMPTS,
+  PURGED_RUNS,
+  RUN_FRAMEWORK_OVERRIDES,
+} from '../etl/run-overrides';
+import { selectRunOverrides } from './run-override-selection';
+
+describe('run override selection', () => {
+  it.each([38878624849, 38925660934])(
+    'selects only the whole-run purge for Muse Spark H100 256k corpus run %s',
+    (runId) => {
+      expect(selectRunOverrides(['--run-id', String(runId), '--yes'])).toEqual({
+        runId,
+        conclusions: new Map(),
+        changelogs: [],
+        benchmarks: [],
+        purgedRuns: new Set([runId]),
+        purgedAttempts: new Map(),
+        purgedPoints: [],
+        frameworks: [],
+      });
+    },
+  );
+
+  it.each([
+    32403083041, 33219708211, 31927376673, 34413290524, 33716849615, 33219706372, 32346724519,
+  ])('selects only the whole-run purge for GB300 FP4 TensorRT-LLM AgentX run %s', (runId) => {
+    expect(selectRunOverrides(['--run-id', String(runId), '--yes'])).toEqual({
+      runId,
+      conclusions: new Map(),
+      changelogs: [],
+      benchmarks: [],
+      purgedRuns: new Set([runId]),
+      purgedAttempts: new Map(),
+      purgedPoints: [],
+      frameworks: [],
+    });
+  });
+
+  it.each([35806602041, 34511705667])(
+    'selects only the whole-run purge for MiniMax M3 GB200 TensorRT-LLM run %s',
+    (runId) => {
+      expect(selectRunOverrides(['--run-id', String(runId), '--yes'])).toEqual({
+        runId,
+        conclusions: new Map(),
+        changelogs: [],
+        benchmarks: [],
+        purgedRuns: new Set([runId]),
+        purgedAttempts: new Map(),
+        purgedPoints: [],
+        frameworks: [],
+      });
+    },
+  );
+
+  it('selects only the whole-run purge for run 35855544139', () => {
+    expect(selectRunOverrides(['--run-id', '35855544139', '--yes'])).toEqual({
+      runId: 35855544139,
+      conclusions: new Map(),
+      changelogs: [],
+      benchmarks: [],
+      purgedRuns: new Set([35855544139]),
+      purgedAttempts: new Map(),
+      purgedPoints: [],
+      frameworks: [],
+    });
+  });
+
+  it('selects only the whole-run purge for MI355X DSV4 ATOM disagg LMCache AgentX run 36734492117', () => {
+    expect(selectRunOverrides(['--run-id', '36734492117', '--yes'])).toEqual({
+      runId: 36734492117,
+      conclusions: new Map(),
+      changelogs: [],
+      benchmarks: [],
+      purgedRuns: new Set([36734492117]),
+      purgedAttempts: new Map(),
+      purgedPoints: [],
+      frameworks: [],
+    });
+  });
+
+  it('selects only the whole-run purge for the H200 Kimi-K3 simple-power run 34819961093', () => {
+    expect(selectRunOverrides(['--run-id', '34819961093', '--yes'])).toEqual({
+      runId: 34819961093,
+      conclusions: new Map(),
+      changelogs: [],
+      benchmarks: [],
+      purgedRuns: new Set([34819961093]),
+      purgedAttempts: new Map(),
+      purgedPoints: [],
+      frameworks: [],
+    });
+  });
+
+  it('selects only the whole-run purge for run 34819564154', () => {
+    expect(selectRunOverrides(['--run-id', '34819564154', '--yes'])).toEqual({
+      runId: 34819564154,
+      conclusions: new Map(),
+      changelogs: [],
+      benchmarks: [],
+      purgedRuns: new Set([34819564154]),
+      purgedAttempts: new Map(),
+      purgedPoints: [],
+      frameworks: [],
+    });
+  });
+
+  it('selects only the whole-run purge for run 35165441471', () => {
+    expect(selectRunOverrides(['--run-id', '35165441471', '--yes'])).toEqual({
+      runId: 35165441471,
+      conclusions: new Map(),
+      changelogs: [],
+      benchmarks: [],
+      purgedRuns: new Set([35165441471]),
+      purgedAttempts: new Map(),
+      purgedPoints: [],
+      frameworks: [],
+    });
+  });
+
+  it('selects only the whole-run purge for the uninitialized MTP run', () => {
+    expect(selectRunOverrides(['--run-id', '34926284365', '--yes'])).toEqual({
+      runId: 34926284365,
+      conclusions: new Map(),
+      changelogs: [],
+      benchmarks: [],
+      purgedRuns: new Set([34926284365]),
+      purgedAttempts: new Map(),
+      purgedPoints: [],
+      frameworks: [],
+    });
+  });
+
+  it('selects only the llm-d framework reassignment for TPU v7 Qwen3.5 xPyD run 40744397059', () => {
+    expect(selectRunOverrides(['--run-id', '40744397059'])).toEqual({
+      runId: 40744397059,
+      conclusions: new Map(),
+      changelogs: [],
+      benchmarks: [],
+      purgedRuns: new Set(),
+      purgedAttempts: new Map(),
+      purgedPoints: [],
+      frameworks: [expect.objectContaining({ id: 'run-40744397059-llmd-vllm-router' })],
+    });
+  });
+
+  it('makes an unregistered ingest a no-op without touching historical rows', () => {
+    expect(
+      selectRunOverrides(['--run-id', '33721476500', '--allow-unregistered-run', '--yes']),
+    ).toEqual({
+      runId: 33721476500,
+      conclusions: new Map(),
+      changelogs: [],
+      benchmarks: [],
+      purgedRuns: new Set(),
+      purgedAttempts: new Map(),
+      purgedPoints: [],
+      frameworks: [],
+    });
+  });
+
+  it('still selects registered corrections when allowing an unregistered run', () => {
+    expect(selectRunOverrides(['--run-id', '33219708211', '--allow-unregistered-run'])).toEqual(
+      selectRunOverrides(['--run-id', '33219708211']),
+    );
+    expect(() => selectRunOverrides(['--allow-unregistered-run'])).toThrow('requires --run-id');
+  });
+
+  it('keeps all registered operations when no run is selected', () => {
+    expect(selectRunOverrides(['--yes'])).toEqual({
+      runId: undefined,
+      conclusions: CONCLUSION_OVERRIDES,
+      changelogs: CHANGELOG_BACKFILLS,
+      benchmarks: BENCHMARK_POINT_BACKFILLS,
+      purgedRuns: PURGED_RUNS,
+      purgedAttempts: PURGED_RUN_ATTEMPTS,
+      purgedPoints: PURGED_BENCHMARK_POINTS,
+      frameworks: RUN_FRAMEWORK_OVERRIDES,
+    });
+  });
+
+  it('scopes every operation type to its selected run', () => {
+    const ids = new Set([
+      ...CONCLUSION_OVERRIDES.keys(),
+      ...CHANGELOG_BACKFILLS.map((entry) => entry.githubRunId),
+      ...BENCHMARK_POINT_BACKFILLS.map((entry) => entry.githubRunId),
+      ...PURGED_RUNS,
+      ...PURGED_RUN_ATTEMPTS.keys(),
+      ...PURGED_BENCHMARK_POINTS.map((entry) => entry.githubRunId),
+      ...RUN_FRAMEWORK_OVERRIDES.map((entry) => entry.githubRunId),
+    ]);
+    for (const id of ids) {
+      const selected = selectRunOverrides([`--run-id=${id}`]);
+      expect([...selected.conclusions]).toEqual(
+        [...CONCLUSION_OVERRIDES].filter(([run]) => run === id),
+      );
+      expect(selected.changelogs).toEqual(
+        CHANGELOG_BACKFILLS.filter((entry) => entry.githubRunId === id),
+      );
+      expect(selected.benchmarks).toEqual(
+        BENCHMARK_POINT_BACKFILLS.filter((entry) => entry.githubRunId === id),
+      );
+      expect([...selected.purgedRuns]).toEqual([...PURGED_RUNS].filter((run) => run === id));
+      expect([...selected.purgedAttempts]).toEqual(
+        [...PURGED_RUN_ATTEMPTS].filter(([run]) => run === id),
+      );
+      expect(selected.purgedPoints).toEqual(
+        PURGED_BENCHMARK_POINTS.filter((entry) => entry.githubRunId === id),
+      );
+      expect(selected.frameworks).toEqual(
+        RUN_FRAMEWORK_OVERRIDES.filter((entry) => entry.githubRunId === id),
+      );
+    }
+  });
+
+  it.each(['', '0', '-1', '1.2', '1e3', '123abc', ' 123 ', '9007199254740992'])(
+    'rejects invalid run ID %j before any database access',
+    (value) => {
+      expect(() => selectRunOverrides([`--run-id=${value}`])).toThrow('positive integer');
+    },
+  );
+
+  it('rejects a missing value, unknown flags, and unregistered runs', () => {
+    expect(() => selectRunOverrides(['--run-id'])).toThrow();
+    expect(() => selectRunOverrides(['--runid', '33219708211'])).toThrow();
+    expect(() => selectRunOverrides(['--run-id', '1'])).toThrow('No registered overrides');
+  });
+});

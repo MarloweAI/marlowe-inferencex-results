@@ -1,0 +1,1341 @@
+'use client';
+
+import { track } from '@/lib/analytics/analytics';
+import { type ReactNode, useCallback, useEffect, useMemo, useRef } from 'react';
+import * as d3 from 'd3';
+
+import { getModelSortIndex } from '@/lib/catalog/constants';
+import { D3Chart, type D3ChartHandle, type LayerConfig } from '@/lib/d3-chart/D3Chart';
+import { renderErrorBars } from '@/lib/d3-chart/layers/error-bars';
+import { renderPoints, updatePointsOnZoom } from '@/lib/d3-chart/layers/points';
+import { computeTooltipPosition } from '@/lib/d3-chart/layers/scatter-points';
+import {
+  attachOverlayXMarkerHandlers,
+  overlayMarkerPosition,
+  xMarkerPath,
+} from '@/lib/d3-chart/overlay-x-marker';
+import { chartHoverCard } from '@/lib/d3-chart/tooltip-shell';
+import { ChartPointDetails, type ChartPointDetailsRow } from '@/components/ui/chart-point-details';
+import { computeLeftMargin } from '@/lib/d3-chart/dynamic-margins';
+
+import { useEvaluation } from '@/components/evaluation/EvaluationContext';
+import type { EvaluationChartData } from '@/components/evaluation/types';
+import { parallelismPills } from '@/components/evaluation/chart-data';
+import {
+  type EvalBenchmark,
+  type Precision,
+  getEvalBenchmarkLabel,
+  getChartWatermark,
+  getPrecisionLabel,
+} from '@/lib/catalog/data-mappings';
+import { useLocale } from '@/lib/i18n/use-locale';
+import type { Locale } from '@/lib/i18n/i18n';
+import ChartLegend from '@/components/ui/chart-legend';
+import { EmptyState } from '@/components/ui/empty-state';
+import { Skeleton } from '@/components/ui/skeleton';
+import {
+  useOverlayScopeReconciliation,
+  useUnofficialRun,
+} from '@/providers/unofficial-run-provider';
+import { useThemeColors } from '@/hooks/useThemeColors';
+import { computeToggle } from '@/hooks/useTogglableSet';
+import { overlayRunColor, overlayRunIndex } from '@/lib/charts/overlay-run-style';
+
+const BASE_MARGIN = { top: 24, right: 24, bottom: 52 };
+const OVERLAY_X_SIZE = 6;
+const OVERLAY_X_HOVER_SIZE = 8;
+const OVERLAY_HIT_RADIUS = 10;
+const OVERLAY_ERROR_STROKE_WIDTH = 1.5;
+
+export const formatEvaluationDate = (dateStr: string, locale: Locale) => {
+  const [year, month, day] = dateStr.split('-');
+  if (locale === 'zh')
+    return `${parseInt(year, 10)}年${parseInt(month, 10)}月${parseInt(day, 10)}日`;
+  return dateStr;
+};
+
+export const formatEvaluationEmptyStateDate = (dateStr: string, locale: Locale) => {
+  if (locale === 'zh') return formatEvaluationDate(dateStr, locale);
+  const [year, month, day] = dateStr.split('-').map(Number);
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  }).format(new Date(year, month - 1, day));
+};
+
+const fmtSideTooltip = (tp: number, ep: number, dpa: boolean, nw: number, locale: Locale) =>
+  [
+    ...parallelismPills(tp, ep, dpa).map((pill) => `${pill.label} ${pill.value ?? ''}`.trim()),
+    locale === 'zh'
+      ? `${nw || 1} 个 worker`
+      : `${nw || 1} ${(nw || 1) === 1 ? 'worker' : 'workers'}`,
+  ].join(' · ');
+
+const EVALUATION_TOOLTIP_STRINGS = {
+  en: {
+    runLink: 'GitHub Actions run',
+    unofficial: 'Unofficial run',
+    date: 'Date',
+    meanScore: 'Mean score',
+    minScore: 'Min score',
+    maxScore: 'Max score',
+    concurrency: 'Concurrency',
+    errorBar: 'Error bar',
+    precision: 'Precision',
+    tensorParallelism: 'Tensor parallelism',
+    expertParallelism: 'Expert parallelism',
+    dataParallelAttention: 'Data parallel attention',
+    multinode: 'Multinode',
+    prefill: 'Prefill',
+    decode: 'Decode',
+    chips: 'Chips',
+    yes: 'True',
+    no: 'False',
+    chipSplit: (prefill: number, decode: number) => `${prefill} prefill / ${decode} decode`,
+  },
+  zh: {
+    runLink: 'GitHub Actions 运行记录',
+    unofficial: '非官方运行',
+    date: '日期',
+    meanScore: '平均得分',
+    minScore: '最低得分',
+    maxScore: '最高得分',
+    concurrency: '并发数',
+    errorBar: '误差线',
+    precision: '精度',
+    tensorParallelism: '张量并行 (TP)',
+    expertParallelism: '专家并行 (EP)',
+    dataParallelAttention: '数据并行注意力 (DPA)',
+    multinode: '多节点',
+    prefill: '预填充',
+    decode: '解码',
+    chips: '芯片',
+    yes: '是',
+    no: '否',
+    chipSplit: (prefill: number, decode: number) =>
+      `${prefill} 个用于预填充 / ${decode} 个用于解码`,
+  },
+} as const;
+
+const parallelismRows = (data: EvaluationChartData, locale: Locale): ChartPointDetailsRow[] => {
+  const t = EVALUATION_TOOLTIP_STRINGS[locale];
+  if (!data.disagg) {
+    return [
+      { label: t.multinode, value: data.isMultinode ? t.yes : t.no },
+      { label: t.tensorParallelism, value: String(data.tp) },
+      { label: t.chips, value: String(data.physicalChips ?? data.numDecodeGpu) },
+      { label: 'DP', value: String(data.dp ?? '?') },
+      { label: t.expertParallelism, value: String(data.ep) },
+      { label: t.dataParallelAttention, value: data.dp_attention ? t.yes : t.no },
+    ];
+  }
+  return [
+    { label: t.multinode, value: data.isMultinode ? t.yes : t.no },
+    {
+      label: t.prefill,
+      value: fmtSideTooltip(
+        data.prefillTp,
+        data.prefillEp,
+        data.prefillDpAttention,
+        data.prefillNumWorkers,
+        locale,
+      ),
+      wide: true,
+    },
+    {
+      label: t.decode,
+      value: fmtSideTooltip(data.tp, data.ep, data.dp_attention, data.decodeNumWorkers, locale),
+      wide: true,
+    },
+    { label: t.chips, value: t.chipSplit(data.numPrefillGpu, data.numDecodeGpu) },
+  ];
+};
+
+export const evaluationPointDetails = (
+  data: EvaluationChartData,
+  unofficialBranch?: string,
+  locale: Locale = 'en',
+) => {
+  const t = EVALUATION_TOOLTIP_STRINGS[locale];
+  const precision = getPrecisionLabel(data.precision as Precision);
+  const date = formatEvaluationDate(data.date, locale);
+  const runId = data.runUrl?.match(/\/runs\/(?<id>\d+)/u)?.groups?.id;
+  return {
+    title: data.hwLabel,
+    subtitle: data.engineLabel || undefined,
+    date,
+    warning:
+      unofficialBranch === undefined
+        ? undefined
+        : `✕ ${unofficialBranch || (runId ? `#${runId}` : t.unofficial)}`,
+    metrics: [
+      { value: data.score.toFixed(4), label: t.meanScore },
+      { value: (data.minScore ?? data.score).toFixed(4), label: t.minScore },
+      { value: (data.maxScore ?? data.score).toFixed(4), label: t.maxScore },
+    ],
+    rows: [
+      { label: t.concurrency, value: String(data.conc) },
+      { label: t.precision, value: precision },
+      ...(data.errorMin !== undefined && data.errorMax !== undefined
+        ? [
+            {
+              label: t.errorBar,
+              value: `${data.errorMin.toFixed(4)} – ${data.errorMax.toFixed(4)}`,
+            },
+          ]
+        : []),
+      ...parallelismRows(data, locale),
+    ],
+    links: data.runUrl
+      ? [{ action: 'run', label: t.runLink, href: data.runUrl, external: true }]
+      : [],
+    summary: `${precision} · ${t.concurrency} ${data.conc} · ${date}`,
+  };
+};
+
+export const generateEvaluationTooltipContent = (
+  data: EvaluationChartData,
+  color: string,
+  unofficialBranch?: string,
+  locale: Locale = 'en',
+): string => {
+  const details = evaluationPointDetails(data, unofficialBranch, locale);
+  return chartHoverCard({
+    title: details.title,
+    subtitle: details.subtitle,
+    color,
+    metrics: [details.metrics[0]],
+    summary: details.summary,
+    warning: details.warning,
+  });
+};
+
+function formatYAxisLabels(axisGroup: d3.Selection<SVGGElement, unknown, null, undefined>) {
+  axisGroup.selectAll('.tick text').each(function () {
+    const el = d3.select(this);
+    const label = el.text();
+    const lines = label.split('\n');
+    const totalHeight = lines.length * 1.1;
+    el.text(null);
+    lines.forEach((line: string, i: number) => {
+      el.append('tspan')
+        .text(line)
+        .attr('x', -8)
+        .attr('dy', i === 0 ? `${-totalHeight / 2 + 0.9}em` : '1.1em')
+        .attr('font-weight', i === 0 ? '600' : 'normal')
+        .attr('font-size', i === 0 ? '10px' : '9px');
+    });
+    el.attr('text-anchor', 'end');
+  });
+}
+
+export function sizeScoreLabelBackgrounds(
+  labelGroups: d3.Selection<SVGGElement, EvaluationChartData, SVGGElement, unknown>,
+): void {
+  const measurements: { group: SVGGElement; bounds: DOMRect }[] = [];
+  labelGroups.each(function () {
+    const text = this.querySelector<SVGTextElement>('.score-label');
+    if (text) measurements.push({ group: this, bounds: text.getBBox() });
+  });
+
+  for (const { group, bounds } of measurements) {
+    d3.select(group)
+      .selectAll<SVGRectElement, EvaluationChartData>('.score-label-bg')
+      .data((datum) => [datum])
+      .join((enter) => enter.insert('rect', ':first-child').attr('class', 'score-label-bg'))
+      .attr('rx', 4)
+      .attr('ry', 4)
+      .attr('fill', 'var(--popover)')
+      .attr('stroke', 'var(--border)')
+      .attr('stroke-width', 1)
+      .attr('x', bounds.x - 5)
+      .attr('y', bounds.y - 1)
+      .attr('width', bounds.width + 10)
+      .attr('height', bounds.height + 2);
+  }
+}
+
+function renderScoreLabels(
+  group: d3.Selection<SVGGElement, unknown, null, undefined>,
+  data: EvaluationChartData[],
+  showLabels: boolean,
+  xScale: d3.ScaleLinear<number, number>,
+  yScale: d3.ScaleBand<string>,
+): void {
+  const labelGroups = group
+    .selectAll<SVGGElement, EvaluationChartData>('.score-label-group')
+    .data(showLabels ? data : [], (datum) => datum.configLabel)
+    .join((enter) => {
+      const labelGroup = enter.append('g').attr('class', 'score-label-group');
+      labelGroup
+        .append('text')
+        .attr('class', 'score-label')
+        .attr('text-anchor', 'start')
+        .style('fill', 'var(--foreground)')
+        .attr('font-size', '10px')
+        .attr('font-weight', '600')
+        .attr('dy', '0.35em');
+      return labelGroup;
+    })
+    .attr(
+      'transform',
+      (datum) =>
+        `translate(${xScale(datum.score) + 12},${
+          (yScale(datum.configLabel) || 0) + yScale.bandwidth() / 2
+        })`,
+    );
+
+  labelGroups.select<SVGTextElement>('.score-label').text((datum) => datum.score.toFixed(3));
+  sizeScoreLabelBackgrounds(labelGroups);
+}
+
+function updateUnofficialScoreLabels(
+  group: d3.Selection<SVGGElement, unknown, null, undefined>,
+  showLabels: boolean,
+): void {
+  group
+    .selectAll<SVGGElement, EvaluationChartData>('.unofficial-eval-point')
+    .each(function (datum) {
+      d3.select(this)
+        .selectAll<SVGTextElement, EvaluationChartData>('.unofficial-score-label')
+        .data(showLabels ? [datum] : [], (labelDatum) => labelDatum.configLabel)
+        .join('text')
+        .attr('class', 'unofficial-score-label')
+        .attr('x', 12)
+        .attr('text-anchor', 'start')
+        .style('fill', 'var(--foreground)')
+        .attr('font-size', '10px')
+        .attr('font-weight', '600')
+        .attr('dy', '0.35em')
+        .attr('pointer-events', 'none')
+        .text((labelDatum) => labelDatum.score.toFixed(3));
+    });
+}
+
+const EVAL_STRINGS = {
+  en: {
+    showLabels: 'Show labels',
+    highContrast: 'High contrast',
+    score: 'Score',
+    unofficialTitle: (branch: string) => `Unofficial: ${branch}`,
+    unofficialRun: 'Unofficial run',
+    branch: 'Branch',
+    viewWorkflow: 'View workflow run',
+    prefill: 'prefill',
+    decode: 'decode',
+    slots: 'slots',
+    dpaValues: 'DPA true/false',
+    loadError: 'Failed to load eval data',
+    modelEmpty: 'No evaluation data is available for this model',
+    dateEmpty: (date: string) => `No evaluation data available for ${date}`,
+    tryDate: 'Try selecting a different date',
+    combinationEmpty: 'No evaluation data available for selected model and benchmark combination',
+    tryCombination: 'Try selecting a different combination',
+  },
+  zh: {
+    showLabels: '显示标签',
+    highContrast: '高对比度',
+    score: '得分',
+    unofficialTitle: (branch: string) => `非官方：${branch}`,
+    unofficialRun: '非官方运行',
+    branch: '分支',
+    viewWorkflow: '查看工作流运行记录',
+    prefill: '预填充',
+    decode: '解码',
+    slots: '字段顺序',
+    dpaValues: 'DPA 是/否',
+    loadError: '评估数据加载失败',
+    modelEmpty: '该模型暂无评估数据',
+    dateEmpty: (date: string) => `${date} 暂无评估数据`,
+    tryDate: '请尝试选择其他日期',
+    combinationEmpty: '所选模型与基准测试组合暂无评估数据',
+    tryCombination: '请尝试选择其他组合',
+  },
+} as const;
+
+export function evaluationChartBlockingState({
+  hasChartData,
+  isEvaluationDataError,
+}: {
+  hasChartData: boolean;
+  isEvaluationDataError: boolean;
+}): 'data-error' | 'empty' | null {
+  if (hasChartData) return null;
+  if (isEvaluationDataError) return 'data-error';
+  return 'empty';
+}
+
+export function evaluationChartIsInitializing({
+  isEvaluationDataSettled,
+}: {
+  isEvaluationDataSettled: boolean;
+}): boolean {
+  return !isEvaluationDataSettled;
+}
+
+export default function EvalBarChartD3({
+  caption,
+  footer,
+}: {
+  caption?: ReactNode;
+  footer?: ReactNode;
+}) {
+  const {
+    loading,
+    isEvaluationDataSettled,
+    isEvaluationDataError,
+    chartData,
+    unofficialChartData,
+    unfilteredChartData,
+    enabledHardware,
+    toggleHardware,
+    removeHardware,
+    hwTypesWithData,
+    selectAllHwTypes,
+    highContrast,
+    setHighContrast,
+    showLabels,
+    setShowLabels,
+    highlightedConfigs,
+    selectedBenchmark,
+    selectedModel,
+    selectedRunDate,
+    availableDates,
+    isLegendExpanded,
+    setIsLegendExpanded,
+    modelHasEvalData,
+  } = useEvaluation();
+  const locale = useLocale();
+  const legendT = EVAL_STRINGS[locale];
+  const {
+    isUnofficialRun,
+    unofficialRunInfo,
+    unofficialRunInfos,
+    activeOverlayHwTypes,
+    allOverlayHwTypes,
+    localOfficialOverride,
+    setUnifiedOverlaySelection,
+    runIndexByUrl,
+  } = useUnofficialRun();
+  const chartRef = useRef<D3ChartHandle>(null);
+
+  const branchForRow = useCallback(
+    (datum: EvaluationChartData): string | undefined => {
+      const url = datum.runUrl ?? null;
+      if (url) {
+        const direct = runIndexByUrl[url];
+        if (direct !== undefined) return unofficialRunInfos[direct]?.branch;
+        const idMatch = url.match(/\/runs\/(?<runId>\d+)/u);
+        if (idMatch) {
+          const viaId = runIndexByUrl[idMatch[1]];
+          if (viaId !== undefined) return unofficialRunInfos[viaId]?.branch;
+        }
+      }
+      return unofficialRunInfo?.branch ?? undefined;
+    },
+    [runIndexByUrl, unofficialRunInfos, unofficialRunInfo],
+  );
+  const branchForRowRef = useRef(branchForRow);
+  branchForRowRef.current = branchForRow;
+  const evaluationOverlayScope = useMemo(
+    () => new Set(unofficialChartData.map((datum) => String(datum.hwKey))),
+    [unofficialChartData],
+  );
+  const evaluationScopeRegistration = useMemo(
+    () =>
+      isUnofficialRun
+        ? {
+            scopeKey: `evaluation|${selectedModel ?? ''}|${selectedBenchmark ?? ''}|${
+              selectedRunDate ?? ''
+            }|${unofficialRunInfos.map((run) => run.url).join(',')}`,
+            officialHwTypes: hwTypesWithData,
+            overlayHwTypes: evaluationOverlayScope,
+            bestOfficialHwTypes: hwTypesWithData,
+            bestOverlayHwTypes: evaluationOverlayScope,
+            bestPerSku: false,
+            ready: !loading || hwTypesWithData.size > 0,
+          }
+        : null,
+    [
+      isUnofficialRun,
+      selectedModel,
+      selectedBenchmark,
+      selectedRunDate,
+      unofficialRunInfos,
+      hwTypesWithData,
+      evaluationOverlayScope,
+      loading,
+      activeOverlayHwTypes,
+      localOfficialOverride,
+    ],
+  );
+  useOverlayScopeReconciliation(evaluationScopeRegistration);
+
+  const effectiveOfficialHardware = localOfficialOverride ?? enabledHardware;
+
+  const allUnifiedHwTypes = useMemo(() => {
+    const all = new Set<string>();
+    hwTypesWithData.forEach((hwKey) => all.add(hwKey));
+    allOverlayHwTypes.forEach((hwKey) => all.add(`overlay:${hwKey}`));
+    return all;
+  }, [hwTypesWithData, allOverlayHwTypes]);
+
+  const unifiedToggle = useCallback(
+    (hwKey: string) => {
+      const prev = new Set<string>();
+      effectiveOfficialHardware.forEach((key) => prev.add(key));
+      activeOverlayHwTypes.forEach((key) => prev.add(`overlay:${key}`));
+      const next = computeToggle(prev, hwKey, allUnifiedHwTypes);
+      const nextOfficial = new Set<string>();
+      const nextOverlay = new Set<string>();
+      for (const key of next) {
+        if (key.startsWith('overlay:')) nextOverlay.add(key.slice(8));
+        else nextOfficial.add(key);
+      }
+      setUnifiedOverlaySelection(nextOfficial, nextOverlay);
+    },
+    [
+      activeOverlayHwTypes,
+      allUnifiedHwTypes,
+      effectiveOfficialHardware,
+      setUnifiedOverlaySelection,
+    ],
+  );
+
+  const handleToggleHardware = useCallback(
+    (hwKey: string) => {
+      if (isUnofficialRun) unifiedToggle(hwKey);
+      else toggleHardware(hwKey);
+    },
+    [isUnofficialRun, toggleHardware, unifiedToggle],
+  );
+
+  const configurations = useMemo(() => {
+    const configMap = new Map<string, { hwKey: string; configLabel: string }>();
+    unfilteredChartData.forEach((data) => {
+      if (!configMap.has(data.configLabel)) {
+        configMap.set(data.configLabel, {
+          hwKey: String(data.hwKey),
+          configLabel: data.configLabel,
+        });
+      }
+    });
+    return [...configMap.values()].toSorted(
+      (a, b) =>
+        getModelSortIndex(a.hwKey) - getModelSortIndex(b.hwKey) || a.hwKey.localeCompare(b.hwKey),
+    );
+  }, [unfilteredChartData]);
+
+  const unofficialConfigurations = useMemo(() => {
+    const configMap = new Map<string, { hwKey: string; configLabel: string }>();
+    unofficialChartData.forEach((data) => {
+      if (!configMap.has(data.configLabel)) {
+        configMap.set(data.configLabel, {
+          hwKey: String(data.hwKey),
+          configLabel: data.configLabel,
+        });
+      }
+    });
+    return [...configMap.values()].toSorted(
+      (a, b) =>
+        getModelSortIndex(a.hwKey) - getModelSortIndex(b.hwKey) ||
+        a.hwKey.localeCompare(b.hwKey) ||
+        a.configLabel.localeCompare(b.configLabel),
+    );
+  }, [unofficialChartData]);
+
+  const yLabels = useMemo(() => {
+    const labels = new Set<string>();
+    [...chartData, ...unofficialChartData].forEach((item) => labels.add(item.configLabel));
+    return [...labels];
+  }, [chartData, unofficialChartData]);
+
+  const chartMargin = useMemo(
+    () => ({
+      ...BASE_MARGIN,
+      left: computeLeftMargin(yLabels, {
+        split: 'newline',
+        primaryFont: '600 10px sans-serif',
+        secondaryFont: '9px sans-serif',
+        minMargin: 80,
+      }),
+    }),
+    [yLabels],
+  );
+
+  const sortedConfigLabels = useMemo(
+    () => [...configurations, ...unofficialConfigurations].map((c) => c.configLabel),
+    [configurations, unofficialConfigurations],
+  );
+  const activeHwKeys = useMemo(
+    () => [
+      ...configurations.filter((c) => effectiveOfficialHardware.has(c.hwKey)).map((c) => c.hwKey),
+      ...unofficialConfigurations
+        .filter((c) => activeOverlayHwTypes.has(c.hwKey))
+        .map((c) => c.hwKey),
+    ],
+    [configurations, unofficialConfigurations, effectiveOfficialHardware, activeOverlayHwTypes],
+  );
+  const activeConfigLabels = useMemo(
+    () => [
+      ...configurations
+        .filter((c) => effectiveOfficialHardware.has(c.hwKey))
+        .map((c) => c.configLabel),
+      ...unofficialConfigurations
+        .filter((c) => activeOverlayHwTypes.has(c.hwKey))
+        .map((c) => c.configLabel),
+    ],
+    [configurations, unofficialConfigurations, effectiveOfficialHardware, activeOverlayHwTypes],
+  );
+  const configLabelToHwKey = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const c of configurations) map.set(c.configLabel, c.hwKey);
+    for (const c of unofficialConfigurations) map.set(c.configLabel, c.hwKey);
+    return map;
+  }, [configurations, unofficialConfigurations]);
+  const hcVendorKeyFor = useCallback(
+    (configLabel: string) => configLabelToHwKey.get(configLabel) ?? configLabel,
+    [configLabelToHwKey],
+  );
+  const { resolveColor, getCssColor } = useThemeColors({
+    highContrast,
+    identifiers: sortedConfigLabels,
+    activeKeys: activeHwKeys,
+    hcKeys: activeConfigLabels,
+    hcVendorKeyFor,
+  });
+
+  useEffect(() => {
+    const pinnedPoint = chartRef.current?.getPinnedPoint() as EvaluationChartData | null;
+    if (!pinnedPoint) return;
+    const isOverlay = chartRef.current?.getPinnedPointIsOverlay();
+    if (isOverlay && !activeOverlayHwTypes.has(String(pinnedPoint.hwKey))) {
+      chartRef.current?.dismissTooltip();
+      return;
+    }
+    if (!isOverlay && !effectiveOfficialHardware.has(String(pinnedPoint.hwKey))) {
+      chartRef.current?.dismissTooltip();
+    }
+  }, [activeOverlayHwTypes, effectiveOfficialHardware]);
+
+  const legendItems = useMemo(
+    () => [
+      ...(unofficialConfigurations.length > 0 && unofficialRunInfos.length > 0
+        ? unofficialRunInfos
+            .map((info, idx) => {
+              const hasPoints = unofficialChartData.some(
+                (d) => overlayRunIndex(d.runUrl ?? null, runIndexByUrl) === idx,
+              );
+              if (!hasPoints) return null;
+              const branch = info.branch || `run ${info.id}`;
+              return {
+                name: `✕ unofficial-run-${info.id}`,
+                label: `✕ ${branch}`,
+                color: overlayRunColor(idx),
+                title: legendT.unofficialTitle(branch),
+                isHighlighted: true,
+                hw: `overlay-run-${info.id}`,
+                isActive: true,
+                onClick: () => {},
+                tooltip: (
+                  <div className="font-normal text-xs">
+                    <div className="font-medium text-destructive">{legendT.unofficialRun}</div>
+                    <div>
+                      {legendT.branch}: {branch}
+                    </div>
+                    {info.url && (
+                      <a
+                        href={info.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="underline"
+                      >
+                        {legendT.viewWorkflow}
+                      </a>
+                    )}
+                  </div>
+                ),
+              };
+            })
+            .filter((x): x is NonNullable<typeof x> => x !== null)
+        : []),
+      ...configurations.map(({ hwKey, configLabel }) => ({
+        name: configLabel,
+        label: configLabel.replaceAll('\n', ' '),
+        color: resolveColor(configLabel, hwKey),
+        title: configLabel.replaceAll('\n', ' '),
+        isHighlighted: highlightedConfigs.has(configLabel),
+        hw: hwKey,
+        isActive: effectiveOfficialHardware.has(hwKey),
+        onClick: () => {
+          handleToggleHardware(hwKey);
+          track('evaluation_hw_toggled', { gpu: hwKey });
+        },
+      })),
+    ],
+    [
+      configurations,
+      effectiveOfficialHardware,
+      handleToggleHardware,
+      highlightedConfigs,
+      resolveColor,
+      unofficialConfigurations,
+      unofficialChartData,
+      unofficialRunInfos,
+      runIndexByUrl,
+      legendT,
+    ],
+  );
+
+  const xDomain = useMemo((): [number, number] => {
+    const allData = [...chartData, ...unofficialChartData];
+    if (allData.length === 0) return [0, 1];
+    const xMin = d3.min(allData, (d) => d.score - (d.scoreError || 0)) || 0;
+    const xMax = d3.max(allData, (d) => d.score + (d.scoreError || 0)) || 1;
+    const xPadding = (xMax - xMin) * 0.3;
+    return [Math.max(0, xMin - xPadding), Math.min(1, xMax + xPadding)];
+  }, [chartData, unofficialChartData]);
+
+  const chartHeight = Math.max(400, yLabels.length * 40 + chartMargin.top + chartMargin.bottom);
+
+  const errorData = useMemo(
+    () => chartData.filter((d) => d.errorMin !== undefined && d.errorMax !== undefined),
+    [chartData],
+  );
+
+  const hasDisaggConfigs = useMemo(
+    () => [...chartData, ...unofficialChartData].some((d) => d.disagg),
+    [chartData, unofficialChartData],
+  );
+
+  const parallelismKey = hasDisaggConfigs ? (
+    <div className="mt-2 text-3xs text-muted-foreground leading-tight no-export">
+      <div>
+        <span className="font-mono">P(·/·/·/·)</span> {legendT.prefill}
+        <span className="mx-1">·</span>
+        <span className="font-mono">D(·/·/·/·)</span> {legendT.decode}
+      </div>
+      <div>
+        {legendT.slots}: <span className="font-mono">tp/ep/dpa/nw</span>
+        <span className="mx-1">·</span>
+        <span className="font-mono">T</span>/<span className="font-mono">F</span> ={' '}
+        {legendT.dpaValues}
+      </div>
+    </div>
+  ) : null;
+  const unofficialErrorData = useMemo(
+    () => unofficialChartData.filter((d) => d.errorMin !== undefined && d.errorMax !== undefined),
+    [unofficialChartData],
+  );
+
+  const dataIdentity = useMemo(
+    () =>
+      JSON.stringify(
+        [
+          ...chartData.map((datum) => JSON.stringify(['official', datum.configLabel])),
+          ...unofficialChartData.map((datum) =>
+            JSON.stringify(['unofficial', datum.runUrl ?? '', datum.configLabel]),
+          ),
+        ].toSorted(),
+      ),
+    [chartData, unofficialChartData],
+  );
+  const metricIdentity = useMemo(
+    () =>
+      JSON.stringify({
+        official: chartData
+          .map((datum) =>
+            JSON.stringify([
+              datum.configLabel,
+              datum.score,
+              datum.errorMin ?? null,
+              datum.errorMax ?? null,
+            ]),
+          )
+          .toSorted(),
+        unofficial: unofficialChartData
+          .map((datum) =>
+            JSON.stringify([
+              datum.runUrl ?? '',
+              datum.configLabel,
+              datum.score,
+              datum.errorMin ?? null,
+              datum.errorMax ?? null,
+            ]),
+          )
+          .toSorted(),
+        xDomain,
+        yLabels,
+      }),
+    [chartData, unofficialChartData, xDomain, yLabels],
+  );
+  const officialPaletteIdentity = useMemo(
+    () =>
+      JSON.stringify(
+        chartData
+          .map((datum) =>
+            JSON.stringify([
+              datum.configLabel,
+              getCssColor(resolveColor(datum.configLabel, String(datum.hwKey))),
+            ]),
+          )
+          .toSorted(),
+      ),
+    [chartData, getCssColor, resolveColor],
+  );
+  const unofficialPaletteIdentity = useMemo(
+    () =>
+      JSON.stringify(
+        unofficialChartData
+          .map((datum) =>
+            JSON.stringify([
+              datum.runUrl ?? '',
+              overlayRunColor(overlayRunIndex(datum.runUrl ?? null, runIndexByUrl)),
+            ]),
+          )
+          .toSorted(),
+      ),
+    [runIndexByUrl, unofficialChartData],
+  );
+  const displayIdentity = `${showLabels}:${officialPaletteIdentity}:${unofficialPaletteIdentity}`;
+  const xScaleConfig = useMemo(() => ({ type: 'linear' as const, domain: xDomain }), [xDomain]);
+  const yScaleConfig = useMemo(
+    () => ({ type: 'band' as const, domain: yLabels, padding: 0.1 }),
+    [yLabels],
+  );
+  const xAxisConfig = useMemo(
+    () => ({
+      label: `${getEvalBenchmarkLabel(selectedBenchmark as EvalBenchmark)} ${legendT.score}`,
+      tickFormat: (datum: d3.AxisDomain) => Number(datum).toFixed(2),
+      tickCount: 5,
+    }),
+    [selectedBenchmark, legendT.score],
+  );
+  const yAxisConfig = useMemo(() => ({ customize: formatYAxisLabels }), []);
+  const zoomConfig = useMemo(
+    () => ({
+      enabled: true,
+      axes: 'x' as const,
+      scaleExtent: [1, 20] as [number, number],
+      resetEventName: 'evaluation_zoom_reset_evaluation-chart',
+      constrain: (transform: d3.ZoomTransform) => {
+        const k = transform.k;
+        const innerWidth =
+          (typeof window === 'undefined' ? 800 : window.innerWidth) -
+          chartMargin.left -
+          chartMargin.right;
+        const xScale = d3.scaleLinear().domain(xDomain).range([0, innerWidth]);
+        const minTx = -xScale(1) * k + innerWidth;
+        const maxTx = -xScale(0) * k;
+        const tx = minTx < maxTx ? Math.max(minTx, Math.min(maxTx, transform.x)) : transform.x;
+        return d3.zoomIdentity.translate(tx, transform.y).scale(k);
+      },
+    }),
+    [chartMargin.left, chartMargin.right, xDomain],
+  );
+  const pointColor = useCallback(
+    (datum: EvaluationChartData, isOverlay: boolean) =>
+      isOverlay
+        ? overlayRunColor(overlayRunIndex(datum.runUrl ?? null, runIndexByUrl))
+        : getCssColor(resolveColor(datum.configLabel, String(datum.hwKey))),
+    [getCssColor, resolveColor, runIndexByUrl],
+  );
+  const tooltipConfig = useMemo(
+    () => ({
+      rulerType: 'crosshair' as const,
+      content: (datum: EvaluationChartData) =>
+        generateEvaluationTooltipContent(datum, pointColor(datum, false), undefined, locale),
+      details: (datum: EvaluationChartData, isOverlay: boolean, close: () => void) => (
+        <ChartPointDetails
+          {...evaluationPointDetails(
+            datum,
+            isOverlay ? (branchForRowRef.current(datum) ?? '') : undefined,
+            locale,
+          )}
+          color={pointColor(datum, isOverlay)}
+          onClose={close}
+        />
+      ),
+      getRulerX: (
+        datum: EvaluationChartData,
+        scale:
+          | d3.ScaleBand<string>
+          | d3.ScaleLinear<number, number>
+          | d3.ScaleLogarithmic<number, number>,
+      ) => {
+        const xScale = scale as unknown as d3.ScaleLinear<number, number>;
+        return xScale(datum.score);
+      },
+      getRulerY: (
+        datum: EvaluationChartData,
+        scale: d3.ScaleLinear<number, number> | d3.ScaleLogarithmic<number, number>,
+      ) => {
+        const bandScale = scale as unknown as d3.ScaleBand<string>;
+        return (bandScale(datum.configLabel) || 0) + bandScale.bandwidth() / 2;
+      },
+      onHoverStart: (
+        selection: d3.Selection<SVGCircleElement, EvaluationChartData, SVGGElement, unknown>,
+      ) => selection.attr('r', 8),
+      onHoverEnd: (
+        selection: d3.Selection<SVGCircleElement, EvaluationChartData, SVGGElement, unknown>,
+      ) => selection.attr('r', 6),
+      attachToLayer: 1,
+    }),
+    [locale, pointColor],
+  );
+
+  const layers = useMemo(
+    (): LayerConfig<EvaluationChartData>[] => [
+      {
+        type: 'custom',
+        key: 'error-bars',
+        render: (group, { xScale: xs, yScale: ys }) => {
+          const xScale = xs as d3.ScaleLinear<number, number>;
+          const yScale = ys as d3.ScaleBand<string>;
+          renderErrorBars(group, errorData, {
+            getCx: (d: EvaluationChartData) =>
+              (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2,
+            getYMin: (d: EvaluationChartData) => xScale(d.errorMin!),
+            getYMax: (d: EvaluationChartData) => xScale(d.errorMax!),
+            capWidth: yScale.bandwidth() / 3,
+            stroke: 'var(--foreground)',
+          });
+          const bars = group.selectAll<SVGGElement, EvaluationChartData>('.error-bar');
+          bars
+            .select('.eb-stem')
+            .attr('x1', (d) => xScale(d.errorMin!))
+            .attr('x2', (d) => xScale(d.errorMax!))
+            .attr('y1', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2)
+            .attr('y2', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2);
+          const capH = yScale.bandwidth() / 6;
+          bars
+            .select('.eb-cap-top')
+            .attr('x1', (d) => xScale(d.errorMin!))
+            .attr('x2', (d) => xScale(d.errorMin!))
+            .attr('y1', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2 - capH)
+            .attr('y2', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2 + capH);
+          bars
+            .select('.eb-cap-bot')
+            .attr('x1', (d) => xScale(d.errorMax!))
+            .attr('x2', (d) => xScale(d.errorMax!))
+            .attr('y1', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2 - capH)
+            .attr('y2', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2 + capH);
+        },
+        onZoom: (group, ctx) => {
+          const newXScale = ctx.newXScale as d3.ScaleLinear<number, number>;
+          const yScale = ctx.yScale as d3.ScaleBand<string>;
+          const bars = group.selectAll<SVGGElement, EvaluationChartData>('.error-bar');
+          bars
+            .select('.eb-stem')
+            .attr('x1', (d) => newXScale(d.errorMin!))
+            .attr('x2', (d) => newXScale(d.errorMax!))
+            .attr('y1', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2)
+            .attr('y2', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2);
+          const capH = yScale.bandwidth() / 6;
+          bars
+            .select('.eb-cap-top')
+            .attr('x1', (d) => newXScale(d.errorMin!))
+            .attr('x2', (d) => newXScale(d.errorMin!))
+            .attr('y1', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2 - capH)
+            .attr('y2', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2 + capH);
+          bars
+            .select('.eb-cap-bot')
+            .attr('x1', (d) => newXScale(d.errorMax!))
+            .attr('x2', (d) => newXScale(d.errorMax!))
+            .attr('y1', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2 - capH)
+            .attr('y2', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2 + capH);
+        },
+      },
+      {
+        type: 'custom',
+        key: 'mean-points',
+        displayIdentity: officialPaletteIdentity,
+        render: (group, { xScale: xs, yScale: ys }) => {
+          const xScale = xs as d3.ScaleLinear<number, number>;
+          const yScale = ys as d3.ScaleBand<string>;
+          return renderPoints(group, chartData, {
+            getCx: (d: EvaluationChartData) => xScale(d.score),
+            getCy: (d: EvaluationChartData) =>
+              (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2,
+            getColor: (d: EvaluationChartData) =>
+              getCssColor(resolveColor(d.configLabel, d.hwKey as string)),
+            getRadius: () => 6,
+            stroke: 'none',
+            strokeWidth: 0,
+          });
+        },
+        onDisplayUpdate: (group) => {
+          group
+            .selectAll<SVGCircleElement, EvaluationChartData>('.point')
+            .attr('fill', (datum) =>
+              getCssColor(resolveColor(datum.configLabel, String(datum.hwKey))),
+            );
+        },
+        onZoom: (group, ctx) => {
+          const newXScale = ctx.newXScale as d3.ScaleLinear<number, number>;
+          const yScale = ctx.yScale as d3.ScaleBand<string>;
+          updatePointsOnZoom<EvaluationChartData>(
+            group,
+            (d) => newXScale(d.score),
+            (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2,
+          );
+        },
+      },
+      {
+        type: 'custom',
+        key: 'unofficial-error-bars',
+        render: (group, { xScale: xs, yScale: ys }) => {
+          const xScale = xs as d3.ScaleLinear<number, number>;
+          const yScale = ys as d3.ScaleBand<string>;
+          const capH = yScale.bandwidth() / 6;
+
+          const bars = group
+            .selectAll<SVGGElement, EvaluationChartData>('.unofficial-error-bar')
+            .data(unofficialErrorData, (datum) => `${datum.runUrl ?? ''}|${datum.configLabel}`)
+            .join((enter) => {
+              const bar = enter.append('g').attr('class', 'unofficial-error-bar');
+              bar
+                .append('line')
+                .attr('class', 'unofficial-eb-stem')
+                .attr('stroke-width', OVERLAY_ERROR_STROKE_WIDTH);
+              bar
+                .append('line')
+                .attr('class', 'unofficial-eb-cap-top')
+                .attr('stroke-width', OVERLAY_ERROR_STROKE_WIDTH);
+              bar
+                .append('line')
+                .attr('class', 'unofficial-eb-cap-bot')
+                .attr('stroke-width', OVERLAY_ERROR_STROKE_WIDTH);
+              return bar;
+            });
+
+          bars.style('filter', null);
+          bars
+            .selectAll<SVGLineElement, EvaluationChartData>(
+              '.unofficial-eb-stem, .unofficial-eb-cap-top, .unofficial-eb-cap-bot',
+            )
+            .attr('stroke', (d) =>
+              overlayRunColor(overlayRunIndex(d.runUrl ?? null, runIndexByUrl)),
+            );
+
+          bars
+            .select('.unofficial-eb-stem')
+            .attr('x1', (d) => xScale(d.errorMin!))
+            .attr('x2', (d) => xScale(d.errorMax!))
+            .attr('y1', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2)
+            .attr('y2', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2);
+
+          bars
+            .select('.unofficial-eb-cap-top')
+            .attr('x1', (d) => xScale(d.errorMin!))
+            .attr('x2', (d) => xScale(d.errorMin!))
+            .attr('y1', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2 - capH)
+            .attr('y2', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2 + capH);
+
+          bars
+            .select('.unofficial-eb-cap-bot')
+            .attr('x1', (d) => xScale(d.errorMax!))
+            .attr('x2', (d) => xScale(d.errorMax!))
+            .attr('y1', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2 - capH)
+            .attr('y2', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2 + capH);
+        },
+        onZoom: (group, { newXScale, yScale: ys }) => {
+          const xScale = newXScale as d3.ScaleLinear<number, number>;
+          const yScale = ys as d3.ScaleBand<string>;
+          const capH = yScale.bandwidth() / 6;
+          const bars = group.selectAll<SVGGElement, EvaluationChartData>('.unofficial-error-bar');
+
+          bars
+            .select('.unofficial-eb-stem')
+            .attr('x1', (d) => xScale(d.errorMin!))
+            .attr('x2', (d) => xScale(d.errorMax!))
+            .attr('y1', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2)
+            .attr('y2', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2);
+
+          bars
+            .select('.unofficial-eb-cap-top')
+            .attr('x1', (d) => xScale(d.errorMin!))
+            .attr('x2', (d) => xScale(d.errorMin!))
+            .attr('y1', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2 - capH)
+            .attr('y2', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2 + capH);
+
+          bars
+            .select('.unofficial-eb-cap-bot')
+            .attr('x1', (d) => xScale(d.errorMax!))
+            .attr('x2', (d) => xScale(d.errorMax!))
+            .attr('y1', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2 - capH)
+            .attr('y2', (d) => (yScale(d.configLabel) || 0) + yScale.bandwidth() / 2 + capH);
+        },
+      },
+      {
+        type: 'custom',
+        key: 'score-labels',
+        displayIdentity: showLabels ? 'visible' : 'hidden',
+        render: (group, { xScale: xs, yScale: ys }) => {
+          renderScoreLabels(
+            group,
+            chartData,
+            showLabels,
+            xs as d3.ScaleLinear<number, number>,
+            ys as d3.ScaleBand<string>,
+          );
+        },
+        onDisplayUpdate: (group, ctx) => {
+          const baseXScale = ctx.xScale as d3.ScaleLinear<number, number>;
+          const svgNode = ctx.layout.svg.node();
+          const currentXScale = svgNode
+            ? d3.zoomTransform(svgNode).rescaleX(baseXScale)
+            : baseXScale;
+          renderScoreLabels(
+            group,
+            chartData,
+            showLabels,
+            currentXScale,
+            ctx.yScale as d3.ScaleBand<string>,
+          );
+        },
+        onZoom: (group, ctx) => {
+          if (!showLabels) return;
+          const newXScale = ctx.newXScale as d3.ScaleLinear<number, number>;
+          const yScale = ctx.yScale as d3.ScaleBand<string>;
+          group
+            .selectAll<SVGGElement, EvaluationChartData>('.score-label-group')
+            .attr(
+              'transform',
+              (datum) =>
+                `translate(${newXScale(datum.score) + 12},${
+                  (yScale(datum.configLabel) || 0) + yScale.bandwidth() / 2
+                })`,
+            );
+        },
+      },
+      {
+        type: 'custom',
+        key: 'unofficial-overlay',
+        displayIdentity: `${showLabels}:${unofficialPaletteIdentity}`,
+        render: (group, { xScale: xs, yScale: ys, layout, tooltipElement }) => {
+          const xScale = xs as d3.ScaleLinear<number, number>;
+          const yScale = ys as d3.ScaleBand<string>;
+          const svgNode = layout.svg.node();
+          const container = svgNode?.parentElement as HTMLDivElement | null;
+          if (!svgNode || !container) return;
+
+          const tooltip = d3.select(tooltipElement);
+          const overlayPoints = group
+            .selectAll<SVGGElement, EvaluationChartData>('.unofficial-eval-point')
+            .data(unofficialChartData, (datum) => `${datum.runUrl ?? ''}|${datum.configLabel}`)
+            .join((enter) => {
+              const g = enter.append('g').attr('class', 'unofficial-eval-point');
+              g.append('circle')
+                .attr('r', OVERLAY_HIT_RADIUS)
+                .attr('fill', 'transparent')
+                .attr('cursor', 'pointer');
+              g.append('path')
+                .attr('class', 'unofficial-eval-x')
+                .attr('d', xMarkerPath(OVERLAY_X_SIZE))
+                .attr('fill', 'none')
+                .attr('stroke-width', 2.5)
+                .attr('stroke-linecap', 'round')
+                .attr('cursor', 'pointer');
+              return g;
+            });
+
+          overlayPoints.attr(
+            'transform',
+            (d) =>
+              `translate(${xScale(d.score)},${(yScale(d.configLabel) || 0) + yScale.bandwidth() / 2})`,
+          );
+          overlayPoints.style('filter', null);
+
+          overlayPoints
+            .select('.unofficial-eval-x')
+            .attr('stroke', (d) =>
+              overlayRunColor(overlayRunIndex(d.runUrl ?? null, runIndexByUrl)),
+            );
+
+          updateUnofficialScoreLabels(group, showLabels);
+
+          attachOverlayXMarkerHandlers(overlayPoints, {
+            markerSelector: '.unofficial-eval-x',
+            normalPath: xMarkerPath(OVERLAY_X_SIZE),
+            hoverPath: xMarkerPath(OVERLAY_X_HOVER_SIZE),
+            tooltip,
+            handle: chartRef.current,
+            panel: true,
+            content: (datum) =>
+              generateEvaluationTooltipContent(
+                datum,
+                pointColor(datum, true),
+                branchForRowRef.current(datum) ?? '',
+                locale,
+              ),
+            position: (event) => {
+              const [mouseX, mouseY] = d3.pointer(event, container);
+              return computeTooltipPosition(mouseX, mouseY, tooltip, container);
+            },
+            rulers: {
+              show: (datum, marker) => {
+                const position = overlayMarkerPosition(marker) ?? {
+                  x: xScale(datum.score),
+                  y: (yScale(datum.configLabel) || 0) + yScale.bandwidth() / 2,
+                };
+                group.select('.ruler-group').style('display', 'block');
+                group.select('.vertical-ruler').attr('x1', position.x).attr('x2', position.x);
+                group.select('.horizontal-ruler').attr('y1', position.y).attr('y2', position.y);
+              },
+              hide: () => group.select('.ruler-group').style('display', 'none'),
+            },
+          });
+        },
+        onDisplayUpdate: (group) => {
+          group
+            .selectAll<SVGGElement, EvaluationChartData>('.unofficial-eval-point')
+            .select('.unofficial-eval-x')
+            .attr('stroke', (datum) =>
+              overlayRunColor(overlayRunIndex(datum.runUrl ?? null, runIndexByUrl)),
+            );
+          updateUnofficialScoreLabels(group, showLabels);
+        },
+        onZoom: (group, { newXScale, yScale: ys }) => {
+          const xScale = newXScale as d3.ScaleLinear<number, number>;
+          const yScale = ys as d3.ScaleBand<string>;
+          group
+            .selectAll<SVGGElement, EvaluationChartData>('.unofficial-eval-point')
+            .attr(
+              'transform',
+              (d) =>
+                `translate(${xScale(d.score)},${(yScale(d.configLabel) || 0) + yScale.bandwidth() / 2})`,
+            );
+        },
+      },
+    ],
+    [
+      chartData,
+      errorData,
+      getCssColor,
+      officialPaletteIdentity,
+      resolveColor,
+      showLabels,
+      unofficialChartData,
+      unofficialErrorData,
+      unofficialPaletteIdentity,
+      runIndexByUrl,
+      locale,
+      pointColor,
+    ],
+  );
+
+  const isInitializing = evaluationChartIsInitializing({ isEvaluationDataSettled });
+  if (isInitializing && chartData.length === 0 && unofficialChartData.length === 0) {
+    return (
+      <div className="p-3">
+        <Skeleton className="h-7 w-2/4 mb-1" />
+        <Skeleton className="h-5 w-3/4 mb-2" />
+        <Skeleton className="h-[600px] w-full" />
+      </div>
+    );
+  }
+
+  const blockingState = evaluationChartBlockingState({
+    hasChartData: chartData.length > 0 || unofficialChartData.length > 0,
+    isEvaluationDataError,
+  });
+  if (blockingState) {
+    const hasSelections = selectedBenchmark && selectedModel && selectedRunDate;
+    const hasNoEvalDataForDate =
+      hasSelections && availableDates.length > 0 && !availableDates.includes(selectedRunDate);
+    return (
+      <EmptyState bare className="h-100">
+        <div>
+          {blockingState === 'data-error' ? (
+            legendT.loadError
+          ) : hasSelections && !modelHasEvalData ? (
+            legendT.modelEmpty
+          ) : hasNoEvalDataForDate ? (
+            <>
+              <div>
+                {legendT.dateEmpty(formatEvaluationEmptyStateDate(selectedRunDate, locale))}
+              </div>
+              <div>{legendT.tryDate}</div>
+            </>
+          ) : (
+            <>
+              <div>{legendT.combinationEmpty}</div>
+              <div>{legendT.tryCombination}</div>
+            </>
+          )}
+        </div>
+      </EmptyState>
+    );
+  }
+
+  return (
+    <D3Chart<EvaluationChartData>
+      ref={chartRef}
+      chartId="evaluation-chart"
+      data={chartData}
+      dataIdentity={dataIdentity}
+      metricIdentity={metricIdentity}
+      displayIdentity={displayIdentity}
+      height={chartHeight}
+      margin={chartMargin}
+      watermark={getChartWatermark(isUnofficialRun)}
+      grabCursor={false}
+      caption={caption}
+      footer={footer}
+      xScale={xScaleConfig}
+      yScale={yScaleConfig}
+      xAxis={xAxisConfig}
+      yAxis={yAxisConfig}
+      layers={layers}
+      zoom={zoomConfig}
+      tooltip={tooltipConfig}
+      legendElement={
+        <ChartLegend
+          variant="sidebar"
+          legendItems={legendItems}
+          onItemRemove={removeHardware}
+          isLegendExpanded={isLegendExpanded}
+          onExpandedChange={(expanded) => {
+            setIsLegendExpanded(expanded);
+            track('evaluation_legend_expanded', { enabled: expanded });
+          }}
+          switches={[
+            {
+              id: 'eval-show-labels',
+              label: legendT.showLabels,
+              checked: showLabels,
+              onCheckedChange: (checked) => {
+                setShowLabels(checked);
+                track('evaluation_show_labels_toggled', { enabled: checked });
+              },
+            },
+            {
+              id: 'eval-high-contrast',
+              label: legendT.highContrast,
+              checked: highContrast,
+              onCheckedChange: (checked) => {
+                setHighContrast(checked);
+                track('evaluation_high_contrast_toggled', { enabled: checked });
+              },
+            },
+          ]}
+          reset={{
+            id: 'eval-reset-filter',
+            disabled:
+              effectiveOfficialHardware.size >= hwTypesWithData.size &&
+              activeOverlayHwTypes.size >= allOverlayHwTypes.size,
+            onClick: () => {
+              selectAllHwTypes();
+              setUnifiedOverlaySelection(hwTypesWithData, allOverlayHwTypes);
+              track('evaluation_filter_reset');
+            },
+          }}
+          enableTooltips={true}
+          keyIndicators={parallelismKey}
+        />
+      }
+    />
+  );
+}

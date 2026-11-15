@@ -1,0 +1,205 @@
+---
+title: 'AMD MI355X GLM-5 推理：SGLang FP8 每百万 token 成本比 B200 最高低 29.6%'
+subtitle: 'GLM-5 发布 14 周后，AMD 在 MI355X 上同时实现了 SGLang FP8 的 MTP 和非 MTP 方案 — 通过 TileLang 实现的融合 MLA + FP8 KV 缓存在大部分性能 Pareto 前沿上将单节点 FP8 成本曲线翻转为 AMD 占优'
+seoDescription: 'AMD MI355X 在 SGLang FP8 上运行 GLM-5，每百万 token 成本比 B200 最高低 29.6%——TileLang 融合 MLA 与 FP8 KV 缓存。'
+date: '2026-05-25'
+publishDate: '2026-05-25'
+modifiedDate: '2026-10-25'
+tags:
+  - benchmark
+  - gpu
+  - inference
+  - glm5
+  - amd
+  - nvidia
+  - mi355x
+  - b200
+  - sglang
+  - rocm
+---
+
+GLM-5 发布 14 周后，在 8k/1k 工作负载下，AMD MI355X SGLang FP8 在双方共有的单节点运行区间内，大部分交互性水平上的每百万 token 成本低于 NVIDIA B200 SGLang FP8。使用 MTP 时，插值得到的最大成本降幅约为 **29.6%，出现在约 24.3 tok/s/user**（B200 $0.3388/M，MI355X $0.2384/M；B200 / MI355X 成本比为 1.421 倍）。不使用 MTP 时，最大降幅约为 **23.7%，出现在约 11.2 tok/s/user**（$0.3161/M vs $0.2411/M；成本比为 1.311 倍）。双方均使用 **SGLang v0.5.12** 和 FP8 KV 缓存。本次比较采用截至 2026-05-20 的历史数据快照。
+
+这正是关键的节奏。GLM-5 发布后，一个季度内 AMD 就完成了上游 SGLang kernel 的合入（[sgl-project/sglang PR #21511](https://github.com/sgl-project/sglang/pull/21511)）及其他优化，并提交了配套的 InferenceX 方案（[InferenceX PR #1440](https://github.com/SemiAnalysisAI/InferenceX/pull/1440)），将该模型的 FP8 单节点成本曲线翻转为 AMD 占优。速度就是护城河。
+
+<DashboardCTA href="https://inferencex.semianalysis.com/infx/inference?g_model=GLM-5&i_prec=fp8&g_rundate=2026-05-20&i_active=b200_sglang%2Cb200_sglang_mtp%2Cmi355x_sglang%2Cmi355x_sglang_mtp&i_metric=y_costh&i_linelabel=1">
+  点击查看完整 InferenceX 仪表板 →
+</DashboardCTA>
+
+GLM-5 是智谱（ZAI）的 MoE 旗舰模型，于 2026-02-11 发布 — 距本文采用的快照约 14 周。该模型拥有 **744B 参数的稀疏 MoE 架构，每 token 激活约 40B**：256 个专家采用 top-8 路由（约 5.9% 稀疏度），外加共享专家。公开的架构名称为 `glm_moe_dsa` — 模型在解码路径中集成了 **DeepSeek 稀疏注意力（DSA）**，这与 DeepSeek 在 V3.2 中引入的稀疏注意力模式相同，也是 SGLang 的 TileLang 后端所围绕构建的核心，同时采用多头潜在注意力（MLA）进行 KV 缓存压缩以支持其 200K 上下文窗口。
+
+在 MI355X 上，等效能力在四月中旬通过 SGLang 的 TileLang 后端落地，由此带来的解码吞吐量提升使得 MI355X 较低的单 GPU TCO（$1.48/GPU/hr，B200 为 $1.95/GPU/hr，数据来源 [SemiAnalysis AI Cloud TCO 模型](https://newsletter.semianalysis.com/p/ai-cloud-economics)）得以转化为真正的每 token 成本优势，而非被软件差距所淹没。
+
+## 推动这一结果的关键优化
+
+AMD 方面的标志性性能优化之一是 [sgl-project/sglang PR #21511](https://github.com/sgl-project/sglang/pull/21511)（由 [HaiShaw](https://github.com/HaiShaw) 提交，2026-04-03 合入）。该 PR 通过 SGLang 的 TileLang 后端为 MI300/MI355 启用了 FP8 KV 缓存和 FP8 注意力 kernel（在 DeepSeek-V3.2 和 GLM-5 上均已测试），并针对不同硬件代际采用了不同的融合策略：
+
+- **在 MI355 上**，该 PR **复用了现有的 `fused_qk_rope_cat_and_cache_mla` kernel 来同时处理 Q 和 KV 的 FP8 量化**。QK rope 拼接、MLA 缓存写入以及 Q 和 KV 的 FP8 量化全部合并到每个解码步骤的单次 kernel 调用中 — 无需额外的 HBM 往返，无需单独的量化 kernel 启动。
+
+TileLang 依赖版本已更新以在 AMD 上启用 FP8 GEMM，并新增了 `sparse_mla_fwd_decode_partial_fp8` kernel 用于部分解码归约路径。该 PR 报告 MI355 吞吐量提升超过 5%（MI300 超过 10%），gsm8k 准确率无下降（DeepSeek-V3.2 0.945 → 0.946；GLM-5 0.946 → 0.950），通过 `--kv-cache-dtype fp8_e4m3` 配合 TileLang 预填充/解码后端激活。
+
+## 基准测试数据
+
+更正（2026-10-25）：此前版本将成本降幅误写为 40%，且部分比较超出了双方共有的实测区间。本文标题、开篇结论和下表均基于同一批历史测量数据，按仪表板当前的插值方法重新计算。
+
+所有数据均为 GLM-5 FP8，**ISL 8192 / OSL 1024**，单节点非分离式部署，来自截至 2026-05-20 的 InferenceX 数据快照，CUDA（B200）和 ROCm（MI355X）均使用 **SGLang v0.5.12**。每百万总 token 成本计算方式为 `TCO_$/GPU/hr / (3600 × tput_per_gpu / 1e6)`，B200 为 $1.95/GPU/hr，MI355X 为 $1.48/GPU/hr。
+
+原始测量分别来自 2026-05-18 的 [B200 运行 26047946365](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/26047946365/attempts/1) 和 2026-05-19 的 [MI355X 运行 26046385161](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/26046385161/attempts/1)。5 月 20 日是快照截止日期，并非双方共同的测量日期。
+
+容器镜像：
+
+- **B200:** `lmsysorg/sglang:v0.5.12-cu130`
+- **MI355X:** `lmsysorg/sglang-rocm:v0.5.12-rocm720-mi35x-20260517`
+
+**B200 SGLang FP8 MTP，TP=8，8 GPU：**
+
+| 并发数 | tok/s/GPU | tok/s/user | TPOT (ms) | $/M tokens |
+| ------ | --------- | ---------- | --------- | ---------- |
+| 4      | 417.0     | 100.85     | 9.92      | $1.30      |
+| 8      | 650.1     | 77.82      | 12.85     | $0.83      |
+| 16     | 952.7     | 56.93      | 17.57     | $0.57      |
+| 32     | 1,296.8   | 38.16      | 26.21     | $0.42      |
+| 64     | 1,619.3   | 23.56      | 42.45     | $0.34      |
+| 128    | 1,929.5   | 13.78      | 72.59     | $0.28      |
+| 256    | 1,947.3   | 11.88      | 84.15     | $0.28      |
+
+**MI355X SGLang FP8 MTP，TP=4，4 GPU**（Pareto 锚定方案）：
+
+| 并发数 | tok/s/GPU | tok/s/user | TPOT (ms) | $/M tokens |
+| ------ | --------- | ---------- | --------- | ---------- |
+| 4      | 625.5     | 76.80      | 13.02     | $0.66      |
+| 8      | 911.7     | 54.59      | 18.32     | $0.45      |
+| 16     | 1,208.1   | 35.82      | 27.92     | $0.34      |
+| 32     | 1,707.4   | 24.83      | 40.27     | $0.24      |
+| 64     | 1,895.0   | 18.19      | 54.99     | $0.22      |
+| 128    | 1,911.7   | 18.05      | 55.40     | $0.22      |
+
+**MI355X SGLang FP8 MTP，TP=8，8 GPU**（高交互性分支）：
+
+| 并发数 | tok/s/GPU | tok/s/user | TPOT (ms) | $/M tokens |
+| ------ | --------- | ---------- | --------- | ---------- |
+| 4      | 373.4     | 90.43      | 11.06     | $1.10      |
+| 8      | 534.2     | 65.05      | 15.37     | $0.77      |
+
+**B200 SGLang FP8 非 MTP，TP=8，8 GPU：**
+
+| 并发数 | tok/s/GPU | tok/s/user | TPOT (ms) | $/M tokens |
+| ------ | --------- | ---------- | --------- | ---------- |
+| 4      | 231.3     | 54.25      | 18.43     | $2.34      |
+| 8      | 382.4     | 46.07      | 21.71     | $1.42      |
+| 16     | 613.2     | 36.65      | 27.28     | $0.88      |
+| 32     | 933.7     | 27.47      | 36.40     | $0.58      |
+| 64     | 1,291.8   | 18.42      | 54.28     | $0.42      |
+| 128    | 1,669.1   | 11.87      | 84.23     | $0.32      |
+| 256    | 1,746.1   | 10.72      | 93.27     | $0.31      |
+
+**MI355X SGLang FP8 非 MTP，TP=4，4 GPU：**
+
+| 并发数 | tok/s/GPU | tok/s/user | TPOT (ms) | $/M tokens |
+| ------ | --------- | ---------- | --------- | ---------- |
+| 4      | 358.8     | 42.03      | 23.79     | $1.15      |
+| 8      | 579.6     | 34.68      | 28.83     | $0.71      |
+| 16     | 870.8     | 25.86      | 38.67     | $0.47      |
+| 32     | 1,274.0   | 18.57      | 53.86     | $0.32      |
+| 64     | 1,660.1   | 11.83      | 84.56     | $0.25      |
+| 128    | 2,071.4   | 7.33       | 136.36    | $0.20      |
+| 256    | 2,189.4   | 6.69       | 149.45    | $0.19      |
+
+## 等交互性成本对比
+
+对每种硬件与 MTP 设置，在其吞吐量 Pareto 前沿上使用与仪表板相同的单调三次 Hermite 样条插值，再按 `TCO_$/GPU/hr × 1e6 / (3600 × interpolated throughput)` 推导成本。MI355X MTP 将 TP=4 与 TP=8 数据点合并为一条前沿。成本比和降幅均使用未舍入的成本计算：`saving = 1 − MI355X cost / B200 cost`。
+
+双方共有的实测交互性范围约为：使用 MTP 时 18.052–90.435 tok/s/user，不使用 MTP 时 10.722–42.032 tok/s/user。MTP 在 18 tok/s/user 或非 MTP 在 10 tok/s/user 的比较均需要外推，因此不报告这两个比较。MTP 的最大插值降幅出现在约 24.32 tok/s/user，表中采用 24.3。MI355X MTP 在约 89.13 tok/s/user 的交点之前成本更低，此后 B200 更低；90 tok/s/user 行的负降幅表示这一反转。
+
+**MTP：**
+
+| 交互性 (tok/s/user) | B200 SGLang MTP $/M tok | MI355X SGLang MTP $/M tok | B200 / MI355X | MI355X 成本降幅 |
+| ------------------- | ----------------------- | ------------------------- | ------------- | --------------- |
+| 18.1                | $0.2987                 | $0.2159                   | 1.384x        | 27.7%           |
+| 24                  | $0.3371                 | $0.2373                   | 1.420x        | 29.6%           |
+| **24.3**            | **$0.3388**             | **$0.2384**               | **1.421x**    | **29.6%**       |
+| 35                  | $0.3982                 | $0.3325                   | 1.197x        | 16.5%           |
+| 55                  | $0.5500                 | $0.4538                   | 1.212x        | 17.5%           |
+| 77                  | $0.8203                 | $0.6608                   | 1.241x        | 19.4%           |
+| 90                  | $1.0475                 | $1.0765                   | 0.973x        | -2.8%           |
+
+**非 MTP：**
+
+| 交互性 (tok/s/user) | B200 SGLang $/M tok | MI355X SGLang $/M tok | B200 / MI355X | MI355X 成本降幅 |
+| ------------------- | ------------------- | --------------------- | ------------- | --------------- |
+| **11.2**            | **$0.3161**         | **$0.2411**           | **1.311x**    | **23.7%**       |
+| 15                  | $0.3669             | $0.2817               | 1.302x        | 23.2%           |
+| 20                  | $0.4449             | $0.3450               | 1.289x        | 22.5%           |
+| 30                  | $0.6450             | $0.5723               | 1.127x        | 11.3%           |
+| 40                  | $1.0390             | $0.9822               | 1.058x        | 5.5%            |
+
+<Figure
+  srcLight="/images/mi355x-glm5-fp8-sglang-40-cheaper-than-b200/benchmark-light.png"
+  srcDark="/images/mi355x-glm5-fp8-sglang-40-cheaper-than-b200/benchmark-dark.png"
+  alt="GLM-5 FP8 8k/1k 每百万总 token 成本与交互性关系图，B200 SGLang 和 MI355X SGLang，含和不含 MTP 投机解码"
+  caption="GLM-5 FP8 8k/1k。每百万总 token 成本与交互性。B200 SGLang 和 MI355X SGLang，含和不含 MTP。标签标注每个配置的 GPU 数量。"
+/>
+
+[实时图表](https://inferencex.semianalysis.com/infx/inference?g_model=GLM-5&i_prec=fp8&g_rundate=2026-05-20&i_active=b200_sglang%2Cb200_sglang_mtp%2Cmi355x_sglang%2Cmi355x_sglang_mtp&i_metric=y_costh&i_linelabel=1)，预筛选为截至 2026-05-20 快照中 B200 和 MI355X SGLang 上的 GLM-5 FP8。
+
+## MI355X 在 GLM-5 上的后续展望
+
+此次结果为单节点、聚合、仅 FP8。仍有两个差距待弥合：
+
+- **FP4 可组合性。** 本次对比中 B200 使用的是 CUDA nightly 上的 FP8。B200 NVFP4 SGLang 的 GLM-5 方案已开始交付，将进一步压缩 B200 的成本曲线。MI355X MXFP4 GLM-5.1 SGLang 已通过 [InferenceX PR #1098](https://github.com/SemiAnalysisAI/InferenceX/pull/1098) 于 2026-04-21 交付，但 MI355X 上的 FP4 + MTP 组合尚未达到本文展示的 FP8 + MTP 方案的水平。
+- **分离式部署和宽专家并行。** MI355X 上的 GLM-5 尚无分离式部署或宽 EP 方案。NVIDIA 的 GB200 NVL72 Dynamo TRT-LLM 和 Dynamo vLLM 方案在 Kimi K2.5 上已展示了[机架级宽 EP 带来的约 3 倍每 GPU 吞吐量优势](https://inferencex.semianalysis.com/zh/blog/gb200-nvl72-kimi-k2-5-vllm-wide-ep-3x-vs-b200)。AMD 尚未为 GLM-5 交付分离式部署方案。
+
+## 致谢
+
+该方案的快速落地得益于 [Anush Elangovan](https://x.com/AnushElangovan)、[HaiShaw](https://github.com/HaiShaw) 及更广泛的 AMD AI 团队在 GLM-5 发布后 14 周内完成了上游 SGLang TileLang 融合 MLA + FP8 KV kernel 的提交。SGLang 维护者在提交后数天内即完成了审查与合入。从上游到基准测试的闭环速度就是护城河。
+
+<DashboardCTA href="https://inferencex.semianalysis.com/infx/inference?g_model=GLM-5&i_prec=fp8&g_rundate=2026-05-20&i_active=b200_sglang%2Cb200_sglang_mtp%2Cmi355x_sglang%2Cmi355x_sglang_mtp&i_metric=y_costh&i_linelabel=1">
+  点击查看完整 InferenceX 仪表板 →
+</DashboardCTA>
+
+<JsonLd>{`{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "AMD MI355X 在 GLM-5 FP8 单节点推理上比 NVIDIA B200 便宜多少？",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "在 GLM-5 FP8、8k/1k、SGLang MTP 条件下，MI355X 的最大插值成本降幅约为 29.6%，出现在约 24.3 tok/s/user：每百万总 token 成本为 $0.2384，B200 为 $0.3388。B200 / MI355X 成本比为 1.421 倍，对应成本降低 29.6%。不使用 MTP 时，最大降幅约为 23.7%，出现在约 11.2 tok/s/user（$0.2411 vs $0.3161，成本比为 1.311 倍）。MTP 比较仅在约 18.052 至 90.435 tok/s/user 范围内有实测前沿支撑；MI355X 在约 89.13 tok/s/user 之前成本更低。TCO 假设为 MI355X $1.48/GPU/hr、B200 $1.95/GPU/hr。5 月 20 日快照包含的 B200 测量来自 2026 年 5 月 18 日，MI355X 测量来自 5 月 19 日。"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "SGLang PR #21511 是什么？它如何帮助 MI355X 运行 GLM-5？",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "sgl-project/sglang PR #21511（由 HaiShaw 提交，2026-04-03 合入）通过 SGLang 的 TileLang 后端为 AMD MI300 和 MI355 启用了 FP8 KV 缓存和 FP8 注意力 kernel，在 DeepSeek-V3.2 和 GLM-5 上均已测试。在 MI355 上，它复用了现有的 fused_qk_rope_cat_and_cache_mla kernel 来同时处理 Q 和 KV 的 FP8 量化，将 QK rope 拼接、MLA 缓存写入以及 FP8 量化合并到每个解码步骤的单次 kernel 调用中。在 MI300 上，使用独立的 Triton kernel set_mla_kv_buffer_fp8_quant 处理 KV 缓存量化。该 PR 报告 MI355 吞吐量提升超过 5%（MI300 超过 10%），gsm8k 准确率无下降（GLM-5 0.946 → 0.950，DeepSeek-V3.2 0.945 → 0.946），通过 --kv-cache-dtype fp8_e4m3 配合 TileLang 预填充/解码后端激活。"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "为什么 MI355X MTP 的成本优势在约 24.3 tok/s/user 时最大？",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "MI355X MTP 将 4-GPU TP=4 配置与较低的单 GPU TCO 假设相结合：MI355X 为 $1.48/GPU/hr，B200 TP=8 为 $1.95/GPU/hr。在约 24.3 tok/s/user 处，仪表板在 MI355X TP=4 的并发数 64 与 32 之间插值吞吐量；B200 则在 TP=8 的并发数 64 与 32 之间插值。由吞吐量推导成本后，MI355X 为 $0.2384/M，B200 为 $0.3388/M，即成本约低 29.6%，B200 / MI355X 成本比为 1.421 倍。在 90 tok/s/user 处比较反转：B200 为 $1.0475/M，MI355X 为 $1.0765/M，插值交点约为 89.13 tok/s/user。"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "MI355X 在不使用 MTP 的 GLM-5 FP8 上也比 B200 便宜吗？",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "是的。不使用 MTP 时，在双方共有的 10.722 至 42.032 tok/s/user 实测范围内，MI355X SGLang FP8 TP=4 的插值成本始终低于 B200 TP=8。最大降幅约为 23.7%，出现在约 11.2 tok/s/user（每百万总 token 为 $0.2411 vs $0.3161）。在 20 tok/s/user 处，降幅为 22.5%（$0.3450 vs $0.4449）；在 40 tok/s/user 处，降幅为 5.5%（$0.9822 vs $1.0390）。B200 的实测前沿不覆盖 10 tok/s/user，因此无法在该点比较。在 MI355X TP=4、并发数 32 时，MTP 使吞吐量提高约 34%：TPOT 从 53.9 ms 降至 40.3 ms，tok/s/GPU 从 1,274 升至 1,707。"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "AMD MI355X 在 GLM-5 上还有哪些差距待弥合？",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "主要有两个差距。FP4 可组合性：B200 NVFP4 SGLang 的 GLM-5 方案已开始交付，速度明显快于 MI355X MXFP4。MI355X MXFP4 GLM-5.1 SGLang 已通过 InferenceX PR #1098 交付，但 MI355X 上的 FP4 + MTP 组合尚未达到本文 FP8 + MTP 方案的水平。分离式部署和宽专家并行：MI355X 上的 GLM-5 尚无分离式部署或宽 EP 方案。NVIDIA GB200 NVL72 Dynamo 方案在 Kimi K2.5 上已展示了机架级宽 EP 带来的约 3 倍每 GPU 吞吐量优势。AMD 尚未为 GLM-5 交付分离式部署方案。"
+      }
+    }
+  ]
+}`}</JsonLd>

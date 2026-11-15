@@ -1,0 +1,447 @@
+'use client';
+
+import { useMemo, useRef, useState } from 'react';
+import { ArrowDown, ArrowUp, ArrowUpDown, ChevronLeft, ChevronRight } from 'lucide-react';
+
+import { useUnofficialDomain } from '@/hooks/useUnofficialDomain';
+import { track } from '@/lib/analytics/analytics';
+import { useSearchTracking } from '@/lib/analytics/use-search-tracking';
+import { SegmentedToggle, type SegmentedToggleOption } from '@/components/ui/segmented-toggle';
+import { TABLE_HEAD_CELL_STYLE, TABLE_HEAD_ROW_STYLE } from '@/components/ui/control-styles';
+import { SearchInput } from '@/components/ui/search-input';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { useLocale } from '@/lib/i18n/use-locale';
+
+export interface DataTableColumn<T> {
+  header: string;
+  align?: 'left' | 'right' | 'center';
+  cell: (row: T, index: number) => React.ReactNode;
+  sortValue?: (row: T) => number | string;
+  colSpan?: (row: T) => number;
+  className?: string;
+  importance?: 'key' | 'secondary';
+  pinned?: boolean;
+}
+
+type SortDir = 'asc' | 'desc' | null;
+
+interface SortState {
+  columnIndex: number;
+  dir: SortDir;
+}
+
+interface DataTableProps<T> {
+  data: T[];
+  columns: DataTableColumn<T>[];
+  testId?: string;
+  analyticsPrefix?: string;
+  watermark?: boolean;
+  searchable?: boolean;
+  /** Offers the key-metrics / all-data column toggle when columns carry an importance. */
+  columnPresets?: boolean;
+}
+
+type TablePreset = 'key' | 'all';
+
+const PAGE_SIZE_OPTIONS = [10, 25, 50, 100, 250, 500] as const;
+
+const ALIGN_CLASSES = {
+  left: 'text-left',
+  right: 'text-right',
+  center: 'text-center',
+} as const;
+
+export function SortIndicator({ dir }: { dir: 'asc' | 'desc' | null }) {
+  if (dir === 'asc') return <ArrowUp aria-hidden="true" className="inline size-3" />;
+  if (dir === 'desc') return <ArrowDown aria-hidden="true" className="inline size-3" />;
+  return (
+    <ArrowUpDown
+      aria-hidden="true"
+      className="inline size-3 opacity-0 transition-opacity group-hover/sort:opacity-50 group-focus-visible/sort:opacity-50"
+    />
+  );
+}
+
+const STRINGS = {
+  en: {
+    noData: 'No data available for the current filters',
+    search: 'Search...',
+    searchAria: 'Search table',
+    clearSearch: 'Clear search',
+    noResults: 'No results match',
+    of: 'of',
+    filteredFrom: 'filtered from',
+    rowUnit: 'rows',
+    rowsPerPage: 'Rows per page',
+    perPage: 'per page',
+    previousPage: 'Previous page',
+    nextPage: 'Next page',
+    preset: 'Columns',
+    keyPreset: 'Key metrics',
+    allPreset: 'All data',
+  },
+  zh: {
+    noData: '当前筛选条件下没有可用数据',
+    search: '搜索…',
+    searchAria: '搜索表格',
+    clearSearch: '清除搜索',
+    noResults: '没有结果匹配',
+    of: '共',
+    filteredFrom: '筛选自',
+    rowUnit: '行',
+    rowsPerPage: '每页行数',
+    perPage: '每页',
+    previousPage: '上一页',
+    nextPage: '下一页',
+    preset: '列显示',
+    keyPreset: '关键指标',
+    allPreset: '全部数据',
+  },
+} as const;
+
+export function DataTable<T>({
+  data,
+  columns,
+  testId = 'data-table',
+  analyticsPrefix = 'table',
+  watermark = true,
+  searchable = true,
+  columnPresets = true,
+}: DataTableProps<T>) {
+  const locale = useLocale();
+  const t = STRINGS[locale];
+  const isUnofficialDomain = useUnofficialDomain();
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState<number>(10);
+  const [sort, setSort] = useState<SortState>({ columnIndex: -1, dir: null });
+  const [search, setSearch] = useState('');
+  const hasPresets =
+    columnPresets &&
+    columns.some((column) => column.importance === 'secondary') &&
+    columns.some((column) => column.importance === 'key');
+  const [preset, setPreset] = useState<TablePreset>('key');
+  const searchRef = useRef<HTMLInputElement>(null);
+  const visibleColumns =
+    hasPresets && preset === 'key'
+      ? columns.filter((column) => column.importance === 'key')
+      : columns;
+
+  const clearSearch = () => {
+    setSearch('');
+    setPage(0);
+    track(`${analyticsPrefix}_search_cleared`);
+    searchRef.current?.focus();
+  };
+
+  const handleSort = (colIndex: number) => {
+    const col = columns[colIndex];
+    if (!col.sortValue) return;
+    setSort((prev) => {
+      let nextDir: SortDir;
+      if (prev.columnIndex !== colIndex) {
+        nextDir = 'desc';
+      } else if (prev.dir === 'desc') {
+        nextDir = 'asc';
+      } else if (prev.dir === 'asc') {
+        nextDir = null;
+      } else {
+        nextDir = 'desc';
+      }
+      track(`${analyticsPrefix}_sort_changed`, {
+        sort_key: col.header,
+        sort_dir: nextDir ?? 'none',
+      });
+      return { columnIndex: colIndex, dir: nextDir };
+    });
+    setPage(0);
+  };
+
+  const filtered = useMemo(() => {
+    if (!searchable || !search.trim()) return data;
+    const q = search.trim().toLowerCase();
+    return data.filter((row) =>
+      columns.some((col) => {
+        if (!col.sortValue) return false;
+        return String(col.sortValue(row)).toLowerCase().includes(q);
+      }),
+    );
+  }, [data, search, columns, searchable]);
+  useSearchTracking(`${analyticsPrefix}_searched`, searchable ? search : '', {
+    results: filtered.length,
+  });
+
+  const sorted = useMemo(() => {
+    if (sort.dir === null || sort.columnIndex < 0) return filtered;
+    const col = columns[sort.columnIndex];
+    if (!col?.sortValue) return filtered;
+    const extract = col.sortValue;
+    const multiplier = sort.dir === 'asc' ? 1 : -1;
+    return [...filtered].toSorted((a, b) => {
+      const av = extract(a);
+      const bv = extract(b);
+      if ((av === null || av === undefined) && (bv === null || bv === undefined)) return 0;
+      if (av === null || av === undefined) return 1;
+      if (bv === null || bv === undefined) return -1;
+      if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * multiplier;
+      return String(av).localeCompare(String(bv)) * multiplier;
+    });
+  }, [filtered, sort, columns]);
+
+  const totalPages = Math.max(1, Math.ceil(sorted.length / pageSize));
+  const safePage = Math.min(page, totalPages - 1);
+  const pageData = sorted.slice(safePage * pageSize, (safePage + 1) * pageSize);
+
+  if (data.length === 0) {
+    return <p className="text-sm text-muted-foreground py-8 text-center">{t.noData}</p>;
+  }
+
+  return (
+    <div data-testid={testId} className="mt-3 w-full min-w-0 max-w-full">
+      {(searchable || hasPresets) && (
+        <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-2">
+          {searchable && (
+            <SearchInput
+              ref={searchRef}
+              value={search}
+              onChange={(e) => {
+                setSearch(e.target.value);
+                setPage(0);
+              }}
+              onClear={clearSearch}
+              placeholder={t.search}
+              aria-label={t.searchAria}
+              clearLabel={t.clearSearch}
+            />
+          )}
+          {hasPresets && (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-muted-foreground">{t.preset}</span>
+              <SegmentedToggle<TablePreset>
+                value={preset}
+                options={
+                  [
+                    { value: 'key', label: t.keyPreset, testId: 'data-table-preset-key' },
+                    { value: 'all', label: t.allPreset, testId: 'data-table-preset-all' },
+                  ] satisfies SegmentedToggleOption<TablePreset>[]
+                }
+                onValueChange={(value) => {
+                  setPreset(value);
+                  track(`${analyticsPrefix}_preset_changed`, { preset: value });
+                }}
+                ariaLabel={t.preset}
+                testId="data-table-preset"
+                role="group"
+              />
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="overflow-x-auto relative">
+        {watermark && isUnofficialDomain === false && (
+          <div
+            className="absolute inset-0 pointer-events-none flex items-center justify-center"
+            aria-hidden="true"
+          >
+            <img src="/brand/logo-color.webp" alt="" className="w-48 opacity-10" />
+          </div>
+        )}
+        <table className="w-full text-sm relative">
+          <thead className="sticky top-0 bg-card z-1">
+            <tr className={TABLE_HEAD_ROW_STYLE}>
+              {visibleColumns.map((col) => {
+                const i = columns.indexOf(col);
+                const sortable = Boolean(col.sortValue);
+                const activeDir = sort.columnIndex === i && sort.dir ? sort.dir : null;
+                return (
+                  <th
+                    key={i}
+                    className={`${TABLE_HEAD_CELL_STYLE} py-2 px-3 ${ALIGN_CLASSES[col.align ?? 'left']} ${col.className ?? ''} ${col.pinned ? 'sticky left-0 z-2 border-r border-border/50 bg-card md:border-r-0' : ''} ${sortable ? 'group/sort cursor-pointer select-none hover:text-foreground transition-colors' : ''}`}
+                    tabIndex={sortable ? 0 : undefined}
+                    onClick={sortable ? () => handleSort(i) : undefined}
+                    onKeyDown={
+                      sortable
+                        ? (e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault();
+                              handleSort(i);
+                            }
+                          }
+                        : undefined
+                    }
+                    aria-sort={
+                      sort.columnIndex === i && sort.dir
+                        ? sort.dir === 'asc'
+                          ? 'ascending'
+                          : 'descending'
+                        : 'none'
+                    }
+                  >
+                    {sortable && col.align === 'right' && (
+                      <span className="mr-1">
+                        <SortIndicator dir={activeDir} />
+                      </span>
+                    )}
+                    {col.header}
+                    {sortable && col.align !== 'right' && (
+                      <span className="ml-1">
+                        <SortIndicator dir={activeDir} />
+                      </span>
+                    )}
+                  </th>
+                );
+              })}
+            </tr>
+          </thead>
+          <tbody>
+            {pageData.length === 0 ? (
+              <tr>
+                <td
+                  colSpan={visibleColumns.length}
+                  className="py-8 text-center text-sm text-muted-foreground"
+                >
+                  <div className="flex flex-col items-center gap-2">
+                    <span>
+                      {t.noResults} &quot;{search}&quot;
+                    </span>
+                    <button
+                      type="button"
+                      onClick={clearSearch}
+                      className="text-sm text-foreground underline underline-offset-4 hover:text-muted-foreground"
+                      aria-label={t.clearSearch}
+                      data-testid="data-table-empty-clear-search"
+                    >
+                      {t.clearSearch}
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ) : (
+              pageData.map((row, rowIndex) => {
+                let covered = 0;
+                return (
+                  <tr key={rowIndex} className="border-b border-border/50 hover:bg-muted/30">
+                    {visibleColumns.map((col) => {
+                      if (covered > 0) {
+                        covered -= 1;
+                        return null;
+                      }
+                      const span = col.colSpan?.(row) ?? 1;
+                      covered = span - 1;
+                      return (
+                        <td
+                          key={columns.indexOf(col)}
+                          colSpan={span > 1 ? span : undefined}
+                          className={`px-3 py-2 ${ALIGN_CLASSES[col.align ?? 'left']} ${col.align === 'right' || col.align === 'center' ? 'tabular-nums' : ''} ${col.className ?? ''} ${col.pinned ? 'sticky left-0 z-1 border-r border-border/50 bg-card md:border-r-0' : ''}`}
+                        >
+                          {col.pinned ? (
+                            <div className="w-40 max-w-40 whitespace-normal [overflow-wrap:anywhere] sm:w-auto sm:max-w-none">
+                              {col.cell(row, safePage * pageSize + rowIndex)}
+                            </div>
+                          ) : (
+                            col.cell(row, safePage * pageSize + rowIndex)
+                          )}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {data.length > PAGE_SIZE_OPTIONS[0] && (
+        <div className="mt-3 flex flex-col gap-2 border-t border-border/50 pt-3 text-xs text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+            <span data-testid="data-table-pagination-summary">
+              {locale === 'zh' ? (
+                <>
+                  {sorted.length === 0
+                    ? `共 0 ${t.rowUnit}`
+                    : `第 ${safePage * pageSize + 1}–${Math.min((safePage + 1) * pageSize, sorted.length)} ${t.rowUnit}，共 ${sorted.length} ${t.rowUnit}`}
+                  {search && `（${t.filteredFrom} ${data.length} ${t.rowUnit}）`}
+                </>
+              ) : (
+                <>
+                  {sorted.length === 0
+                    ? '0'
+                    : `${safePage * pageSize + 1}–${Math.min((safePage + 1) * pageSize, sorted.length)}`}{' '}
+                  {t.of} {sorted.length}
+                  {search && ` (${t.filteredFrom} ${data.length})`}
+                </>
+              )}
+            </span>
+            <div
+              data-testid="data-table-page-size"
+              className="flex shrink-0 items-center gap-1 whitespace-nowrap"
+            >
+              {locale === 'zh' && <span>{t.perPage}</span>}
+              <Select
+                value={String(pageSize)}
+                onValueChange={(v) => {
+                  const size = Number(v);
+                  setPageSize(size);
+                  setPage(0);
+                  track(`${analyticsPrefix}_page_size_changed`, { size });
+                }}
+              >
+                <SelectTrigger
+                  size="sm"
+                  className="min-w-14 w-auto gap-1 px-2 text-xs data-[size=sm]:h-11 md:data-[size=sm]:h-8"
+                  aria-label={t.rowsPerPage}
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {PAGE_SIZE_OPTIONS.map((size) => (
+                    <SelectItem key={size} value={String(size)}>
+                      {size}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <span>{locale === 'zh' ? t.rowUnit : t.perPage}</span>
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-1 self-end sm:self-auto">
+            <button
+              type="button"
+              onClick={() => {
+                setPage((p) => Math.max(0, p - 1));
+                track(`${analyticsPrefix}_page_changed`, { direction: 'prev' });
+              }}
+              disabled={safePage === 0}
+              className="inline-flex size-11 items-center justify-center rounded-md hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40 transition-colors md:size-8"
+              aria-label={t.previousPage}
+            >
+              <ChevronLeft className="size-4" />
+            </button>
+            <span>
+              {safePage + 1} / {totalPages}
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                setPage((p) => Math.min(totalPages - 1, p + 1));
+                track(`${analyticsPrefix}_page_changed`, { direction: 'next' });
+              }}
+              disabled={safePage >= totalPages - 1}
+              className="inline-flex size-11 items-center justify-center rounded-md hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40 transition-colors md:size-8"
+              aria-label={t.nextPage}
+            >
+              <ChevronRight className="size-4" />
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

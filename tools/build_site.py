@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Build the static site into _site/: the page, data/site.json and one page per recipe.
+"""Prepare the app's public files: one page per recipe and the static API files the chart reads.
 
-python3 tools/build_site.py [--out _site]
+python3 tools/build_site.py [--public app/packages/app/public] [--site-base PREFIX]
 
-data/site.json holds every Marlowe point (data/marlowe/*.json) and the rows of the latest InferenceX snapshot
-(data/inferencex/<date>.json). The build fails if a Marlowe point has no complete recipe, or if a published file
-carries an absolute path, a cluster node name or a non-loopback IP address. Standard library only.
+Writes <public>/recipes/<point>/ (recipe page plus its files) and <public>/data/api/ (tools/build_static_api.py).
+Then `bun run build` in app/ exports the site to app/packages/app/out/. The step fails if a Marlowe point has no
+complete recipe, or if a published file carries an absolute path, a cluster node name or a non-loopback IP address.
+Standard library only.
 """
 
 from __future__ import annotations
@@ -16,8 +17,9 @@ import json
 import re
 import shutil
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
+
+import build_static_api
 
 ROOT = Path(__file__).resolve().parent.parent
 RECIPE_FILES = ("server.sh", "client.sh", "summary.json", "windows.json", "aiperf_summary.json")
@@ -88,11 +90,11 @@ def recipe_page(p: dict, files: dict[str, str]) -> str:
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Recipe: {html.escape(title)}</title>
-<link rel="stylesheet" href="../../style.css">
+<link rel="stylesheet" href="../recipe.css">
 </head>
 <body>
 <main class="page recipe">
-<p class="crumb"><a href="../../">← All results</a></p>
+<p class="crumb"><a href="../../">← Back to the chart</a></p>
 <p class="brand">Marlowe</p>
 <h1>{html.escape(title)}</h1>
 <p class="lede">Measured by Marlowe with InferenceX's agentx-harness client (1.0.13, <code>agentx</code> preset,
@@ -110,39 +112,26 @@ client's own aggregate export. Local paths are replaced by variables; server log
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--out", type=Path, default=ROOT / "_site")
+    ap.add_argument("--public", type=Path, default=ROOT / "app" / "packages" / "app" / "public")
+    ap.add_argument("--site-base", default="", help="URL path prefix of the site (empty for a root site)")
     a = ap.parse_args(argv)
     points = [json.loads(f.read_text()) for f in sorted((ROOT / "data" / "marlowe").glob("*.json"))]
     errors = check(points)
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
-    snaps = sorted((ROOT / "data" / "inferencex").glob("????-??-??.json"))
-    snap = json.loads(snaps[-1].read_text())
-
-    out = a.out
+    out = a.public / "recipes"
     if out.exists():
         shutil.rmtree(out)
-    shutil.copytree(ROOT / "site", out)
-    (out / "data").mkdir()
-    site = {
-        "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
-        "inferencex": {
-            "snapshot": snaps[-1].stem,
-            "fetched_at": snap["fetched_at"],
-            "site": snap["site"],
-            "models": {code: {"api_model": m["api_model"], "rows": m["rows"]} for code, m in snap["models"].items()},
-        },
-        "marlowe": points,
-    }
-    (out / "data" / "site.json").write_text(json.dumps(site, separators=(",", ":")))
+    out.mkdir(parents=True)
+    shutil.copy(ROOT / "tools" / "recipe.css", out / "recipe.css")
     for p in points:
-        src, dst = ROOT / p["recipe"], out / p["recipe"]
+        src, dst = ROOT / p["recipe"], a.public / p["recipe"]
         shutil.copytree(src, dst)
         files = {n: (src / n).read_text() for n in RECIPE_FILES}
         (dst / "index.html").write_text(recipe_page(p, files))
-    print(f"{out}: {len(points)} Marlowe points, InferenceX snapshot {snaps[-1].stem}")
-    return 0
+    print(f"{out}: {len(points)} recipe pages")
+    return build_static_api.main(["--out", str(a.public / "data" / "api"), "--site-base", a.site_base])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,659 @@
+import { TCO_SOURCE_TITLE, TCO_SOURCE_URL } from '@semianalysisai/inferencex-constants';
+
+import {
+  availability as agenticAvailability,
+  b300Rows as agenticB300Rows,
+} from '../support/overlay-fixtures';
+import { availabilityBody, unlockAgenticGate } from '../support/e2e';
+
+describe('TCO Calculator', () => {
+  describe('tab navigation', () => {
+    before(() => {
+      cy.window().then((win) => {
+        win.localStorage.setItem('inferencex-star-modal-dismissed', String(Date.now()));
+      });
+      cy.visit('/infx/inference');
+    });
+
+    it('switches back to inference tab and then returns to calculator', () => {
+      cy.get('[data-testid="tab-trigger-calculator"]').should('not.exist');
+      cy.get('[data-testid="footer-link-calculator"]')
+        .scrollIntoView()
+        .should('be.visible')
+        .and('contain.text', 'TCO calculator');
+
+      cy.get('[data-testid="footer-link-calculator"]').scrollIntoView().click();
+      cy.url().should('include', '/infx/calculator');
+      cy.get('[data-testid="tab-trigger-inference"]').click();
+      cy.url().should('include', '/infx/inference');
+      cy.get('[data-testid="footer-link-calculator"]').scrollIntoView().click();
+      cy.url().should('include', '/infx/calculator');
+      cy.get('[data-testid="calculator-controls"]').should('be.visible');
+    });
+  });
+
+  describe('controls, interactions, and features', () => {
+    before(() => {
+      cy.window().then((win) => {
+        win.localStorage.setItem('inferencex-star-modal-dismissed', String(Date.now()));
+      });
+      cy.visit('/infx/calculator');
+      cy.get('[data-testid="calculator-bar-chart"] svg .bar').should('have.length.greaterThan', 0);
+    });
+
+    beforeEach(() => {
+      cy.document().then((doc) => {
+        delete doc.body.dataset.scrollLocked;
+        doc.body.style.removeProperty('pointer-events');
+      });
+    });
+
+    it('groups benchmark config above pricing and the comparison target', () => {
+      cy.viewport(1280, 900);
+      cy.get('[data-testid="calculator-controls"] fieldset legend').should(($legends) => {
+        expect([...$legends].map((legend) => legend.textContent)).to.deep.equal([
+          'Benchmark config',
+          'Pricing config',
+          'Comparison target',
+        ]);
+      });
+      cy.get('[data-testid="calculator-controls"] fieldset').then(($groups) => {
+        const [benchmark, pricing, target] = [...$groups].map((group) =>
+          group.getBoundingClientRect(),
+        );
+        expect(pricing.top).to.be.greaterThan(benchmark.bottom);
+        expect(target.top).to.be.greaterThan(benchmark.bottom);
+      });
+      cy.get('[data-testid="calc-cost-selector"]').should(
+        'contain.text',
+        'Owning at large hyperscaler volume',
+      );
+      cy.get('[data-testid="calculator-metric-throughput"]').should('be.visible');
+      cy.get('[data-testid="calculator-metric-throughput"]')
+        .should('have.attr', 'aria-pressed', 'true')
+        .and('have.class', 'bg-muted')
+        .parent()
+        .should(($group) => {
+          expect(
+            $group[0].getBoundingClientRect().height,
+            'metric group matches regular desktop controls',
+          ).to.equal(36);
+        });
+      cy.get('input[type="range"]').should('be.visible');
+    });
+
+    for (const width of [1280, 1440]) {
+      it(`shows every configuration value in full at ${width}px`, () => {
+        cy.viewport(width, 900);
+        cy.get('[data-testid="calculator-controls"] fieldset')
+          .first()
+          .find('button[role="combobox"] *')
+          .should(($nodes) => {
+            for (const node of $nodes) {
+              expect(node.scrollWidth, node.textContent ?? '').to.be.at.most(node.clientWidth + 1);
+            }
+          });
+      });
+    }
+
+    it('places the config-range toggle beside its label above the slider', () => {
+      cy.get('[data-testid="calculator-hide-over-limit-control"]').then(($control) => {
+        const label = $control.children().first()[0].getBoundingClientRect();
+        const toggle = $control.find('button[role="switch"]')[0].getBoundingClientRect();
+        const slider = $control
+          .closest('[data-testid="calculator-controls"]')
+          .find('input[type="range"]')[0]
+          .getBoundingClientRect();
+        expect(toggle.left - label.right).to.be.lessThan(12);
+        expect(toggle.bottom).to.be.lessThan(slider.top);
+      });
+    });
+
+    it('displays chart title that updates when metric changes', () => {
+      const metrics = [
+        { metric: 'throughput', title: 'Total token throughput per chip', badges: [] },
+        {
+          metric: 'power',
+          title: 'Total tokens per provisioned all-in megawatt',
+          badges: ['All in power/chip', 'kW'],
+        },
+        {
+          metric: 'cost',
+          title: 'Cost per million',
+          badges: ['TCO', '$/chip/hr'],
+        },
+      ] as const;
+      for (const { metric, title, badges } of metrics) {
+        cy.get(`[data-testid="calculator-metric-${metric}"]`)
+          .click()
+          .should('have.attr', 'aria-pressed', 'true');
+        cy.get('[data-testid="calculator-chart-section"] h2').first().should('contain.text', title);
+        cy.get('[data-testid="calculator-bar-chart"] svg .bar').should(
+          'have.length.greaterThan',
+          0,
+        );
+        cy.get('[data-testid="calculator-bar-chart"] svg .value-label')
+          .should('have.length.greaterThan', 0)
+          .first()
+          .invoke('text')
+          .should('match', /\d/u);
+        if (badges.length === 0) {
+          cy.get('[data-testid="calculator-cost-badges"]').should('not.exist');
+        } else {
+          for (const text of badges)
+            cy.get('[data-testid="calculator-cost-badges"]').should('contain.text', text);
+        }
+        if (metric === 'power') {
+          cy.get('[data-testid="calculator-chart-section"]').should(
+            'contain.text',
+            'SemiAnalysis Datacenter Industry Model',
+          );
+        }
+        if (metric === 'cost') {
+          cy.get('[data-testid="calculator-chart-section"]')
+            .contains('a', TCO_SOURCE_TITLE)
+            .should('have.attr', 'href', TCO_SOURCE_URL);
+        }
+      }
+    });
+
+    it('switching to table view shows the results table', () => {
+      cy.get('[data-testid="calculator-metric-throughput"]').click();
+      cy.get('[data-testid="calculator-table-view-btn"]').click();
+      cy.get('[data-testid="calculator-results-table"]').should('be.visible');
+      cy.get('[data-testid="calculator-results-table"] table').should('exist');
+      cy.get('[data-testid="calculator-results-table"] tbody tr').should(
+        'have.length.greaterThan',
+        0,
+      );
+      cy.get('[data-testid="calculator-bar-chart"]').should('not.exist');
+
+      cy.get('[data-testid="calculator-results-table"]').within(() => {
+        cy.get('thead').should('contain.text', 'Chip');
+        cy.get('thead').should('contain.text', 'tok/s/MW');
+        cy.get('thead').should('contain.text', 'Concurrency');
+      });
+    });
+
+    it('hides the table logo on unofficial domains', () => {
+      cy.get('[data-testid="calculator-results-table"] img[src="/brand/logo-color.webp"]').should(
+        'not.exist',
+      );
+    });
+
+    it('table view rows contain numeric throughput and cost values', () => {
+      cy.get('[data-testid="calculator-results-table"] tbody tr')
+        .first()
+        .within(() => {
+          cy.get('td').eq(0).invoke('text').should('have.length.greaterThan', 0);
+          cy.get('td')
+            .eq(1)
+            .invoke('text')
+            .should('match', /\d+\.\d/u);
+          cy.get('td')
+            .eq(2)
+            .invoke('text')
+            .should('match', /\$\d+\.\d/u);
+          cy.get('td').eq(3).invoke('text').should('match', /\d+/u);
+          cy.get('td').eq(4).invoke('text').should('match', /~\d+/u);
+        });
+
+      cy.get('[data-testid="calculator-chart-view-btn"]').click();
+      cy.get('[data-testid="calculator-bar-chart"]').should('be.visible');
+    });
+
+    it('table total matches bar count (first page caps at 10 rows)', () => {
+      cy.get('[data-testid="calculator-bar-chart"] svg .bar')
+        .its('length')
+        .then((barCount) => {
+          cy.get('[data-testid="calculator-table-view-btn"]').click();
+          cy.get('[data-testid="calculator-results-table"] tbody tr').should(
+            'have.length',
+            Math.min(barCount, 10),
+          );
+          if (barCount > 10) {
+            cy.get('[data-testid="calculator-chart-section"]').should(
+              'contain.text',
+              `of ${barCount}`,
+            );
+          }
+        });
+    });
+
+    it('picking a locked rental tier opens the TCO model dialog without changing the provider', () => {
+      cy.get('[data-testid="calculator-controls"]').within(() => {
+        cy.get('#calc-cost').click();
+      });
+      cy.get('[role="option"]').should('have.length', 7);
+      cy.get('[role="option"]').eq(0).should('contain.text', 'Owning at large hyperscaler volume');
+      cy.get('[role="option"]').eq(1).should('contain.text', 'Rent – 3-year commit');
+      cy.get('[role="option"]').eq(2).should('contain.text', 'Rent – on demand');
+      cy.get('[role="option"]').eq(3).should('contain.text', 'Rent – 1-month commit');
+      cy.get('[role="option"]').eq(4).should('contain.text', 'Rent – 6-month commit');
+      cy.get('[role="option"]').eq(5).should('contain.text', 'Rent – 1-year commit');
+      cy.get('[role="option"]').eq(6).should('contain.text', 'Rent – 2-year commit');
+      cy.get('[role="option"] [data-testid="locked-tier-badge"]').should('have.length', 5);
+      cy.get('body').type('{esc}');
+
+      cy.get('#calc-cost').invoke('text').as('providerBefore');
+      cy.get('[data-testid="calculator-controls"]').within(() => {
+        cy.get('#calc-cost').click();
+      });
+      cy.get('[data-testid="cost-provider-locked-rent_1_year"]').click();
+      cy.get('[data-testid="tco-model-dialog"]')
+        .should('be.visible')
+        .and('contain.text', 'Rent – 1-year commit');
+      cy.get('[data-testid="tco-model-dialog-link"]').should(
+        'have.attr',
+        'href',
+        'https://semianalysis.com/ai-cloud-tco-model/',
+      );
+      cy.contains('button', 'Not now').click();
+      cy.get('[data-testid="tco-model-dialog"]').should('not.exist');
+      cy.get<string>('@providerBefore').then((before) => {
+        cy.get('#calc-cost').should('have.text', before);
+      });
+    });
+
+    it('switching token type updates table column headers', () => {
+      cy.get('[data-testid="calculator-controls"]').within(() => {
+        cy.get('#calc-cost-type').click();
+      });
+      cy.get('[role="option"]').should('have.length', 3);
+      cy.get('[role="option"]').eq(0).should('contain.text', 'Total tokens');
+      cy.get('[role="option"]').eq(1).should('contain.text', 'Input tokens');
+      cy.get('[role="option"]').eq(2).should('contain.text', 'Output tokens');
+      cy.get('body').type('{esc}');
+
+      cy.get('[data-testid="calculator-chart-section"] h2').first().should('contain.text', 'Total');
+      cy.get('[data-testid="calculator-controls"]').within(() => {
+        cy.get('#calc-cost-type').click();
+      });
+      cy.get('[role="option"]').contains('Input tokens').click();
+      cy.get('[data-testid="calculator-chart-section"] h2').first().should('contain.text', 'Input');
+      cy.get('[data-testid="calculator-chart-section"] h2')
+        .first()
+        .should('not.contain.text', 'Total');
+
+      cy.get('[data-testid="calculator-controls"]').within(() => {
+        cy.get('#calc-cost-type').click();
+      });
+      cy.get('[role="option"]').contains('Output tokens').click();
+      cy.get('[data-testid="calculator-chart-section"] h2')
+        .first()
+        .should('contain.text', 'Output');
+
+      cy.get('[data-testid="calculator-table-view-btn"]').click();
+      cy.get('[data-testid="calculator-results-table"] thead').should(
+        'contain.text',
+        'Output Throughput',
+      );
+      cy.get('[data-testid="calculator-controls"]').within(() => {
+        cy.get('#calc-cost-type').click();
+      });
+      cy.get('[role="option"]').contains('Total tokens').click();
+      cy.get('[data-testid="calculator-results-table"] thead').should(
+        'contain.text',
+        'Total Throughput',
+      );
+      cy.get('[data-testid="calculator-chart-view-btn"]').click();
+    });
+
+    it('changing cost provider updates the cost metric chart title', () => {
+      cy.get('[data-testid="calculator-metric-cost"]').click();
+      cy.get('[data-testid="calculator-chart-section"] h2')
+        .first()
+        .should('contain.text', 'Owning at large hyperscaler volume');
+      cy.get('[data-testid="calculator-controls"]').within(() => {
+        cy.get('#calc-cost').click();
+      });
+      cy.get('[role="option"]').contains('Rent – 3-year commit').click();
+      cy.get('[data-testid="calculator-chart-section"] h2')
+        .first()
+        .should('contain.text', 'Rent – 3-year commit');
+    });
+
+    it('typing a new value in the number input updates the chart title', () => {
+      cy.get('[data-testid="calculator-metric-throughput"]').click();
+      cy.get('[data-testid="calculator-controls"]').within(() => {
+        cy.get('input[type="range"]')
+          .invoke('val')
+          .then((sliderVal) => {
+            cy.get('input[type="number"]').should('have.value', String(sliderVal));
+          });
+      });
+
+      cy.get('[data-testid="calculator-controls"]').within(() => {
+        cy.get('input[type="number"]').clear().type('50');
+      });
+      cy.get('[data-testid="calculator-controls"] input[type="number"]').blur();
+      cy.get('[data-testid="calculator-chart-section"] h2')
+        .first()
+        .should('contain.text', '50 tok/s/user');
+
+      cy.get('[data-testid="calculator-controls"]').within(() => {
+        cy.get('input[type="range"]')
+          .parent()
+          .find('.relative.text-muted-foreground span')
+          .should('have.length.greaterThan', 0)
+          .each(($span) => {
+            const text = $span.text().trim();
+            expect(Number.isNaN(Number(text))).to.equal(false);
+          });
+      });
+    });
+
+    it('toggling a legend item changes visible bar count', () => {
+      cy.get('[data-testid="calculator-bar-chart"] svg .bar')
+        .should('have.length.greaterThan', 1)
+        .its('length')
+        .then((initialCount) => {
+          cy.get('.sidebar-legend label').first().click();
+          cy.get('[data-testid="calculator-bar-chart"] svg .bar').should(
+            'have.length.lessThan',
+            initialCount,
+          );
+        });
+    });
+
+    it('clicking one bar shows a comparison banner with "selected" text', () => {
+      cy.visit('/infx/calculator');
+      cy.get('[data-testid="calculator-bar-chart"] svg .bar').should('have.length.greaterThan', 1);
+      cy.get('[data-testid="calculator-bar-chart"] svg .bar').first().click();
+      cy.get('[data-testid="calculator-comparison-banner"]').should('be.visible');
+      cy.get('[data-testid="calculator-comparison-banner"]').should('contain.text', 'selected');
+      cy.get('[data-testid="calculator-comparison-banner"]').should(
+        'contain.text',
+        'Click another bar to compare',
+      );
+
+      cy.get('[data-testid="calculator-bar-chart"] svg .bar')
+        .first()
+        .should('have.attr', 'opacity')
+        .and('satisfy', (val: string) => parseFloat(val) > 0.5);
+      cy.get('[data-testid="calculator-bar-chart"] svg .bar')
+        .eq(1)
+        .should('have.attr', 'opacity')
+        .and('satisfy', (val: string) => parseFloat(val) < 0.5);
+    });
+
+    it('clicking two bars shows a comparison ratio', () => {
+      cy.get('[data-testid="calculator-bar-chart"] svg .bar').eq(1).click();
+      cy.get('[data-testid="calculator-comparison-banner"]').should('be.visible');
+      cy.get('[data-testid="calculator-comparison-banner"]').should('contain.text', 'x more');
+
+      cy.get('[data-testid="calculator-comparison-banner"]').contains('Clear selection').click();
+      cy.get('[data-testid="calculator-comparison-banner"]').should('not.exist');
+    });
+
+    it('shows the disaggregated cost disclaimer only for per-token-type cost', () => {
+      cy.visit('/infx/calculator');
+      cy.get('[data-testid="calculator-bar-chart"] svg .bar').should('have.length.greaterThan', 0);
+      cy.get('[data-testid="calculator-metric-cost"]').click();
+
+      cy.get('[data-testid="calculator-disagg-cost-note"]').should('not.be.visible');
+
+      for (const tokenType of ['Output tokens', 'Input tokens']) {
+        cy.get('[data-testid="calc-cost-type-selector"]').click();
+        cy.contains('[role="option"]', tokenType).click();
+        cy.get('body').type('{esc}');
+        cy.get('[data-testid="calculator-disagg-cost-note"]').should('be.visible');
+      }
+
+      cy.get('[data-testid="calc-cost-type-selector"]').click();
+      cy.contains('[role="option"]', 'Total tokens').click();
+      cy.get('body').type('{esc}');
+      cy.get('[data-testid="calculator-disagg-cost-note"]').should('not.be.visible');
+    });
+  });
+
+  describe('direct URL navigation', () => {
+    it('?g_model= seeds the model selector before client hydration', () => {
+      cy.request('/infx/calculator?g_model=DeepSeek-V4-Pro').then((response) => {
+        expect(response.body).to.contain('DeepSeek V4 Pro 0813 1.6T');
+        expect(response.body).not.to.contain('DeepSeek R1 0528 671B');
+      });
+    });
+
+    it('renders the URL-supplied model in the dropdown after navigating', () => {
+      cy.window().then((win) => {
+        win.localStorage.setItem('inferencex-star-modal-dismissed', String(Date.now()));
+      });
+      cy.visit('/infx/calculator?g_model=DeepSeek-V4-Pro');
+      cy.get('[data-testid="calc-model-selector"]').should(
+        'contain.text',
+        'DeepSeek V4 Pro 0813 1.6T',
+      );
+    });
+  });
+
+  describe('availability failure degradation', () => {
+    it('keeps usable benchmark results visible when availability metadata fails', () => {
+      cy.intercept('GET', '/api/v1/availability/compact', {
+        statusCode: 503,
+        body: { error: 'temporarily unavailable' },
+      }).as('availabilityFailure');
+
+      cy.visit('/infx/calculator');
+      cy.wait('@availabilityFailure');
+      cy.get('[data-testid="calculator-bar-chart"] svg .bar').should('have.length.greaterThan', 0);
+      cy.get('[data-testid="calculator-controls"]').should('be.visible');
+      cy.contains('Error loading calculator data').should('not.exist');
+    });
+  });
+
+  describe('DeepSeek V4 agentic calculations', () => {
+    beforeEach(() => {
+      const b300Rows = agenticB300Rows(null);
+      const b200Rows = agenticB300Rows(null).map((row) => ({
+        ...row,
+        hardware: 'b200',
+      }));
+      cy.intercept('GET', '/api/v1/availability/compact', {
+        body: availabilityBody([
+          ...agenticAvailability,
+          ...agenticAvailability.map((row) => ({ ...row, hardware: 'b200' })),
+        ]),
+      }).as('agenticAvailability');
+      cy.intercept('GET', '/api/v1/benchmarks*', { body: [...b300Rows, ...b200Rows] }).as(
+        'agenticBenchmarks',
+      );
+      cy.visit('/infx/calculator?g_model=DeepSeek-V4-Pro&i_seq=agentic-traces&i_prec=fp4', {
+        onBeforeLoad(win) {
+          win.localStorage.setItem('inferencex-star-modal-dismissed', String(Date.now()));
+          unlockAgenticGate(win);
+        },
+      });
+      cy.wait('@agenticBenchmarks');
+    });
+
+    it('renders throughput and cost calculations from null-ISL/OSL agentic rows', () => {
+      cy.get('[data-testid="calc-sequence-selector"]').should('not.exist');
+      cy.get('button[data-testid="calc-precision-selector"]')
+        .should('have.text', 'FP4')
+        .and('be.disabled');
+      cy.get('[data-testid="calc-percentile-selector"]').should('contain.text', 'p90');
+      cy.get('[data-testid="calculator-no-data"]').should('not.exist');
+      cy.get('[data-testid="calculator-bar-chart"] svg .bar').should('have.length', 2);
+      cy.get('[data-testid="calculator-chart-section"] h2')
+        .first()
+        .should('contain.text', 'P90 interactivity');
+
+      cy.get('[data-testid="calculator-metric-cost"]').click();
+      cy.get('[data-testid="calculator-bar-chart"] svg .value-label')
+        .first()
+        .should('contain.text', '$');
+    });
+
+    it('recalculates agentic results at P75 and includes it in the share link', () => {
+      cy.get('[data-testid="calc-percentile-selector"]').click();
+      cy.get('[role="option"]').contains('p75').click();
+
+      cy.get('[data-testid="calculator-bar-chart"] svg .bar').should('have.length', 2);
+      cy.get('[data-testid="calculator-chart-section"] h2')
+        .first()
+        .should('contain.text', 'P75 interactivity');
+      cy.get('[data-testid="calculator-controls"]').should(
+        'contain.text',
+        'Target P75 interactivity',
+      );
+      cy.get('[data-testid="share-button"]').click();
+      cy.get('[data-testid="share-url-input"]').invoke('val').should('include', 'i_pctl=p75');
+    });
+
+    it('preserves a soloed GPU when the agentic percentile changes', () => {
+      cy.get('[data-testid="calculator-bar-chart"] svg .bar').should('have.length', 2);
+
+      cy.get('.sidebar-legend label').first().click();
+      cy.get('[data-testid="calculator-bar-chart"] svg .bar').should('have.length', 1);
+
+      cy.get('[data-testid="calc-percentile-selector"]').click();
+      cy.get('[role="option"]').contains('p75').click();
+
+      cy.get('[data-testid="calculator-bar-chart"] svg .bar').should('have.length', 1);
+      cy.get('[data-testid="calculator-chart-section"] h2')
+        .first()
+        .should('contain.text', 'P75 interactivity');
+    });
+
+    it('hides the percentile selector behind the feature gate and defaults to P90', () => {
+      cy.visit('/infx/calculator?g_model=DeepSeek-V4-Pro&i_seq=agentic-traces&i_prec=fp4', {
+        onBeforeLoad(win) {
+          win.localStorage.setItem('inferencex-star-modal-dismissed', String(Date.now()));
+          win.localStorage.removeItem('inferencex-feature-gate-konami-v1');
+        },
+      });
+      cy.wait('@agenticBenchmarks');
+
+      cy.get('[data-testid="calc-sequence-selector"]').should('not.exist');
+      cy.get('button[data-testid="calc-precision-selector"]')
+        .should('have.text', 'FP4')
+        .and('be.disabled');
+      cy.get('[data-testid="calc-percentile-selector"]').should('not.exist');
+      cy.get('[data-testid="calculator-chart-section"] h2')
+        .first()
+        .should('contain.text', 'P90 interactivity');
+      cy.get('[data-testid="calculator-controls"]').should(
+        'contain.text',
+        'Target P90 interactivity',
+      );
+    });
+  });
+
+  describe('cost target', () => {
+    before(() => {
+      cy.window().then((win) => {
+        win.localStorage.setItem('inferencex-star-modal-dismissed', String(Date.now()));
+      });
+      cy.visit('/infx/calculator');
+      cy.get('[data-testid="calculator-bar-chart"] svg .bar').should('have.length.greaterThan', 0);
+    });
+
+    it('sits directly under the interactivity slider, since it inverts it', () => {
+      cy.get('[data-testid="calculator-costcap-section"]').should('be.visible');
+      cy.get('[data-testid="calculator-costcap-empty"]').should('not.exist');
+      cy.get('[data-testid="calculator-controls"]').then(($controls) => {
+        cy.get('[data-testid="calculator-costcap-section"]').then(($costcap) => {
+          const order = $controls[0]!.compareDocumentPosition($costcap[0]!);
+          // eslint-disable-next-line no-bitwise
+          expect(order & Node.DOCUMENT_POSITION_FOLLOWING).to.be.greaterThan(0);
+        });
+      });
+      cy.get('[data-testid="calculator-chart-section"]').then(($chart) => {
+        cy.get('[data-testid="calculator-costcap-section"]').then(($costcap) => {
+          const order = $chart[0]!.compareDocumentPosition($costcap[0]!);
+          // eslint-disable-next-line no-bitwise
+          expect(order & Node.DOCUMENT_POSITION_PRECEDING).to.be.greaterThan(0);
+        });
+      });
+    });
+
+    it('owns the MW budget input now that the lifecycle section moved to /infx/fleet', () => {
+      cy.get('[data-testid="calculator-costcap-section"]')
+        .find('[data-testid="calc-costcap-mw-input"]')
+        .should('have.value', '10');
+      cy.get('[data-testid="calculator-lifecycle-section"]').should('not.exist');
+      cy.get('[data-testid="calculator-fleet-pointer-link"]')
+        .should('have.attr', 'href')
+        .and('match', /\/infx\/fleet$/);
+    });
+
+    it('entering a generous cost target renders reachable interactivity per GPU', () => {
+      cy.get('[data-testid="calc-costcap-input"]').type('100');
+      cy.get('[data-testid="calculator-costcap-table"]').should('be.visible');
+      cy.get('[data-testid="calculator-costcap-table"]').within(() => {
+        cy.contains('th', 'Max interactivity (tok/s/user)').should('exist');
+        cy.get('tbody tr').should('have.length.greaterThan', 0);
+        cy.get('tbody tr')
+          .first()
+          .find('td')
+          .eq(1)
+          .invoke('text')
+          .should('match', /^\d+(?:\.\d+)?$/u);
+      });
+    });
+
+    it('an unreachably low cost target shows Not reachable rows', () => {
+      cy.get('[data-testid="calc-costcap-input"]').clear();
+      cy.get('[data-testid="calc-costcap-input"]').type('0.000001');
+      cy.get('[data-testid="calculator-costcap-table"]').should('contain.text', 'Not reachable');
+    });
+
+    it('cost-cap table follows legend visibility (soloing a GPU filters its rows)', () => {
+      cy.get('[data-testid="calc-costcap-input"]').clear();
+      cy.get('[data-testid="calc-costcap-input"]').type('100');
+      cy.get('[data-testid="calculator-costcap-table"] tbody tr').then(($rows) => {
+        const fullCount = $rows.length;
+        cy.get('.sidebar-legend label').first().click();
+        cy.get('[data-testid="calculator-costcap-table"] tbody tr')
+          .should('have.length.lessThan', fullCount)
+          .and('have.length.greaterThan', 0);
+        cy.get('.sidebar-legend label').first().click();
+        cy.get('[data-testid="calculator-costcap-table"] tbody tr').should(
+          'have.length',
+          fullCount,
+        );
+      });
+    });
+  });
+});
+
+describe('TCO Calculator Chinese route', () => {
+  beforeEach(() => {
+    cy.viewport(390, 844);
+    cy.visit('/zh/infx/calculator', {
+      onBeforeLoad(win) {
+        win.localStorage.setItem('inferencex-star-modal-dismissed', String(Date.now()));
+      },
+    });
+    cy.get('[data-testid="calculator-bar-chart"] svg .bar').should('have.length.greaterThan', 0);
+  });
+
+  it('keeps dense tables internally scrollable without body overflow at 390px', () => {
+    cy.contains('[role="tab"]:visible', '表格').click();
+    cy.get('[data-testid="calculator-results-table"] .overflow-x-auto')
+      .first()
+      .then(($scroller) => {
+        expect($scroller[0].scrollWidth).to.be.greaterThan($scroller[0].clientWidth);
+      });
+    cy.document().then((doc) => {
+      expect(doc.documentElement.scrollWidth).to.be.at.most(doc.documentElement.clientWidth);
+    });
+  });
+
+  it('keeps the localized chart contained at 375px', () => {
+    cy.viewport(375, 812);
+    cy.document().should((doc) => {
+      expect(doc.documentElement.scrollWidth).to.be.at.most(doc.documentElement.clientWidth);
+    });
+  });
+
+  it('emits bidirectional hreflang metadata', () => {
+    cy.get('link[rel="alternate"][hreflang="en"]')
+      .invoke('attr', 'href')
+      .should('include', '/infx/calculator');
+    cy.get('link[rel="alternate"][hreflang="zh-CN"]')
+      .invoke('attr', 'href')
+      .should('include', '/zh/infx/calculator');
+  });
+});

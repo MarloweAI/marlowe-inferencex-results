@@ -1,0 +1,722 @@
+import { ArrowRight, ChevronRight } from 'lucide-react';
+
+import { Card } from '@/components/ui/card';
+import { MinecraftSplash } from '@/components/minecraft/minecraft-splash';
+import { NewBadge } from '@/components/ui/new-badge';
+import {
+  agentxDashboardHref,
+  FEATURED_AGENTX_MODELS,
+  isNewAgentxModel,
+} from '@/lib/compare/compare-agentx';
+
+import { CompareIndexTrackedLink } from './compare-index-tracked-link';
+import { getDashboardRoute } from '@/lib/routing/dashboard-routes';
+
+const MODEL_LOGOS: Record<string, string> = {
+  'muse-spark-open': '/logos/meta-color.svg',
+  'kimi-k31-pro': '/logos/kimi-color.svg',
+  'kimi-k3': '/logos/kimi-color.svg',
+  'deepseek-v41-flash': '/logos/deepseek-color.svg',
+  'deepseek-v4': '/logos/deepseek-color.svg',
+  'glm-5-3': '/logos/zai-color.svg',
+  'minimax-m3': '/logos/minimax-color.svg',
+  'minimax-m31-flash': '/logos/minimax-color.svg',
+  'qwen-3-8-flash-next': '/logos/qwen-color.svg',
+  'qwen-3-5': '/logos/qwen-color.svg',
+};
+
+interface VendorMarkGradient {
+  id: string;
+  x1: string;
+  y1: string;
+  x2: string;
+  y2: string;
+  stops: readonly { offset: string; color: string }[];
+}
+
+const VENDOR_MARKS: readonly {
+  name: string;
+  viewBox: string;
+  width: number;
+  height: number;
+  gradients?: readonly VendorMarkGradient[];
+  paths: readonly { d: string; fill: string }[];
+}[] = [
+  {
+    name: 'Huawei',
+    viewBox: '0 0 24 24',
+    width: 24,
+    height: 24,
+    // Huawei brand mark from https://cdn.simpleicons.org/huawei (Simple Icons).
+    paths: [
+      {
+        d: 'M3.67 6.14S1.82 7.91 1.72 9.78v.35c.08 1.51 1.22 2.4 1.22 2.4 1.83 1.79 6.26 4.04 7.3 4.55 0 0 .06.03.1-.01l.02-.04v-.04C7.52 10.8 3.67 6.14 3.67 6.14zM9.65 18.6c-.02-.08-.1-.08-.1-.08l-7.38.26c.8 1.43 2.15 2.53 3.56 2.2.96-.25 3.16-1.78 3.88-2.3.06-.05.04-.09.04-.09zm.08-.78C6.49 15.63.21 12.28.21 12.28c-.15.46-.2.9-.21 1.3v.07c0 1.07.4 1.82.4 1.82.8 1.69 2.34 2.2 2.34 2.2.7.3 1.4.31 1.4.31.12.02 4.4 0 5.54 0 .05 0 .08-.05.08-.05v-.06c0-.03-.03-.05-.03-.05zM9.06 3.19a3.42 3.42 0 00-2.57 3.15v.41c.03.6.16 1.05.16 1.05.66 2.9 3.86 7.65 4.55 8.65.05.05.1.03.1.03a.1.1 0 00.06-.1c1.06-10.6-1.11-13.42-1.11-13.42-.32.02-1.19.23-1.19.23zm8.299 2.27s-.49-1.8-2.44-2.28c0 0-.57-.14-1.17-.22 0 0-2.18 2.81-1.12 13.43.01.07.06.08.06.08.07.03.1-.03.1-.03.72-1.03 3.9-5.76 4.55-8.64 0 0 .36-1.4.02-2.34zm-2.92 13.07s-.07 0-.09.05c0 0-.01.07.03.1.7.51 2.85 2 3.88 2.3 0 0 .16.05.43.06h.14c.69-.02 1.9-.37 3-2.26l-7.4-.25zm7.83-8.41c.14-2.06-1.94-3.97-1.94-3.98 0 0-3.85 4.66-6.67 10.8 0 0-.03.08.02.13l.04.01h.06c1.06-.53 5.46-2.77 7.28-4.54 0 0 1.15-.93 1.21-2.42zm1.52 2.14s-6.28 3.37-9.52 5.55c0 0-.05.04-.03.11 0 0 .03.06.07.06 1.16 0 5.56 0 5.67-.02 0 0 .57-.02 1.27-.29 0 0 1.56-.5 2.37-2.27 0 0 .73-1.45.17-3.14z',
+        fill: '#FF0000',
+      },
+    ],
+  },
+  {
+    name: 'Google',
+    viewBox: '0 0 48 48',
+    width: 22,
+    height: 22,
+    paths: [
+      {
+        d: 'M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z',
+        fill: '#EA4335',
+      },
+      {
+        d: 'M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z',
+        fill: '#4285F4',
+      },
+      {
+        d: 'M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z',
+        fill: '#FBBC05',
+      },
+      {
+        d: 'M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z',
+        fill: '#34A853',
+      },
+    ],
+  },
+  {
+    name: 'OpenAI',
+    viewBox: '0 0 256 260',
+    width: 22,
+    height: 22,
+    paths: [
+      {
+        d: 'M239.184 106.203a64.716 64.716 0 0 0-5.576-53.103C219.452 28.459 191 15.784 163.213 21.74A65.586 65.586 0 0 0 52.096 45.22a64.716 64.716 0 0 0-43.23 31.36c-14.31 24.602-11.061 55.634 8.033 76.74a64.665 64.665 0 0 0 5.525 53.102c14.174 24.65 42.644 37.324 70.446 31.36a64.72 64.72 0 0 0 48.754 21.744c28.481.025 53.714-18.361 62.414-45.481a64.767 64.767 0 0 0 43.229-31.36c14.137-24.558 10.875-55.423-8.083-76.483Zm-97.56 136.338a48.397 48.397 0 0 1-31.105-11.255l1.535-.87 51.67-29.825a8.595 8.595 0 0 0 4.247-7.367v-72.85l21.845 12.636c.218.111.37.32.409.563v60.367c-.056 26.818-21.783 48.545-48.601 48.601Zm-104.466-44.61a48.345 48.345 0 0 1-5.781-32.589l1.534.921 51.722 29.826a8.339 8.339 0 0 0 8.441 0l63.181-36.425v25.221a.87.87 0 0 1-.358.665l-52.335 30.184c-23.257 13.398-52.97 5.431-66.404-17.803ZM23.549 85.38a48.499 48.499 0 0 1 25.58-21.333v61.39a8.288 8.288 0 0 0 4.195 7.316l62.874 36.272-21.845 12.636a.819.819 0 0 1-.767 0L41.353 151.53c-23.211-13.454-31.171-43.144-17.804-66.405v.256Zm179.466 41.695-63.08-36.63L161.73 77.86a.819.819 0 0 1 .768 0l52.233 30.184a48.6 48.6 0 0 1-7.316 87.635v-61.391a8.544 8.544 0 0 0-4.4-7.213Zm21.742-32.69-1.535-.922-51.619-30.081a8.39 8.39 0 0 0-8.492 0L99.98 99.808V74.587a.716.716 0 0 1 .307-.665l52.233-30.133a48.652 48.652 0 0 1 72.236 50.391v.205ZM88.061 139.097l-21.845-12.585a.87.87 0 0 1-.41-.614V65.685a48.652 48.652 0 0 1 79.757-37.346l-1.535.87-51.67 29.825a8.595 8.595 0 0 0-4.246 7.367l-.051 72.697Zm11.868-25.58 28.138-16.217 28.188 16.218v32.434l-28.086 16.218-28.188-16.218-.052-32.434Z',
+        fill: 'currentColor',
+      },
+    ],
+  },
+  {
+    name: 'AMD',
+    viewBox: '18.2 9.06 5.88 5.88',
+    width: 22,
+    height: 22,
+    paths: [
+      {
+        d: 'M18.324 9.137l1.559 1.56h2.556v2.557L24 14.814V9.137zM19.881 11.01l-1.604 1.603v2.25h2.246l1.604-1.607h-2.246z',
+        fill: 'currentColor',
+      },
+    ],
+  },
+  {
+    name: 'NVIDIA',
+    viewBox: '-0.02 4.03 24.04 15.94',
+    width: 33,
+    height: 22,
+    paths: [
+      {
+        d: 'M8.948 8.798v-1.43a6.7 6.7 0 0 1 .424-.018c3.922-.124 6.493 3.374 6.493 3.374s-2.774 3.851-5.75 3.851c-.398 0-.787-.062-1.158-.185v-4.346c1.528.185 1.837.857 2.747 2.385l2.04-1.714s-1.492-1.952-4-1.952a6.016 6.016 0 0 0-.796.035m0-4.735v2.138l.424-.027c5.45-.185 9.01 4.47 9.01 4.47s-4.08 4.964-8.33 4.964c-.37 0-.733-.035-1.095-.097v1.325c.3.035.61.062.91.062 3.957 0 6.82-2.023 9.593-4.408.459.371 2.34 1.263 2.73 1.652-2.633 2.208-8.772 3.984-12.253 3.984-.335 0-.653-.018-.971-.053v1.864H24V4.063zm0 10.326v1.131c-3.657-.654-4.673-4.46-4.673-4.46s1.758-1.944 4.673-2.262v1.237H8.94c-1.528-.186-2.73 1.245-2.73 1.245s.68 2.412 2.739 3.11M2.456 10.9s2.164-3.197 6.5-3.533V6.201C4.153 6.59 0 10.653 0 10.653s2.35 6.802 8.948 7.42v-1.237c-4.84-.6-6.492-5.936-6.492-5.936z',
+        fill: '#76B900',
+      },
+    ],
+  },
+  {
+    name: 'SambaNova',
+    viewBox: '0 0 24 21.71',
+    width: 24,
+    height: 22,
+    paths: [
+      {
+        d: 'M10.3 21.65C8.39 21.34 6.19 19.75 4.17 17.23C2.24 14.82 0.43 11.51 0.11 9.84C-0.1 8.71 0.02 7.98 0.52 7.42C0.74 7.16 1.41 6.71 1.89 6.48C2.34 6.28 3.48 5.89 3.96 5.79C4.46 5.68 5.58 5.52 6.61 5.41L7.42 5.32L8.17 4.75C11.23 2.42 14.06 0.87 16.36 0.27C18.23 -0.22 19.54 -0.05 20.6 0.82C22.41 2.3 23.68 5.38 23.96 8.96C24.02 9.75 23.99 11.57 23.9 12.23C23.64 14.09 23.17 15.45 22.41 16.57C21.32 18.16 17.16 20.48 13.87 21.34C12.97 21.57 12.24 21.68 11.42 21.69C10.9 21.7 10.56 21.69 10.3 21.65ZM18.52 15.4C19.33 14.5 20.2 13.4 20.77 12.56C21.66 11.27 21.97 9.78 21.56 8.85C21.23 8.12 19.91 7.4 18.17 7.01C15.81 6.49 12.19 6.41 8.82 6.82C7.93 6.93 7.8 6.99 7.13 7.59C5.17 9.36 4 10.55 3.62 11.17L3.52 11.33L3.79 11.59C4.56 12.31 5.58 12.85 7.53 13.56C10.63 14.69 15.33 15.76 17.93 15.92C18.03 15.93 18.12 15.84 18.52 15.4Z',
+        fill: '#2A1246',
+      },
+      {
+        d: 'M15.02 20.15C16.88 18.97 18.75 17.13 20.27 15.01C21.38 13.45 22.29 11.77 22.68 10.54C22.9 9.86 22.97 9.48 22.97 8.94C22.98 8.53 22.96 8.42 22.87 8.17C22.68 7.62 22.39 7.28 21.84 6.92C20.76 6.22 18.54 5.73 15.75 5.57C14.78 5.51 10.57 5.54 9.46 5.61C5.64 5.86 3.19 6.23 1.6 6.8C1.33 6.9 1.1 6.98 1.09 6.97C1.06 6.94 1.62 6.61 1.92 6.47C2.42 6.24 3.55 5.87 4.1 5.76C4.67 5.65 5.75 5.5 6.99 5.36L7.84 5.27L8.21 5.05C9.42 4.35 10.99 3.54 12.34 2.93C14.15 2.11 15.93 1.51 17.34 1.24C17.74 1.16 17.97 1.14 18.7 1.15C19.51 1.15 19.6 1.15 20.01 1.26C20.99 1.5 21.51 1.88 22.04 2.73C23.03 4.32 23.73 6.76 23.88 9.1C23.99 10.71 23.75 12.61 23.27 14.06C22.95 15 22.37 16.08 21.9 16.62L21.75 16.78L21.9 16.48C22.33 15.61 22.92 14.26 22.92 14.15C22.92 14.14 22.79 14.38 22.64 14.69C22.31 15.34 21.88 16.01 21.27 16.81C20.84 17.37 20.67 17.57 20.91 17.21C21.34 16.59 21.87 15.61 22.18 14.87C22.46 14.19 22.46 14.15 22.16 14.7C21.43 16.07 20.53 17.27 19.51 18.2L19.2 18.49L19.61 17.97C20.94 16.3 21.94 14.57 22.38 13.17C22.45 12.96 22.49 12.79 22.49 12.78C22.48 12.78 22.38 13.02 22.25 13.32C21.81 14.42 21.35 15.21 20.59 16.15C19.85 17.08 18.85 18.11 17.8 19.01C17.52 19.26 17.58 19.18 18.16 18.59C19.29 17.43 20.11 16.34 21.01 14.82C21.32 14.31 21.48 14.02 21.44 14.02C21.43 14.02 21.33 14.16 21.22 14.32C21.1 14.49 20.81 14.9 20.56 15.23C19.02 17.3 17.98 18.33 16.38 19.39C15.84 19.76 14.7 20.42 14.62 20.42C14.6 20.42 14.78 20.3 15.02 20.15ZM11.11 20.04C9.54 19.82 7.17 18 5.01 15.37C3.27 13.24 2.09 11.12 1.81 9.59C1.73 9.15 1.74 8.44 1.83 8.28C1.88 8.18 1.89 8.21 2 8.71C2.16 9.48 2.33 9.87 2.78 10.55C3.39 11.46 4.27 12.18 5.97 13.16C6.5 13.47 8.19 14.32 8.84 14.6C11.52 15.77 14.36 16.61 16.5 16.88L17.07 16.95L16.71 17.25C16.29 17.59 16.42 17.57 15.45 17.4C13.36 17.03 10.54 16.02 7.79 14.64C7.3 14.39 6.9 14.2 6.9 14.2C6.9 14.23 7.85 14.8 8.46 15.14C10.84 16.46 13.47 17.47 15.47 17.81C15.76 17.85 16 17.9 16 17.9C16.01 17.91 15.85 18.02 15.64 18.15L15.27 18.39L14.9 18.32C12.85 17.95 9.81 16.57 7.01 14.75C6.24 14.25 6.26 14.27 7.15 14.95C9.26 16.53 11.63 17.81 13.41 18.33C13.83 18.45 14.72 18.63 14.91 18.64C15 18.64 13.85 19.36 13.37 19.59C12.79 19.87 12.44 19.99 11.97 20.05C11.58 20.1 11.48 20.1 11.11 20.04ZM12.17 19.61C10.23 19.19 7.68 17.38 5.03 14.54L4.61 14.08L4.95 14.54C6.83 17.02 9.01 18.9 10.64 19.44C11.16 19.61 11.47 19.67 11.96 19.67L12.42 19.67L12.17 19.61ZM13.92 19.19C13.98 19.18 14.02 19.15 14.02 19.14C14.02 19.12 13.84 19.08 13.63 19.04C11.71 18.67 8.88 17.04 5.99 14.66L5.55 14.3L6.11 14.86C8.23 16.95 10.73 18.57 12.56 19.04C13.11 19.18 13.72 19.25 13.92 19.19ZM22.51 6.49C21.76 5.55 20.41 5.02 18.36 4.87C17.41 4.79 14.23 4.83 13.44 4.93C13.1 4.96 12.83 5 12.82 5.01C12.81 5.02 13.15 5.02 13.57 5C14.48 4.98 16.7 5.05 17.62 5.14C18.95 5.26 20.38 5.56 21.15 5.87C21.61 6.05 22.25 6.38 22.42 6.53C22.62 6.7 22.66 6.69 22.51 6.49ZM21.98 4.92C21.52 4.49 20.71 4.17 19.66 4.01C19 3.9 16.94 3.9 15.97 4.01C14.85 4.13 12.44 4.51 12.49 4.56C12.5 4.57 12.91 4.53 13.4 4.47C15.03 4.29 15.52 4.26 17.18 4.26C18.6 4.26 18.86 4.28 19.45 4.36C20.58 4.51 21.51 4.76 21.98 5.03C22.1 5.1 22.2 5.15 22.21 5.15C22.22 5.15 22.12 5.05 21.98 4.92ZM13.5 3.87C15.18 3.54 16.39 3.37 17.72 3.28C19.25 3.18 20.78 3.37 21.62 3.75L21.9 3.87L21.77 3.74C21.47 3.42 20.74 3.11 19.96 2.97C19.38 2.86 17.96 2.87 17.09 2.99C15.91 3.15 14.82 3.39 13.29 3.81C12.1 4.14 12.11 4.15 13.5 3.87ZM12.67 3.48C15.58 2.52 17.48 2.16 19.24 2.22C19.96 2.24 20.43 2.31 20.87 2.45L21.11 2.54L20.96 2.41C20.46 1.97 19.36 1.74 18.23 1.83C16.57 1.96 14.88 2.43 12.6 3.38C11.94 3.66 11.54 3.84 11.65 3.81C11.68 3.8 12.14 3.65 12.67 3.48Z',
+        fill: '#7340B8',
+      },
+      {
+        d: 'M15.06 20.16C15.06 20.15 15.19 20.05 15.36 19.94C17.2 18.72 19.11 16.76 20.58 14.58C22.1 12.33 22.92 10.47 22.99 9.11C23.03 8.3 22.86 7.84 22.34 7.32C21.99 6.96 21.62 6.73 21.07 6.51C19.04 5.69 15.77 5.37 11.06 5.53C6.87 5.67 3.75 6.07 1.81 6.72C1.23 6.91 1.16 6.92 1.27 6.84C1.64 6.53 3.17 5.95 4.1 5.76C5.23 5.53 7.37 5.3 9.94 5.13C11.27 5.05 15.09 5.01 16.31 5.07C19.21 5.22 21.17 5.68 22.34 6.49C23.32 7.17 23.67 8.06 23.44 9.28C23.35 9.77 23.04 10.89 22.85 11.38C22.46 12.44 21.67 13.74 20.39 15.43C19.02 17.24 18.14 18.13 16.76 19.12C16.26 19.48 15.06 20.21 15.06 20.16ZM10.98 20C9.74 19.76 8.08 18.63 6.36 16.86C4.04 14.47 2.24 11.61 1.85 9.69C1.76 9.27 1.75 8.52 1.83 8.34C1.88 8.22 1.88 8.24 1.99 8.78C2.32 10.35 2.88 11.55 4.25 13.58C5.08 14.81 5.88 15.78 6.97 16.87C8.8 18.71 10.34 19.61 11.78 19.7C12.43 19.74 13.31 19.52 14.11 19.11C14.27 19.03 14.39 18.97 14.39 18.98C14.39 19.02 13.53 19.51 13.23 19.65C12.84 19.82 12.58 19.91 12.23 19.99C11.93 20.05 11.27 20.06 10.98 20Z',
+        fill: '#CC8FF3',
+      },
+    ],
+  },
+  {
+    name: 'Meta',
+    viewBox: '0 3.99 24 16.02',
+    width: 30,
+    height: 20,
+    gradients: [
+      {
+        id: 'agentx-meta-0',
+        x1: '75.897%',
+        y1: '89.199%',
+        x2: '26.312%',
+        y2: '12.194%',
+        stops: [
+          { offset: '.06%', color: '#0867DF' },
+          { offset: '45.39%', color: '#0668E1' },
+          { offset: '85.91%', color: '#0064E0' },
+        ],
+      },
+      {
+        id: 'agentx-meta-1',
+        x1: '21.67%',
+        y1: '75.874%',
+        x2: '97.068%',
+        y2: '23.985%',
+        stops: [
+          { offset: '13.23%', color: '#0064DF' },
+          { offset: '99.88%', color: '#0064E0' },
+        ],
+      },
+      {
+        id: 'agentx-meta-2',
+        x1: '38.263%',
+        y1: '89.127%',
+        x2: '60.895%',
+        y2: '16.131%',
+        stops: [
+          { offset: '1.47%', color: '#0072EC' },
+          { offset: '68.81%', color: '#0064DF' },
+        ],
+      },
+      {
+        id: 'agentx-meta-3',
+        x1: '47.032%',
+        y1: '90.19%',
+        x2: '52.15%',
+        y2: '15.745%',
+        stops: [
+          { offset: '7.31%', color: '#007CF6' },
+          { offset: '99.43%', color: '#0072EC' },
+        ],
+      },
+      {
+        id: 'agentx-meta-4',
+        x1: '52.155%',
+        y1: '58.301%',
+        x2: '47.591%',
+        y2: '37.004%',
+        stops: [
+          { offset: '7.31%', color: '#007FF9' },
+          { offset: '100%', color: '#007CF6' },
+        ],
+      },
+      {
+        id: 'agentx-meta-5',
+        x1: '37.689%',
+        y1: '12.502%',
+        x2: '61.961%',
+        y2: '63.624%',
+        stops: [
+          { offset: '7.31%', color: '#007FF9' },
+          { offset: '100%', color: '#0082FB' },
+        ],
+      },
+      {
+        id: 'agentx-meta-6',
+        x1: '34.808%',
+        y1: '68.859%',
+        x2: '62.313%',
+        y2: '23.174%',
+        stops: [
+          { offset: '27.99%', color: '#007FF8' },
+          { offset: '91.41%', color: '#0082FB' },
+        ],
+      },
+      {
+        id: 'agentx-meta-7',
+        x1: '43.762%',
+        y1: '6.235%',
+        x2: '57.602%',
+        y2: '98.514%',
+        stops: [
+          { offset: '0%', color: '#0082FB' },
+          { offset: '99.95%', color: '#0081FA' },
+        ],
+      },
+      {
+        id: 'agentx-meta-8',
+        x1: '60.055%',
+        y1: '4.661%',
+        x2: '39.88%',
+        y2: '69.077%',
+        stops: [
+          { offset: '6.19%', color: '#0081FA' },
+          { offset: '100%', color: '#0080F9' },
+        ],
+      },
+      {
+        id: 'agentx-meta-9',
+        x1: '30.282%',
+        y1: '59.32%',
+        x2: '61.081%',
+        y2: '33.244%',
+        stops: [
+          { offset: '0%', color: '#027AF3' },
+          { offset: '100%', color: '#0080F9' },
+        ],
+      },
+      {
+        id: 'agentx-meta-10',
+        x1: '20.433%',
+        y1: '50.001%',
+        x2: '82.112%',
+        y2: '50.001%',
+        stops: [
+          { offset: '0%', color: '#0377EF' },
+          { offset: '99.94%', color: '#0279F1' },
+        ],
+      },
+      {
+        id: 'agentx-meta-11',
+        x1: '40.303%',
+        y1: '35.298%',
+        x2: '72.394%',
+        y2: '57.811%',
+        stops: [
+          { offset: '.19%', color: '#0471E9' },
+          { offset: '100%', color: '#0377EF' },
+        ],
+      },
+      {
+        id: 'agentx-meta-12',
+        x1: '32.254%',
+        y1: '19.719%',
+        x2: '68.003%',
+        y2: '84.908%',
+        stops: [
+          { offset: '27.65%', color: '#0867DF' },
+          { offset: '100%', color: '#0471E9' },
+        ],
+      },
+    ],
+    paths: [
+      {
+        d: 'M6.897 4h-.024l-.031 2.615h.022c1.715 0 3.046 1.357 5.94 6.246l.175.297.012.02 1.62-2.438-.012-.019a48.763 48.763 0 00-1.098-1.716 28.01 28.01 0 00-1.175-1.629C10.413 4.932 8.812 4 6.896 4z',
+        fill: 'url(#agentx-meta-0)',
+      },
+      {
+        d: 'M6.873 4C4.95 4.01 3.247 5.258 2.02 7.17a4.352 4.352 0 00-.01.017l2.254 1.231.011-.017c.718-1.083 1.61-1.774 2.568-1.785h.021L6.896 4h-.023z',
+        fill: 'url(#agentx-meta-1)',
+      },
+      {
+        d: 'M2.019 7.17l-.011.017C1.2 8.447.598 9.995.274 11.664l-.005.022 2.534.6.004-.022c.27-1.467.786-2.828 1.456-3.845l.011-.017L2.02 7.17z',
+        fill: 'url(#agentx-meta-2)',
+      },
+      {
+        d: 'M2.807 12.264l-2.533-.6-.005.022c-.177.918-.267 1.851-.269 2.786v.023l2.598.233v-.023a12.591 12.591 0 01.21-2.44z',
+        fill: 'url(#agentx-meta-3)',
+      },
+      {
+        d: 'M2.677 15.537a5.462 5.462 0 01-.079-.813v-.022L0 14.468v.024a8.89 8.89 0 00.146 1.652l2.535-.585a4.106 4.106 0 01-.004-.022z',
+        fill: 'url(#agentx-meta-4)',
+      },
+      {
+        d: 'M3.27 16.89c-.284-.31-.484-.756-.589-1.328l-.004-.021-2.535.585.004.021c.192 1.01.568 1.85 1.106 2.487l.014.017 2.018-1.745a2.106 2.106 0 01-.015-.016z',
+        fill: 'url(#agentx-meta-5)',
+      },
+      {
+        d: 'M10.78 9.654c-1.528 2.35-2.454 3.825-2.454 3.825-2.035 3.2-2.739 3.917-3.871 3.917a1.545 1.545 0 01-1.186-.508l-2.017 1.744.014.017C2.01 19.518 3.058 20 4.356 20c1.963 0 3.374-.928 5.884-5.33l1.766-3.13a41.283 41.283 0 00-1.227-1.886z',
+        fill: '#0082FB',
+      },
+      {
+        d: 'M13.502 5.946l-.016.016c-.4.43-.786.908-1.16 1.416.378.483.768 1.024 1.175 1.63.48-.743.928-1.345 1.367-1.807l.016-.016-1.382-1.24z',
+        fill: 'url(#agentx-meta-6)',
+      },
+      {
+        d: 'M20.918 5.713C19.853 4.633 18.583 4 17.225 4c-1.432 0-2.637.787-3.723 1.944l-.016.016 1.382 1.24.016-.017c.715-.747 1.408-1.12 2.176-1.12.826 0 1.6.39 2.27 1.075l.015.016 1.589-1.425-.016-.016z',
+        fill: '#0082FB',
+      },
+      {
+        d: 'M23.998 14.125c-.06-3.467-1.27-6.566-3.064-8.396l-.016-.016-1.588 1.424.015.016c1.35 1.392 2.277 3.98 2.361 6.971v.023h2.292v-.022z',
+        fill: 'url(#agentx-meta-7)',
+      },
+      {
+        d: 'M23.998 14.15v-.023h-2.292v.022c.004.14.006.282.006.424 0 .815-.121 1.474-.368 1.95l-.011.022 1.708 1.782.013-.02c.62-.96.946-2.293.946-3.91 0-.083 0-.165-.002-.247z',
+        fill: 'url(#agentx-meta-8)',
+      },
+      {
+        d: 'M21.344 16.52l-.011.02c-.214.402-.519.67-.917.787l.778 2.462a3.493 3.493 0 00.438-.182 3.558 3.558 0 001.366-1.218l.044-.065.012-.02-1.71-1.784z',
+        fill: 'url(#agentx-meta-9)',
+      },
+      {
+        d: 'M19.92 17.393c-.262 0-.492-.039-.718-.14l-.798 2.522c.449.153.927.222 1.46.222.492 0 .943-.073 1.352-.215l-.78-2.462c-.167.05-.341.075-.517.073z',
+        fill: 'url(#agentx-meta-10)',
+      },
+      {
+        d: 'M18.323 16.534l-.014-.017-1.836 1.914.016.017c.637.682 1.246 1.105 1.937 1.337l.797-2.52c-.291-.125-.573-.353-.9-.731z',
+        fill: 'url(#agentx-meta-11)',
+      },
+      {
+        d: 'M18.309 16.515c-.55-.642-1.232-1.712-2.303-3.44l-1.396-2.336-.011-.02-1.62 2.438.012.02.989 1.668c.959 1.61 1.74 2.774 2.493 3.585l.016.016 1.834-1.914a2.353 2.353 0 01-.014-.017z',
+        fill: 'url(#agentx-meta-12)',
+      },
+    ],
+  },
+  {
+    name: 'Microsoft',
+    viewBox: '0 0 256 256',
+    width: 20,
+    height: 20,
+    paths: [
+      { d: 'M121.666 121.666H0V0h121.666z', fill: '#F1511B' },
+      { d: 'M256 121.666H134.335V0H256z', fill: '#80CC28' },
+      { d: 'M121.663 256.002H0V134.336h121.663z', fill: '#00ADEF' },
+      { d: 'M256 256.002H134.335V134.336H256z', fill: '#FBBC09' },
+    ],
+  },
+  {
+    name: 'Oracle',
+    viewBox: '0 0 231 30',
+    width: 108,
+    height: 14,
+    paths: [
+      {
+        d: 'M99.61,19.52h15.24l-8.05-13L92,30H85.27l18-28.17a4.29,4.29,0,0,1,7-.05L128.32,30h-6.73l-3.17-5.25H103l-3.36-5.23m69.93,5.23V0.28h-5.72V27.16a2.76,2.76,0,0,0,.85,2,2.89,2.89,0,0,0,2.08.87h26l3.39-5.25H169.54M75,20.38A10,10,0,0,0,75,.28H50V30h5.71V5.54H74.65a4.81,4.81,0,0,1,0,9.62H58.54L75.6,30h8.29L72.43,20.38H75M14.88,30H32.15a14.86,14.86,0,0,0,0-29.71H14.88a14.86,14.86,0,1,0,0,29.71m16.88-5.23H15.26a9.62,9.62,0,0,1,0-19.23h16.5a9.62,9.62,0,1,1,0,19.23M140.25,30h17.63l3.34-5.23H140.64a9.62,9.62,0,1,1,0-19.23h16.75l3.38-5.25H140.25a14.86,14.86,0,1,0,0,29.71m69.87-5.23a9.62,9.62,0,0,1-9.26-7h24.42l3.36-5.24H200.86a9.61,9.61,0,0,1,9.26-7h16.76l3.35-5.25h-20.5a14.86,14.86,0,0,0,0,29.71h17.63l3.35-5.23h-20.6',
+        fill: '#C74634',
+      },
+    ],
+  },
+] as const;
+
+const LANDING_HIDDEN_LEDGER_MODELS: ReadonlySet<string> = new Set([
+  'muse-spark-open',
+  'deepseek-v4',
+  'qwen-3-8-flash-next',
+  'qwen-3-5',
+  'minimax-m3',
+  'kimi-k3',
+  'glm-5-3',
+]);
+
+const LANDING_HARDWARE_RESULTS = [
+  {
+    id: 'huawei',
+    vendor: 'Huawei',
+    title: 'Huawei Ascend 950PR',
+    titleZh: '华为 Ascend 950PR',
+    subtitle: 'Core and memory profiles · uBenchX',
+    subtitleZh: '核心与内存性能剖析 · uBenchX',
+    href: '/ubx/core-memory-profiles',
+    model: 'ascend950pr',
+    analyticsEvent: 'landing_huawei_results_clicked',
+    isNew: true,
+  },
+  {
+    id: 'tpu-kimi-k3',
+    vendor: 'Google',
+    title: 'Google TPU',
+    titleZh: 'Google TPU',
+    subtitle: 'Kimi K3 · 2.8T parameters · AgentX',
+    subtitleZh: 'Kimi K3 · 2.8 万亿参数 · AgentX',
+    href: `${getDashboardRoute('inference').path}/kimi-k3`,
+    model: 'kimi-k3',
+    analyticsEvent: 'landing_tpu_results_clicked',
+    isNew: true,
+  },
+  {
+    id: 'rubin-glm-5-3',
+    vendor: 'NVIDIA',
+    title: 'Vera Rubin NVL72',
+    titleZh: 'Vera Rubin NVL72',
+    subtitle: 'GLM 5.3 · 744B parameters · AgentX',
+    subtitleZh: 'GLM 5.3 · 7440 亿参数 · AgentX',
+    href: `${getDashboardRoute('inference').path}/glm-5-3`,
+    model: 'glm-5-3',
+    analyticsEvent: 'landing_rubin_results_clicked',
+  },
+  {
+    id: 'jalapeno',
+    vendor: 'OpenAI',
+    title: 'OpenAI Jalapeño',
+    titleZh: 'OpenAI Jalapeño',
+    subtitle: 'DeepSeek R1 · 8K/1K · FP4',
+    href: `${getDashboardRoute('inference').path}/deepseek-r1?i_seq=8k%2F1k&i_prec=fp4&i_xmode=e2e`,
+    model: 'deepseek-r1',
+    analyticsEvent: 'landing_jalapeno_results_clicked',
+  },
+  {
+    id: 'minimax-m31-flash',
+    vendor: 'MiniMax',
+    title: 'MiniMax M3.1 Flash',
+    titleZh: 'MiniMax M3.1 Flash',
+    subtitle: '428B parameters · AgentX',
+    subtitleZh: '4280 亿参数 · AgentX',
+    href: `${getDashboardRoute('inference').path}/minimax-m31-flash`,
+    model: 'minimax-m31-flash',
+    analyticsEvent: 'landing_minimax_m31_flash_results_clicked',
+  },
+] as const;
+
+const MODEL_SIZE_SUFFIX = /\s(?<amount>\d+(?:\.\d+)?)(?<unit>[BT])$/;
+
+function ledgerTitle(label: string): string {
+  return label.replace(MODEL_SIZE_SUFFIX, '');
+}
+
+function ledgerSubtitle(label: string, locale: 'en' | 'zh'): string {
+  const size = MODEL_SIZE_SUFFIX.exec(label)?.groups;
+  if (!size) return 'AgentX';
+  const { amount, unit } = size;
+  if (locale === 'en') return `${amount}${unit} parameters · AgentX`;
+  const zh = unit === 'T' ? `${amount} 万亿` : `${Number(amount) * 10} 亿`;
+  return `${zh}参数 · AgentX`;
+}
+
+const STRINGS = {
+  en: {
+    title: 'Compare realistic agentic inference performance',
+    description:
+      'Long-context, multi-turn inference performance on Google TPUv7 Ironwood, OpenAI Jalapeño, MI355X, GB300 NVL72, GB200 NVL72, B200, H200, H100 and RTX Pro. TPUv8i, SambaNova SN50, Rubin NVL72 and MI455X UALoE72 are next.',
+    revenueCalculator: 'Token revenue calculator',
+    dashboard: 'Dashboard',
+    ledgerTitle: 'Models with AgentX results',
+    modelAction: 'View results',
+    newModel: 'New',
+  },
+  zh: {
+    title: '真实智能体工作负载下的推理性能对比',
+    description:
+      '比较不同硬件平台在长上下文、多轮智能体工作负载下的推理性能，覆盖 Google TPUv7 Ironwood、OpenAI Jalapeño、MI355X、GB300 NVL72、GB200 NVL72、B200、H200、H100 和 RTX Pro，即将支持 TPUv8i、SambaNova SN50、Rubin NVL72 与 MI455X UALoE72。',
+    revenueCalculator: 'Token 收入计算器',
+    dashboard: '仪表板',
+    ledgerTitle: '已发布 AgentX 结果的模型',
+    modelAction: '查看结果',
+    newModel: '新',
+  },
+} as const;
+
+export function AgentXCompareHero({
+  locale,
+  headingLevel = 'h1',
+  surface = 'compare',
+}: {
+  locale: 'en' | 'zh';
+  headingLevel?: 'h1' | 'h2';
+  surface?: 'compare' | 'landing';
+}) {
+  const t = STRINGS[locale];
+  const prefix = locale === 'zh' ? '/zh' : '';
+  const Heading = headingLevel;
+  const ledgerModels =
+    surface === 'landing'
+      ? FEATURED_AGENTX_MODELS.filter((model) => !LANDING_HIDDEN_LEDGER_MODELS.has(model.slug))
+      : FEATURED_AGENTX_MODELS;
+
+  return (
+    <section data-testid="compare-agentx-primary">
+      <Card className="overflow-hidden p-0 md:p-0">
+        <div className="grid lg:grid-cols-[minmax(0,1.15fr)_minmax(19rem,0.85fr)]">
+          <div className="flex flex-col justify-center p-6 md:p-8 lg:p-10">
+            <div className="relative">
+              <Heading className="max-w-2xl text-3xl font-semibold text-foreground lg:text-4xl lg:tracking-heading">
+                {t.title}
+              </Heading>
+              {surface === 'landing' && <MinecraftSplash />}
+            </div>
+            <p className="mt-4 max-w-3xl text-base leading-7 text-muted-foreground">
+              {t.description}
+            </p>
+            <div
+              aria-hidden="true"
+              data-testid="compare-agentx-vendor-marks"
+              className="mt-6 grid grid-cols-3 items-center gap-x-4 gap-y-3 text-foreground sm:flex sm:flex-wrap sm:gap-x-6 sm:gap-y-2"
+            >
+              {VENDOR_MARKS.filter((mark) => surface === 'landing' || mark.name !== 'Huawei').map(
+                (mark) => (
+                  <svg
+                    key={mark.name}
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox={mark.viewBox}
+                    width={mark.width}
+                    height={mark.height}
+                    className="h-auto max-w-full shrink-0"
+                  >
+                    {mark.gradients ? (
+                      <defs>
+                        {mark.gradients.map((gradient) => (
+                          <linearGradient
+                            key={gradient.id}
+                            id={gradient.id}
+                            x1={gradient.x1}
+                            y1={gradient.y1}
+                            x2={gradient.x2}
+                            y2={gradient.y2}
+                          >
+                            {gradient.stops.map((stop) => (
+                              <stop key={stop.offset} offset={stop.offset} stopColor={stop.color} />
+                            ))}
+                          </linearGradient>
+                        ))}
+                      </defs>
+                    ) : null}
+                    {mark.paths.map((path) => (
+                      <path key={path.d} d={path.d} fill={path.fill} />
+                    ))}
+                  </svg>
+                ),
+              )}
+            </div>
+            <div className="mt-6 flex flex-wrap gap-3">
+              <CompareIndexTrackedLink
+                data-testid="compare-agentx-revenue-calculator-link"
+                href={`${prefix}${getDashboardRoute('profit-estimator-per-gigawatt').path}`}
+                analyticsEvent="compare_agentx_revenue_calculator_clicked"
+                analyticsSurface={surface}
+                appNavigation
+                className="group motion-press inline-flex min-h-11 items-center gap-2 rounded-md bg-brand-fill px-5 py-2.5 font-medium text-primary-foreground transition-colors hover:bg-brand-fill/90 max-[479px]:w-full max-[479px]:justify-center"
+              >
+                {t.revenueCalculator}
+                <ArrowRight
+                  aria-hidden="true"
+                  className="size-4 motion-safe:transition-transform motion-safe:duration-200 motion-safe:group-hover:translate-x-0.5"
+                />
+              </CompareIndexTrackedLink>
+              <CompareIndexTrackedLink
+                data-testid="compare-agentx-dashboard-link"
+                href={agentxDashboardHref(locale, FEATURED_AGENTX_MODELS[0])}
+                analyticsEvent="compare_agentx_dashboard_clicked"
+                analyticsTarget={FEATURED_AGENTX_MODELS[0].slug}
+                analyticsSurface={surface}
+                appNavigation
+                className="group motion-press inline-flex min-h-11 items-center gap-2 rounded-md border border-border px-5 py-2.5 font-medium text-foreground transition-colors hover:bg-muted max-[479px]:w-full max-[479px]:justify-center"
+              >
+                {t.dashboard}
+                <ArrowRight
+                  aria-hidden="true"
+                  className="size-4 motion-safe:transition-transform motion-safe:duration-200 motion-safe:group-hover:translate-x-0.5"
+                />
+              </CompareIndexTrackedLink>
+            </div>
+          </div>
+
+          <div className="border-t border-border/30 bg-muted/20 lg:border-t-0 lg:border-l">
+            {surface === 'landing' && (
+              <div className="divide-y divide-border/20 border-b border-border/20">
+                {LANDING_HARDWARE_RESULTS.map((result) => {
+                  const mark = VENDOR_MARKS.find((vendor) => vendor.name === result.vendor);
+                  return (
+                    <CompareIndexTrackedLink
+                      key={result.id}
+                      data-testid={`landing-${result.id}-results-link`}
+                      href={`${prefix}${result.href}`}
+                      analyticsEvent={result.analyticsEvent}
+                      analyticsTarget={result.model}
+                      analyticsSurface={surface}
+                      appNavigation
+                      className="group flex min-h-14 items-center justify-between gap-4 px-5 py-3 transition-colors hover:bg-muted/60 focus-visible:outline-none"
+                    >
+                      <span className="flex min-w-0 items-center gap-3">
+                        {result.vendor === 'MiniMax' ? (
+                          <img
+                            data-testid={`landing-${result.id}-${result.vendor.toLowerCase()}-logo`}
+                            src={MODEL_LOGOS[result.model]}
+                            alt=""
+                            aria-hidden="true"
+                            width={32}
+                            height={32}
+                            loading="lazy"
+                            className="size-8 shrink-0 object-contain"
+                          />
+                        ) : (
+                          <svg
+                            data-testid={`landing-${result.id}-${result.vendor.toLowerCase()}-logo`}
+                            xmlns="http://www.w3.org/2000/svg"
+                            viewBox={mark!.viewBox}
+                            width={32}
+                            height={32}
+                            aria-hidden="true"
+                            className="size-8 shrink-0 text-foreground"
+                          >
+                            {mark!.paths.map((path) => (
+                              <path key={path.d} d={path.d} fill={path.fill} />
+                            ))}
+                          </svg>
+                        )}
+                        <span className="min-w-0">
+                          <span className="block text-sm font-medium leading-tight text-foreground">
+                            {locale === 'zh' ? result.titleZh : result.title}
+                            {'isNew' in result && result.isNew && (
+                              <NewBadge
+                                data-new-badge={`landing-${result.id}`}
+                                flashing
+                                className="ml-2 align-[-0.125em]"
+                              >
+                                {t.newModel}
+                              </NewBadge>
+                            )}
+                          </span>
+                          <span className="mt-1 block text-xs text-muted-foreground">
+                            {locale === 'zh' && 'subtitleZh' in result
+                              ? result.subtitleZh
+                              : result.subtitle}
+                          </span>
+                        </span>
+                      </span>
+                      <span className="inline-flex shrink-0 items-center gap-1 text-xs font-medium text-muted-foreground group-hover:text-brand">
+                        <span className="max-sm:sr-only">{t.modelAction}</span>
+                        <ArrowRight
+                          aria-hidden="true"
+                          className="size-3.5 max-sm:hidden motion-safe:transition-transform motion-safe:duration-200 motion-safe:group-hover:translate-x-0.5"
+                        />
+                        <ChevronRight aria-hidden="true" className="size-5 sm:hidden" />
+                      </span>
+                    </CompareIndexTrackedLink>
+                  );
+                })}
+              </div>
+            )}
+            <nav aria-label={t.ledgerTitle} className="divide-y divide-border/20">
+              {ledgerModels.map((model) => (
+                <CompareIndexTrackedLink
+                  key={model.slug}
+                  data-testid={`compare-agentx-model-${model.slug}`}
+                  href={agentxDashboardHref(locale, model)}
+                  analyticsEvent="compare_agentx_model_clicked"
+                  analyticsTarget={model.slug}
+                  analyticsSurface={surface}
+                  appNavigation
+                  className="group flex min-h-14 items-center justify-between gap-4 px-5 py-3 transition-colors hover:bg-muted/60 focus-visible:outline-none"
+                >
+                  <span className="flex min-w-0 items-center gap-3">
+                    {MODEL_LOGOS[model.slug] && (
+                      <img
+                        src={MODEL_LOGOS[model.slug]}
+                        alt=""
+                        aria-hidden="true"
+                        width={32}
+                        height={32}
+                        loading="lazy"
+                        className="size-8 shrink-0 object-contain"
+                      />
+                    )}
+                    <span className="min-w-0">
+                      <span className="block text-sm font-medium leading-tight text-foreground">
+                        {ledgerTitle(model.label)}
+                        {isNewAgentxModel(model) && (
+                          <NewBadge
+                            data-new-badge="agentx-ledger"
+                            className="ml-2 align-[-0.125em]"
+                          >
+                            {t.newModel}
+                          </NewBadge>
+                        )}
+                      </span>
+                      <span className="mt-1 block text-xs text-muted-foreground">
+                        {ledgerSubtitle(model.label, locale)}
+                      </span>
+                    </span>
+                  </span>
+                  <span className="inline-flex shrink-0 items-center gap-1 text-xs font-medium text-muted-foreground group-hover:text-brand">
+                    <span className="max-sm:sr-only">{t.modelAction}</span>
+                    <ArrowRight
+                      aria-hidden="true"
+                      className="size-3.5 max-sm:hidden motion-safe:transition-transform motion-safe:duration-200 motion-safe:group-hover:translate-x-0.5"
+                    />
+                    <ChevronRight aria-hidden="true" className="size-5 sm:hidden" />
+                  </span>
+                </CompareIndexTrackedLink>
+              ))}
+            </nav>
+          </div>
+        </div>
+      </Card>
+    </section>
+  );
+}

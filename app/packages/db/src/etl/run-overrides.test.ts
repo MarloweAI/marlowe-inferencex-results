@@ -1,0 +1,1107 @@
+import { describe, it, expect } from 'vitest';
+import {
+  type BenchmarkPointBackfill,
+  type ChangelogBackfill,
+  type PurgedBenchmarkPoint,
+  applyBenchmarkPointBackfill,
+  applyChangelogBackfills,
+  backfilledPoints,
+  BENCHMARK_POINT_BACKFILLS,
+  CHANGELOG_BACKFILLS,
+  CONCLUSION_OVERRIDES,
+  PURGED_BENCHMARK_POINTS,
+  PURGED_RUN_ATTEMPTS,
+  PURGED_RUNS,
+  RUN_FRAMEWORK_OVERRIDES,
+  applyRunFrameworkOverridesToChangelogs,
+  isBenchmarkPointPurged,
+  isRunAttemptPurged,
+  planBenchmarkPoint,
+  recordBackfilledPointIdentity,
+  resolveRunFramework,
+  rewriteConfigKeyFramework,
+  validateRunBackfills,
+} from './run-overrides';
+
+const EXAMPLE_CONFIG = {
+  hardware: 'gb300',
+  framework: 'dynamo-vllm',
+  model: 'dsv4',
+  precision: 'fp4',
+  specMethod: 'mtp',
+  disagg: true,
+  isMultinode: true,
+  prefillTp: 8,
+  prefillEp: 8,
+  prefillDpAttn: true,
+  prefillNumWorkers: 1,
+  decodeTp: 8,
+  decodeEp: 8,
+  decodeDpAttn: true,
+  decodeNumWorkers: 1,
+  numPrefillGpu: 8,
+  numDecodeGpu: 8,
+} as const;
+
+function examplePointBackfill(
+  overrides: Partial<BenchmarkPointBackfill> = {},
+): BenchmarkPointBackfill {
+  return {
+    id: 'run-123-point-offload',
+    reason: 'Artifact omitted the offload metadata.',
+    githubRunId: 123,
+    runAttempt: 1,
+    productionConfigId: 456,
+    config: EXAMPLE_CONFIG,
+    benchmarkType: 'agentic_traces',
+    isl: null,
+    osl: null,
+    conc: 64,
+    offloadMode: 'off',
+    recipeFingerprint: null,
+    set: {
+      offloadMode: 'on',
+      metricsMerge: { kv_offloading: 'dram', kv_offload_backend: 'lmcache' },
+      metricsRemove: ['stale_offload_field'],
+    },
+    ...overrides,
+  };
+}
+
+describe('audited run backfills', () => {
+  it('accepts a public benchmark audit ID while still requiring an exact stable selector', () => {
+    const source = examplePointBackfill({
+      productionConfigId: undefined,
+      productionBenchmarkId: 441192,
+    });
+    expect(() => validateRunBackfills([], [source])).not.toThrow();
+    expect(() =>
+      validateRunBackfills([], [{ ...source, productionBenchmarkId: undefined }]),
+    ).toThrow(/ID is required/u);
+    expect(() => validateRunBackfills([], [{ ...source, productionBenchmarkId: 0 }])).toThrow(
+      /positive integer/u,
+    );
+    expect(() =>
+      validateRunBackfills(
+        [],
+        [source, { ...source, id: 'other-source', productionBenchmarkId: 441193 }],
+      ),
+    ).toThrow(/duplicate.*selector/u);
+  });
+
+  it('fails closed on possible purge overlap when the audit has no config ID', () => {
+    const purged = PURGED_BENCHMARK_POINTS[0];
+    const source = examplePointBackfill({
+      githubRunId: purged.githubRunId,
+      runAttempt: purged.runAttempt,
+      productionConfigId: undefined,
+      productionBenchmarkId: 441192,
+      benchmarkType: purged.benchmarkType,
+      isl: purged.isl,
+      osl: purged.osl,
+      conc: purged.conc,
+      offloadMode: purged.offloadMode,
+      recipeFingerprint: purged.recipeFingerprint,
+      set: { metricsMerge: { p90_power_w: 500 } },
+    });
+    expect(() => validateRunBackfills([], [source])).toThrow(/already being purged/u);
+  });
+
+  it('accepts zero worker counts only for aggregated configurations', () => {
+    const source = examplePointBackfill({
+      config: { ...EXAMPLE_CONFIG, disagg: false, prefillNumWorkers: 0, decodeNumWorkers: 0 },
+    });
+    expect(() => validateRunBackfills([], [source])).not.toThrow();
+    expect(() =>
+      validateRunBackfills([], [{ ...source, config: { ...source.config, disagg: true } }]),
+    ).toThrow(/positive/u);
+    expect(() =>
+      validateRunBackfills(
+        [],
+        [{ ...source, config: { ...source.config, prefillNumWorkers: -1 } }],
+      ),
+    ).toThrow(/non-negative/u);
+  });
+
+  it('validates the checked-in registries', () => {
+    expect(() => validateRunBackfills()).not.toThrow();
+  });
+
+  it('restores Kimi GB300 append-only metadata only for the published merge identity', () => {
+    const changelog = {
+      baseRef: '8ca602ebb5e2fa99f90583881bfa8783f9f67d8c',
+      headRef: '9242d18a33f73b9c673bb1134addb989a3cc44da',
+      entries: [
+        {
+          configKeys: ['kimik3-fp4-gb300-dynamo-vllm-agentic-mooncake-dcp8-agg'],
+          description: 'Kimi-K3 GB300 aggregate power',
+          prLink: 'https://github.com/SemiAnalysisAI/InferenceX/pull/3046',
+          appendOnly: false,
+        },
+      ],
+    };
+
+    const applied = applyChangelogBackfills(34744429340, 1, [changelog]);
+    expect(applied.backfillIds).toEqual(['run-34744429340-restore-append-only']);
+    expect(applied.changelogs[0].entries[0].appendOnly).toBe(true);
+    expect(applyChangelogBackfills(34744429340, 2, [changelog]).backfillIds).toEqual([]);
+  });
+
+  it('restores the Kimi H200 snapshot by identifying its ten legacy latency points', () => {
+    const changelog = {
+      baseRef: '64c5b00a476f3d19921ecb680a2eaac7bed58c8d',
+      headRef: '91ac9c0bc26e062c6305c97241ed84688531eaa9',
+      entries: [
+        {
+          configKeys: ['kimik3-fp4-h200-vllm-agentic-latency'],
+          description: 'Kimi-K3 H200 latency power',
+          prLink: 'https://github.com/SemiAnalysisAI/InferenceX/pull/3044',
+          appendOnly: false,
+        },
+      ],
+    };
+    const applied = applyChangelogBackfills(34744300699, 1, [changelog]);
+    expect(applied.backfillIds).toEqual(['run-34744300699-restore-append-only']);
+    expect(applied.changelogs[0].entries[0].appendOnly).toBe(true);
+
+    const pointBackfills = BENCHMARK_POINT_BACKFILLS.filter(
+      (backfill) => backfill.githubRunId === 30781313910,
+    );
+    expect(pointBackfills.map((backfill) => backfill.conc)).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 10, 12,
+    ]);
+    for (const backfill of pointBackfills) {
+      expect(backfill.recipeFingerprint).toBeNull();
+      expect(backfill.set).toEqual({
+        recipeFingerprint: 'a6aa413ff9af529330e547e9fe13ef32c3d5e83a18887c3ee795df596ce3ecb5',
+      });
+      const appliedPoint = applyBenchmarkPointBackfill(30781313910, 3, {
+        configId: 999,
+        config: backfill.config,
+        benchmarkType: backfill.benchmarkType,
+        isl: backfill.isl,
+        osl: backfill.osl,
+        conc: backfill.conc,
+        offloadMode: backfill.offloadMode,
+        recipeFingerprint: backfill.recipeFingerprint ?? null,
+        metrics: { ...backfill.expectedMetrics },
+      });
+      expect(appliedPoint.backfillId).toBe(backfill.id);
+      expect(appliedPoint.point.recipeFingerprint).toBe(
+        'a6aa413ff9af529330e547e9fe13ef32c3d5e83a18887c3ee795df596ce3ecb5',
+      );
+      expect(appliedPoint.point.metrics).toEqual(backfill.expectedMetrics);
+    }
+  });
+
+  it.each([
+    [128, 4, 'd84f06bb4a4016f9f2fe917feb4f10b960f87ac5f48bfae1b0bca1d66d7c887b'],
+    [256, 4, '1472857d464c0780b5eeb41184ff70290c5f6b9ad6a8c07b2524697e21dd0e07'],
+    [512, 8, '6ab19ba8680ab38b81c0d6a251d252576caafaf660118007c508b1f62df08c39'],
+  ] as const)(
+    'corrects the GB300 Mooncake c%i recipe without changing performance',
+    (conc, prefillSize, recipeFingerprint) => {
+      const point = {
+        configId: prefillSize === 4 ? 2449 : 2448,
+        config: {
+          ...EXAMPLE_CONFIG,
+          prefillTp: prefillSize,
+          prefillEp: prefillSize,
+          numPrefillGpu: prefillSize,
+          decodeTp: 16,
+          decodeEp: 16,
+          numDecodeGpu: 16,
+        },
+        benchmarkType: 'agentic_traces',
+        isl: null,
+        osl: null,
+        conc,
+        offloadMode: 'off',
+        recipeFingerprint,
+        metrics: {
+          kv_offloading: 'none',
+          allocated_cpu_dram_gb: 0,
+          median_itl: 0.1,
+          output_tput_per_gpu: 123,
+        },
+      };
+      const applied = applyBenchmarkPointBackfill(32809502132, 1, point);
+      expect(applied.point.offloadMode).toBe('on');
+      expect(applied.point.metrics).toMatchObject({
+        offload_mode: 'on',
+        kv_offloading: 'dram',
+        kv_offload_backend: 'mooncake',
+        kv_offload_backend_version: '0.3.11.post1',
+        median_itl: 0.1,
+        output_tput_per_gpu: 123,
+      });
+      expect(applied.point.metrics).not.toHaveProperty('allocated_cpu_dram_gb');
+      expect(applyBenchmarkPointBackfill(32809502132, 2, point).backfillId).toBeNull();
+      expect(
+        applyBenchmarkPointBackfill(32809502132, 1, { ...point, recipeFingerprint: null })
+          .backfillId,
+      ).toBeNull();
+      expect(applyBenchmarkPointBackfill(32809502132, 1, applied.point).point).toEqual(
+        applied.point,
+      );
+      expect(
+        BENCHMARK_POINT_BACKFILLS.find((b) => b.githubRunId === 32809502132 && b.conc === 4)?.set
+          .offloadMode,
+      ).toBeUndefined();
+    },
+  );
+
+  it('limits borrowed prefix-cache hit rates to GB300 dynamo-vllm DeepSeek-V4 AgentX points', () => {
+    const cacheHitKeys = [
+      'server_gpu_cache_hit_rate',
+      'server_external_cache_hit_rate',
+      'server_cpu_cache_hit_rate',
+    ];
+    const borrowed = BENCHMARK_POINT_BACKFILLS.filter((backfill) =>
+      cacheHitKeys.some((key) => key in (backfill.set.metricsMerge ?? {})),
+    );
+
+    expect(borrowed.length).toBe(14);
+    for (const backfill of borrowed) {
+      expect(backfill.config.hardware).toBe('gb300');
+      expect(backfill.config.framework).toBe('dynamo-vllm');
+      expect(backfill.config.model).toBe('dsv4');
+      expect(backfill.benchmarkType).toBe('agentic_traces');
+      for (const key of cacheHitKeys) {
+        const value = backfill.set.metricsMerge?.[key];
+        expect(typeof value).toBe('number');
+        expect(value).toBeGreaterThanOrEqual(0);
+        expect(value).toBeLessThanOrEqual(1);
+      }
+    }
+  });
+
+  it('requires a stable ID, reason, exact selector, and non-empty patch', () => {
+    expect(() => validateRunBackfills([], [examplePointBackfill({ id: 'Not Valid' })])).toThrow(
+      /kebab-case/u,
+    );
+    expect(() => validateRunBackfills([], [examplePointBackfill({ reason: ' ' })])).toThrow(
+      /reason/u,
+    );
+    expect(() => validateRunBackfills([], [examplePointBackfill({ set: {} })])).toThrow(
+      /at least one field/u,
+    );
+  });
+
+  it('rejects source-to-destination point identity collisions', () => {
+    const first = examplePointBackfill();
+    const second = examplePointBackfill({
+      id: 'run-123-existing-offload-point',
+      offloadMode: 'on',
+      set: { metricsMerge: { note: 'already on' } },
+    });
+    expect(() => validateRunBackfills([], [first, second])).toThrow(/collides/u);
+  });
+
+  it('rejects duplicate stable selectors even when production config IDs differ', () => {
+    const first = examplePointBackfill();
+    const second = examplePointBackfill({
+      id: 'run-123-duplicate-stable-selector',
+      productionConfigId: 999,
+    });
+
+    expect(() => validateRunBackfills([], [first, second])).toThrow(/duplicate.*selector/u);
+  });
+
+  it('applies point corrections during ingest and synchronizes offload metadata', () => {
+    const backfill = examplePointBackfill();
+    const registry = BENCHMARK_POINT_BACKFILLS as BenchmarkPointBackfill[];
+    registry.push(backfill);
+    const point = {
+      configId: 456,
+      config: EXAMPLE_CONFIG,
+      benchmarkType: 'agentic_traces',
+      isl: null,
+      osl: null,
+      conc: 64,
+      offloadMode: 'off',
+      recipeFingerprint: null,
+      metrics: { median_itl: 0.1, stale_offload_field: true },
+    };
+
+    try {
+      const applied = applyBenchmarkPointBackfill(123, 1, point);
+      expect(applied.backfillId).toBe(backfill.id);
+      expect(applied.point.offloadMode).toBe('on');
+      expect(applied.point.metrics).toEqual({
+        median_itl: 0.1,
+        offload_mode: 'on',
+        kv_offloading: 'dram',
+        kv_offload_backend: 'lmcache',
+      });
+      expect(applied.desiredIdentity).not.toBe(applied.sourceIdentity);
+
+      const otherAttempt = applyBenchmarkPointBackfill(123, 2, point);
+      expect(otherAttempt.backfillId).toBeNull();
+      expect(applyBenchmarkPointBackfill(123, undefined, point).backfillId).toBe(backfill.id);
+    } finally {
+      registry.splice(registry.indexOf(backfill), 1);
+    }
+  });
+
+  it('matches point backfills by stable config dimensions across database branches', () => {
+    const backfill = examplePointBackfill();
+    const registry = BENCHMARK_POINT_BACKFILLS as BenchmarkPointBackfill[];
+    registry.push(backfill);
+
+    try {
+      const applied = applyBenchmarkPointBackfill(123, 1, {
+        configId: 999,
+        config: { ...EXAMPLE_CONFIG },
+        benchmarkType: 'agentic_traces',
+        isl: null,
+        osl: null,
+        conc: 64,
+        offloadMode: 'off',
+        recipeFingerprint: null,
+        metrics: { median_itl: 0.1 },
+      });
+
+      expect(applied.backfillId).toBe(backfill.id);
+      expect(applied.point.configId).toBe(999);
+      expect(applied.point.offloadMode).toBe('on');
+    } finally {
+      registry.splice(registry.indexOf(backfill), 1);
+    }
+  });
+
+  it('does not match a different stable config that reuses the production config ID', () => {
+    const backfill = examplePointBackfill();
+    const registry = BENCHMARK_POINT_BACKFILLS as BenchmarkPointBackfill[];
+    registry.push(backfill);
+
+    try {
+      const applied = applyBenchmarkPointBackfill(123, 1, {
+        configId: 456,
+        config: { ...EXAMPLE_CONFIG, decodeTp: 16, numDecodeGpu: 16 },
+        benchmarkType: 'agentic_traces',
+        isl: null,
+        osl: null,
+        conc: 64,
+        offloadMode: 'off',
+        recipeFingerprint: null,
+        metrics: { median_itl: 0.1 },
+      });
+
+      expect(applied.backfillId).toBeNull();
+    } finally {
+      registry.splice(registry.indexOf(backfill), 1);
+    }
+  });
+
+  it('applies changelog corrections to the row that ingest persists', () => {
+    const backfill: ChangelogBackfill = {
+      id: 'run-123-changelog-configs',
+      reason: 'The artifact listed the wrong config key.',
+      githubRunId: 123,
+      runAttempt: 1,
+      baseRef: 'master',
+      headRef: 'feature-sha',
+      set: {
+        configKeys: ['dsv4-fp4-b300-vllm-mtp'],
+        description: 'Corrected description',
+        prLink: null,
+        appendOnly: true,
+      },
+    };
+    const registry = CHANGELOG_BACKFILLS as ChangelogBackfill[];
+    registry.push(backfill);
+
+    try {
+      const applied = applyChangelogBackfills(123, 1, [
+        {
+          baseRef: 'master',
+          headRef: 'feature-sha',
+          entries: [
+            {
+              configKeys: ['old-first'],
+              description: 'First entry is overwritten by ingest',
+              prLink: 'https://example.com/first',
+              evalsOnly: false,
+              appendOnly: false,
+            },
+            {
+              configKeys: ['old-final'],
+              description: 'Final stored entry',
+              prLink: 'https://example.com/final',
+              evalsOnly: false,
+              appendOnly: false,
+            },
+          ],
+        },
+      ]);
+
+      expect(applied.backfillIds).toEqual([backfill.id]);
+      expect(applied.changelogs[0].entries[0].configKeys).toEqual(['old-first']);
+      expect(applied.changelogs[0].entries[0].appendOnly).toBe(true);
+      expect(applied.changelogs[0].entries[1]).toMatchObject({
+        configKeys: ['dsv4-fp4-b300-vllm-mtp'],
+        description: 'Corrected description',
+        prLink: null,
+        appendOnly: true,
+        evalsOnly: false,
+      });
+    } finally {
+      registry.splice(registry.indexOf(backfill), 1);
+    }
+  });
+
+  it('detects two artifact rows collapsing onto one corrected identity', () => {
+    const seen = new Map<string, string>();
+    recordBackfilledPointIdentity(seen, 'source-off', 'desired-on');
+    expect(() => recordBackfilledPointIdentity(seen, 'source-on', 'desired-on')).toThrow(
+      /collision/u,
+    );
+  });
+});
+
+describe('planBenchmarkPoint', () => {
+  const point = {
+    configId: 456,
+    config: EXAMPLE_CONFIG,
+    benchmarkType: 'agentic_traces',
+    isl: null,
+    osl: null,
+    conc: 64,
+    offloadMode: 'off',
+    recipeFingerprint: null,
+    metrics: { median_itl: 0.1 },
+  };
+
+  it('purges a registered point before any correction is considered', () => {
+    const purged = PURGED_BENCHMARK_POINTS[0];
+    const plan = planBenchmarkPoint(
+      purged,
+      { ...purged, config: EXAMPLE_CONFIG, metrics: {} },
+      new Map(),
+    );
+    expect(plan).toEqual({ kind: 'purged' });
+  });
+
+  it('applies the matching backfill and refuses a second row that collapses onto its identity', () => {
+    const backfill = examplePointBackfill();
+    const registry = BENCHMARK_POINT_BACKFILLS as BenchmarkPointBackfill[];
+    registry.push(backfill);
+    try {
+      const seen = new Map<string, string>();
+      const plan = planBenchmarkPoint({ githubRunId: 123, runAttempt: 1 }, point, seen);
+      expect(plan).toMatchObject({ kind: 'planned', backfillId: backfill.id });
+      expect(plan.kind === 'planned' && plan.point.offloadMode).toBe('on');
+      expect(() =>
+        planBenchmarkPoint(
+          { githubRunId: 123, runAttempt: 1 },
+          { ...point, offloadMode: 'on' },
+          seen,
+        ),
+      ).toThrow(/collision/u);
+    } finally {
+      registry.splice(registry.indexOf(backfill), 1);
+    }
+  });
+
+  it('relabels required-power points the same way ingest relabels retained points', () => {
+    const required = {
+      config: {
+        ...EXAMPLE_CONFIG,
+        hardware: 'b300',
+        framework: 'vllm',
+        model: 'kimik3',
+        disagg: false,
+        isMultinode: false,
+        prefillTp: 8,
+        prefillEp: 1,
+        prefillDpAttn: false,
+        prefillNumWorkers: 0,
+        decodeTp: 8,
+        decodeEp: 1,
+        decodeDpAttn: false,
+        decodeNumWorkers: 0,
+      },
+      benchmarkType: 'agentic_traces',
+      isl: null,
+      osl: null,
+      conc: 24,
+      offloadMode: 'on',
+      recipeFingerprint: '61ba8917bcdef3e354ba09a889270595338d97885bd465fedd01c9dbe7e9beaa',
+      metrics: {},
+    };
+    const [relabeled] = backfilledPoints({ githubRunId: 31893747354, runAttempt: 2 }, [required]);
+    expect(relabeled!.config.specMethod).toBe('none');
+  });
+
+  it('moves a non-drafting B300 Kimi-K3 point to the none config and leaves drafting points alone', () => {
+    const kimiB300 = {
+      ...EXAMPLE_CONFIG,
+      hardware: 'b300',
+      framework: 'vllm',
+      model: 'kimik3',
+      disagg: false,
+      isMultinode: false,
+      prefillTp: 8,
+      prefillEp: 1,
+      prefillDpAttn: false,
+      prefillNumWorkers: 0,
+      decodeTp: 8,
+      decodeEp: 1,
+      decodeDpAttn: false,
+      decodeNumWorkers: 0,
+    };
+    const kimiPoint = (conc: number) => ({
+      configId: 2182,
+      config: kimiB300,
+      benchmarkType: 'agentic_traces',
+      isl: null,
+      osl: null,
+      conc,
+      offloadMode: 'on',
+      recipeFingerprint: '61ba8917bcdef3e354ba09a889270595338d97885bd465fedd01c9dbe7e9beaa',
+      metrics: { median_itl: 0.1 },
+    });
+    const run = { githubRunId: 31893747354, runAttempt: 2 };
+    const seen = new Map<string, string>();
+
+    const relabeled = planBenchmarkPoint(run, kimiPoint(24), seen);
+    expect(relabeled.kind === 'planned' && relabeled.point.config).toEqual({
+      ...kimiB300,
+      specMethod: 'none',
+    });
+    expect(relabeled.kind === 'planned' && relabeled.point.metrics).toEqual({ median_itl: 0.1 });
+
+    const drafting = planBenchmarkPoint(run, kimiPoint(16), seen);
+    expect(drafting).toMatchObject({ kind: 'planned', backfillId: null });
+    expect(drafting.kind === 'planned' && drafting.point.config.specMethod).toBe('mtp');
+
+    expect(() =>
+      planBenchmarkPoint(
+        run,
+        { ...kimiPoint(24), configId: 2116, config: { ...kimiB300, specMethod: 'none' } },
+        seen,
+      ),
+    ).toThrow(/collision/u);
+  });
+
+  it('rejects a spec method correction that does not change the config', () => {
+    expect(() =>
+      validateRunBackfills([], [examplePointBackfill({ set: { specMethod: 'mtp' } })]),
+    ).toThrow(/specMethod/u);
+  });
+});
+
+describe('CONCLUSION_OVERRIDES', () => {
+  it('all run IDs are positive integers', () => {
+    for (const runId of CONCLUSION_OVERRIDES.keys()) {
+      expect(runId).toBeGreaterThan(0);
+      expect(Number.isInteger(runId)).toBe(true);
+    }
+  });
+
+  it('only contains valid GitHub conclusion values', () => {
+    const validConclusions = new Set(['success', 'failure', 'cancelled', 'skipped']);
+    for (const conclusion of CONCLUSION_OVERRIDES.values()) {
+      expect(validConclusions.has(conclusion), `unexpected: '${conclusion}'`).toBe(true);
+    }
+  });
+});
+
+describe('PURGED_RUNS', () => {
+  it('all run IDs are positive integers', () => {
+    for (const runId of PURGED_RUNS) {
+      expect(runId).toBeGreaterThan(0);
+      expect(Number.isInteger(runId)).toBe(true);
+    }
+  });
+
+  it('does not overlap with CONCLUSION_OVERRIDES', () => {
+    for (const runId of PURGED_RUNS) {
+      expect(
+        CONCLUSION_OVERRIDES.has(runId),
+        `run ${runId} is in both PURGED_RUNS and CONCLUSION_OVERRIDES`,
+      ).toBe(false);
+    }
+  });
+});
+
+describe('PURGED_RUN_ATTEMPTS', () => {
+  it('all run IDs and attempt numbers are positive integers', () => {
+    for (const [runId, attempts] of PURGED_RUN_ATTEMPTS) {
+      expect(runId).toBeGreaterThan(0);
+      expect(Number.isInteger(runId)).toBe(true);
+      expect(attempts.size).toBeGreaterThan(0);
+      for (const attempt of attempts) {
+        expect(attempt).toBeGreaterThan(0);
+        expect(Number.isInteger(attempt)).toBe(true);
+      }
+    }
+  });
+
+  it('does not overlap with PURGED_RUNS (use one or the other)', () => {
+    for (const runId of PURGED_RUN_ATTEMPTS.keys()) {
+      expect(
+        PURGED_RUNS.has(runId),
+        `run ${runId} appears in both PURGED_RUNS and PURGED_RUN_ATTEMPTS`,
+      ).toBe(false);
+    }
+  });
+
+  it('does not overlap with CONCLUSION_OVERRIDES', () => {
+    for (const runId of PURGED_RUN_ATTEMPTS.keys()) {
+      expect(
+        CONCLUSION_OVERRIDES.has(runId),
+        `run ${runId} is in both PURGED_RUN_ATTEMPTS and CONCLUSION_OVERRIDES`,
+      ).toBe(false);
+    }
+  });
+});
+
+describe('PURGED_BENCHMARK_POINTS', () => {
+  it('uses complete, valid point identities and no run-level purge overlaps', () => {
+    const unique = new Set<string>();
+    for (const point of PURGED_BENCHMARK_POINTS) {
+      expect(point.githubRunId).toBeGreaterThan(0);
+      expect(Number.isInteger(point.githubRunId)).toBe(true);
+      expect(point.runAttempt).toBeGreaterThan(0);
+      expect(Number.isInteger(point.runAttempt)).toBe(true);
+      expect(PURGED_RUNS.has(point.githubRunId)).toBe(false);
+      expect(CONCLUSION_OVERRIDES.has(point.githubRunId)).toBe(false);
+      expect(PURGED_RUN_ATTEMPTS.get(point.githubRunId)?.has(point.runAttempt) ?? false).toBe(
+        false,
+      );
+      expect(point.configId).toBeGreaterThan(0);
+      expect(Number.isInteger(point.configId)).toBe(true);
+      expect(point.benchmarkType).not.toBe('');
+      expect(point.isl === null || point.isl > 0).toBe(true);
+      expect(point.osl === null || point.osl > 0).toBe(true);
+      expect(point.conc).toBeGreaterThan(0);
+      expect(point.offloadMode).not.toBe('');
+      expect(
+        point.recipeFingerprint === undefined ||
+          point.recipeFingerprint === null ||
+          point.recipeFingerprint !== '',
+      ).toBe(true);
+      const identity = [
+        point.githubRunId,
+        point.runAttempt,
+        point.configId,
+        point.benchmarkType,
+        point.isl,
+        point.osl,
+        point.conc,
+        point.offloadMode,
+        point.recipeFingerprint ?? null,
+      ].join('|');
+      expect(unique.has(identity), `duplicate point override: ${identity}`).toBe(false);
+      unique.add(identity);
+    }
+  });
+});
+
+describe('isRunAttemptPurged', () => {
+  it.each([38878624849, 38925660934])(
+    'purges every attempt of Muse Spark H100 256k corpus run %s',
+    (runId) => {
+      for (const attempt of [undefined, 1, 2, 99]) {
+        expect(isRunAttemptPurged(runId, attempt)).toBe(true);
+      }
+      expect(isRunAttemptPurged(runId - 1, 1)).toBe(false);
+      expect(isRunAttemptPurged(runId + 1, 1)).toBe(false);
+    },
+  );
+
+  it.each([
+    32403083041, 33219708211, 31927376673, 34413290524, 33716849615, 33219706372, 32346724519,
+  ])(
+    'purges every attempt of GB300 FP4 TensorRT-LLM AgentX run %s with disabled server metrics',
+    (runId) => {
+      expect(PURGED_RUNS.has(runId)).toBe(true);
+      for (const attempt of [undefined, 1, 2, 3, 4, 99]) {
+        expect(isRunAttemptPurged(runId, attempt)).toBe(true);
+      }
+      expect(isRunAttemptPurged(runId - 1, 1)).toBe(false);
+      expect(isRunAttemptPurged(runId + 1, 1)).toBe(false);
+      expect(BENCHMARK_POINT_BACKFILLS.filter((entry) => entry.githubRunId === runId)).toEqual([]);
+      expect(() =>
+        validateRunBackfills([], [examplePointBackfill({ githubRunId: runId })]),
+      ).toThrow(/already in PURGED_RUNS/u);
+    },
+  );
+
+  it.each([35806602041, 34511705667])(
+    'purges every attempt of MiniMax M3 GB200 TensorRT-LLM run %s with disabled server metrics',
+    (runId) => {
+      expect(PURGED_RUNS.has(runId)).toBe(true);
+      for (const attempt of [undefined, 1, 2, 99]) {
+        expect(isRunAttemptPurged(runId, attempt)).toBe(true);
+      }
+      expect(isRunAttemptPurged(runId - 1, 1)).toBe(false);
+      expect(isRunAttemptPurged(runId + 1, 1)).toBe(false);
+    },
+  );
+
+  it('purges every attempt of run 35855544139 without CPU KV cache hit rates, leaving neighboring runs intact', () => {
+    expect(PURGED_RUNS.has(35855544139)).toBe(true);
+    for (const attempt of [undefined, 1, 2, 99]) {
+      expect(isRunAttemptPurged(35855544139, attempt)).toBe(true);
+    }
+    expect(isRunAttemptPurged(35855544138, 1)).toBe(false);
+    expect(isRunAttemptPurged(35855544140, 1)).toBe(false);
+  });
+
+  it('purges every attempt of MI355X DSV4 ATOM disagg LMCache AgentX run 36734492117 without CPU KV cache hit rates', () => {
+    expect(PURGED_RUNS.has(36734492117)).toBe(true);
+    for (const attempt of [undefined, 1, 2, 99]) {
+      expect(isRunAttemptPurged(36734492117, attempt)).toBe(true);
+    }
+    expect(isRunAttemptPurged(36734492116, 1)).toBe(false);
+    expect(isRunAttemptPurged(36734492118, 1)).toBe(false);
+  });
+
+  it('purges every attempt of the H200 Kimi-K3 simple-power run 34819961093 while keeping the 2026-09-13 H200 runs', () => {
+    expect(PURGED_RUNS.has(34819961093)).toBe(true);
+    for (const attempt of [undefined, 1, 2, 99]) {
+      expect(isRunAttemptPurged(34819961093, attempt)).toBe(true);
+    }
+    expect(PURGED_RUNS.has(34819578354)).toBe(true);
+    expect(isRunAttemptPurged(34819961092, 1)).toBe(false);
+    expect(isRunAttemptPurged(34819961094, 1)).toBe(false);
+    expect(isRunAttemptPurged(30781313910, 3)).toBe(false);
+    expect(isRunAttemptPurged(34744300699, 1)).toBe(false);
+  });
+
+  it('purges every attempt of run 34819564154 without purging adjacent runs', () => {
+    expect(PURGED_RUNS.has(34819564154)).toBe(true);
+    for (const attempt of [undefined, 1, 2, 99]) {
+      expect(isRunAttemptPurged(34819564154, attempt)).toBe(true);
+    }
+    expect(isRunAttemptPurged(34819564153, 1)).toBe(false);
+    expect(isRunAttemptPurged(34819564155, 1)).toBe(false);
+  });
+
+  it('purges every attempt of run 35165441471 without purging adjacent runs', () => {
+    expect(PURGED_RUNS.has(35165441471)).toBe(true);
+    for (const attempt of [undefined, 1, 2, 99]) {
+      expect(isRunAttemptPurged(35165441471, attempt)).toBe(true);
+    }
+    expect(isRunAttemptPurged(35165441470, 1)).toBe(false);
+    expect(isRunAttemptPurged(35165441472, 1)).toBe(false);
+  });
+
+  it('purges every attempt of run 34926284365 with uninitialized MTP weights', () => {
+    expect(PURGED_RUNS.has(34926284365)).toBe(true);
+    for (const attempt of [undefined, 1, 2, 99]) {
+      expect(isRunAttemptPurged(34926284365, attempt)).toBe(true);
+    }
+    expect(isRunAttemptPurged(34926284364, 1)).toBe(false);
+    expect(isRunAttemptPurged(34926284366, 1)).toBe(false);
+  });
+
+  it('purges every attempt of the accidentally merged EFA-patched run', () => {
+    for (const attempt of [undefined, 1, 2, 99]) {
+      expect(isRunAttemptPurged(39112710364, attempt)).toBe(true);
+      expect(isRunAttemptPurged(39112710363, attempt)).toBe(false);
+      expect(isRunAttemptPurged(39112710365, attempt)).toBe(false);
+    }
+  });
+
+  it('returns true for runs in PURGED_RUNS regardless of attempt', () => {
+    const [first] = PURGED_RUNS;
+    if (first === undefined) return;
+    expect(isRunAttemptPurged(first)).toBe(true);
+    expect(isRunAttemptPurged(first, 1)).toBe(true);
+    expect(isRunAttemptPurged(first, 99)).toBe(true);
+  });
+
+  it('returns true only for the specific attempts listed in PURGED_RUN_ATTEMPTS', () => {
+    for (const [runId, attempts] of PURGED_RUN_ATTEMPTS) {
+      for (const attempt of attempts) {
+        expect(isRunAttemptPurged(runId, attempt)).toBe(true);
+      }
+      const unlistedAttempt = Math.max(...attempts) + 1;
+      if (!attempts.has(unlistedAttempt)) {
+        expect(isRunAttemptPurged(runId, unlistedAttempt)).toBe(false);
+      }
+      expect(isRunAttemptPurged(runId)).toBe(false);
+    }
+  });
+
+  it('returns false for runs that are not purged', () => {
+    expect(isRunAttemptPurged(1, 1)).toBe(false);
+    expect(isRunAttemptPurged(1)).toBe(false);
+  });
+});
+
+describe('isBenchmarkPointPurged', () => {
+  it('matches the full point identity within the selected run attempt', () => {
+    const point: PurgedBenchmarkPoint = {
+      githubRunId: 1,
+      runAttempt: 1,
+      configId: 1,
+      benchmarkType: 'single_turn',
+      isl: 1024,
+      osl: 1024,
+      conc: 1,
+      offloadMode: 'none',
+      recipeFingerprint: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    };
+    const registry = PURGED_BENCHMARK_POINTS as PurgedBenchmarkPoint[];
+    registry.push(point);
+
+    try {
+      expect(isBenchmarkPointPurged(point.githubRunId, point.runAttempt, point)).toBe(true);
+      expect(isBenchmarkPointPurged(point.githubRunId, undefined, point)).toBe(true);
+      expect(isBenchmarkPointPurged(point.githubRunId, null, point)).toBe(true);
+      expect(isBenchmarkPointPurged(point.githubRunId, 2, point)).toBe(false);
+      expect(isBenchmarkPointPurged(2, point.runAttempt, point)).toBe(false);
+      expect(
+        isBenchmarkPointPurged(point.githubRunId, point.runAttempt, { ...point, conc: 2 }),
+      ).toBe(false);
+      expect(
+        isBenchmarkPointPurged(point.githubRunId, point.runAttempt, {
+          ...point,
+          offloadMode: 'cpu',
+        }),
+      ).toBe(false);
+      expect(
+        isBenchmarkPointPurged(point.githubRunId, point.runAttempt, {
+          ...point,
+          recipeFingerprint: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        }),
+      ).toBe(false);
+      expect(
+        isBenchmarkPointPurged(point.githubRunId, point.runAttempt, {
+          ...point,
+          recipeFingerprint: null,
+        }),
+      ).toBe(false);
+    } finally {
+      registry.splice(registry.indexOf(point), 1);
+    }
+  });
+
+  it('treats omitted and null fingerprints as the same legacy identity', () => {
+    const point: PurgedBenchmarkPoint = {
+      githubRunId: 1,
+      runAttempt: 1,
+      configId: 1,
+      benchmarkType: 'single_turn',
+      isl: 1024,
+      osl: 1024,
+      conc: 1,
+      offloadMode: 'none',
+    };
+    const registry = PURGED_BENCHMARK_POINTS as PurgedBenchmarkPoint[];
+    registry.push(point);
+
+    try {
+      expect(
+        isBenchmarkPointPurged(point.githubRunId, point.runAttempt, {
+          ...point,
+          recipeFingerprint: null,
+        }),
+      ).toBe(true);
+      expect(
+        isBenchmarkPointPurged(point.githubRunId, point.runAttempt, {
+          ...point,
+          recipeFingerprint: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        }),
+      ).toBe(false);
+    } finally {
+      registry.splice(registry.indexOf(point), 1);
+    }
+  });
+});
+
+const validateFrameworkOverrides = (overrides: Parameters<typeof validateRunBackfills>[2]) => () =>
+  validateRunBackfills([], [], overrides);
+
+describe('RUN_FRAMEWORK_OVERRIDES', () => {
+  const LLMD_RUN = 40744397059;
+
+  it('reassigns the TPU v7 Qwen3.5 xPyD run from vllm to llmd-vllm', () => {
+    expect(RUN_FRAMEWORK_OVERRIDES).toContainEqual(
+      expect.objectContaining({
+        id: 'run-40744397059-llmd-vllm-router',
+        githubRunId: LLMD_RUN,
+        from: 'vllm',
+        to: 'llmd-vllm',
+      }),
+    );
+    expect(() => validateRunBackfills()).not.toThrow();
+  });
+
+  it('resolves the served framework only for the registered run and declared framework', () => {
+    expect(resolveRunFramework(LLMD_RUN, 'vllm')).toEqual({
+      framework: 'llmd-vllm',
+      overrideId: 'run-40744397059-llmd-vllm-router',
+    });
+    expect(resolveRunFramework(String(LLMD_RUN), 'vllm')).toEqual({
+      framework: 'llmd-vllm',
+      overrideId: 'run-40744397059-llmd-vllm-router',
+    });
+    expect(resolveRunFramework(LLMD_RUN, 'dynamo-vllm')).toEqual({
+      framework: 'dynamo-vllm',
+      overrideId: null,
+    });
+    expect(resolveRunFramework(LLMD_RUN + 1, 'vllm')).toEqual({
+      framework: 'vllm',
+      overrideId: null,
+    });
+    for (const runId of [undefined, null, '', 'abc', '0', -1, 1.5]) {
+      expect(resolveRunFramework(runId, 'vllm')).toEqual({ framework: 'vllm', overrideId: null });
+    }
+  });
+
+  it('reassigns the Kimi-K3.1-Pro B200 direct vLLM run from dynamo-vllm to vllm', () => {
+    const run = 42071652809;
+    expect(resolveRunFramework(run, 'dynamo-vllm')).toEqual({
+      framework: 'vllm',
+      overrideId: 'run-42071652809-kimik31-b200-direct-vllm',
+    });
+    expect(resolveRunFramework(run, 'vllm')).toEqual({ framework: 'vllm', overrideId: null });
+    expect(resolveRunFramework(run + 1, 'dynamo-vllm')).toEqual({
+      framework: 'dynamo-vllm',
+      overrideId: null,
+    });
+    const changelogs = [
+      {
+        baseRef: 'a',
+        headRef: 'b',
+        entries: [
+          {
+            configKeys: ['kimik3.1-fp4-b200-dynamo-vllm-agentic-dspark'],
+            description: 'x',
+            prLink: null,
+            evalsOnly: false,
+            appendOnly: false,
+          },
+        ],
+      },
+    ];
+    const result = applyRunFrameworkOverridesToChangelogs(run, changelogs);
+    expect(result.overrideIds).toEqual(['run-42071652809-kimik31-b200-direct-vllm']);
+    expect(result.changelogs[0].entries[0].configKeys).toEqual([
+      'kimik3.1-fp4-b200-vllm-agentic-dspark',
+    ]);
+    expect(() => validateRunBackfills()).not.toThrow();
+  });
+
+  it('rewrites only the framework segment of a changelog config key', () => {
+    expect(
+      rewriteConfigKeyFramework('qwen3.5-fp8-tpuv7-vllm-agentic-xpyd-mtp', 'vllm', 'llmd-vllm'),
+    ).toBe('qwen3.5-fp8-tpuv7-llmd-vllm-agentic-xpyd-mtp');
+    expect(rewriteConfigKeyFramework('dsv4-fp4-gb200-vllm', 'vllm', 'llmd-vllm')).toBe(
+      'dsv4-fp4-gb200-llmd-vllm',
+    );
+    for (const untouched of [
+      'dsv4-fp4-gb200-dynamo-vllm-mtp',
+      'dsv4-fp4-gb200-llmd-vllm',
+      'dsv4-fp4-gb200-vllmx',
+      'dsv4-fp4-gb200',
+      'vllm',
+      '',
+      '-fp4-gb200-vllm',
+    ]) {
+      expect(rewriteConfigKeyFramework(untouched, 'vllm', 'llmd-vllm')).toBe(untouched);
+    }
+  });
+
+  it('applies the override to changelog config keys and reports the override ID once', () => {
+    const changelogs = [
+      {
+        baseRef: 'a',
+        headRef: 'b',
+        entries: [
+          {
+            configKeys: ['qwen3.5-fp8-tpuv7-vllm-agentic-xpyd-mtp', 'dsv4-fp4-gb200-dynamo-vllm'],
+            description: 'x',
+            prLink: null,
+            evalsOnly: false,
+            appendOnly: false,
+          },
+          {
+            configKeys: ['qwen3.5-fp8-tpuv7-vllm-agentic-xpyd-mtp'],
+            description: 'y',
+            prLink: null,
+            evalsOnly: false,
+            appendOnly: false,
+          },
+        ],
+      },
+    ];
+    const result = applyRunFrameworkOverridesToChangelogs(LLMD_RUN, changelogs);
+    expect(result.overrideIds).toEqual(['run-40744397059-llmd-vllm-router']);
+    expect(result.changelogs[0].entries.map((entry) => entry.configKeys)).toEqual([
+      ['qwen3.5-fp8-tpuv7-llmd-vllm-agentic-xpyd-mtp', 'dsv4-fp4-gb200-dynamo-vllm'],
+      ['qwen3.5-fp8-tpuv7-llmd-vllm-agentic-xpyd-mtp'],
+    ]);
+    expect(result.changelogs[0].entries[0].description).toBe('x');
+    expect(changelogs[0].entries[0].configKeys[0]).toBe('qwen3.5-fp8-tpuv7-vllm-agentic-xpyd-mtp');
+
+    const other = applyRunFrameworkOverridesToChangelogs(LLMD_RUN + 1, changelogs);
+    expect(other).toEqual({ changelogs, overrideIds: [] });
+    const alreadyCorrect = applyRunFrameworkOverridesToChangelogs(LLMD_RUN, [
+      { baseRef: 'a', headRef: 'b', entries: [{ configKeys: ['dsv4-fp4-gb200-llmd-vllm'] }] },
+    ]);
+    expect(alreadyCorrect.overrideIds).toEqual([]);
+  });
+
+  it('validates every framework override field', () => {
+    const base = {
+      id: 'run-1-framework',
+      reason: 'declared framework differs from the served one',
+      githubRunId: 1,
+      from: 'vllm',
+      to: 'llmd-vllm',
+    };
+    expect(validateFrameworkOverrides([base])).not.toThrow();
+    expect(validateFrameworkOverrides([{ ...base, id: 'Bad_Id' }])).toThrow('kebab-case');
+    expect(validateFrameworkOverrides([base, { ...base, from: 'sglang' }])).toThrow(
+      'duplicate backfill id',
+    );
+    expect(validateFrameworkOverrides([base, { ...base, id: 'run-1-again' }])).toThrow(
+      'duplicate framework override for run 1:vllm',
+    );
+    expect(validateFrameworkOverrides([{ ...base, reason: ' ' }])).toThrow(
+      'reason must not be empty',
+    );
+    expect(validateFrameworkOverrides([{ ...base, githubRunId: 0 }])).toThrow('positive integer');
+    expect(validateFrameworkOverrides([{ ...base, githubRunId: [...PURGED_RUNS][0] }])).toThrow(
+      'PURGED_RUNS',
+    );
+    expect(validateFrameworkOverrides([{ ...base, from: '' }])).toThrow('non-empty lowercase');
+    expect(validateFrameworkOverrides([{ ...base, to: 'LLMD-VLLM' }])).toThrow(
+      'non-empty lowercase',
+    );
+    expect(validateFrameworkOverrides([{ ...base, from: 'trtllm' }])).toThrow('not an alias');
+    expect(validateFrameworkOverrides([{ ...base, to: 'vllm' }])).toThrow(
+      'from and to must differ',
+    );
+    expect(validateFrameworkOverrides([{ ...base, to: 'not-a-framework' }])).toThrow(
+      'registered framework key',
+    );
+  });
+
+  it('shares the stable ID namespace with the other audited corrections', () => {
+    expect(() =>
+      validateRunBackfills(
+        [
+          {
+            id: 'run-1-framework',
+            reason: 'r',
+            githubRunId: 1,
+            runAttempt: 1,
+            baseRef: 'a',
+            headRef: 'b',
+            set: { appendOnly: true },
+          },
+        ],
+        [],
+        [{ id: 'run-1-framework', reason: 'r', githubRunId: 1, from: 'vllm', to: 'llmd-vllm' }],
+      ),
+    ).toThrow('duplicate backfill id');
+  });
+});

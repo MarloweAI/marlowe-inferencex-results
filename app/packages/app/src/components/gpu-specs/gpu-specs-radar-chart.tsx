@@ -1,0 +1,234 @@
+'use client';
+
+import { type ReactNode, useMemo, useState, useCallback } from 'react';
+import { track } from '@/lib/analytics/analytics';
+
+import type * as d3 from 'd3';
+
+import { GPU_SPECS, GPU_CHART_METRICS, type GpuSpec } from '@/lib/catalog/gpu-specs';
+import { D3Chart } from '@/lib/d3-chart/D3Chart';
+import type { LayerConfig } from '@/lib/d3-chart/D3Chart/types';
+import type { RadarDot } from '@/lib/d3-chart/layers/radar';
+import { useLocale } from '@/lib/i18n/use-locale';
+import { chartHoverCard } from '@/lib/d3-chart/tooltip-shell';
+import ChartLegend from '@/components/ui/chart-legend';
+import { EmptyState } from '@/components/ui/empty-state';
+
+const RADAR_METRICS = GPU_CHART_METRICS.filter(
+  (m) => m.key !== 'scaleUpWorldSize' && m.key !== 'scaleOutBandwidth',
+);
+
+function getGpuColor(spec: GpuSpec, _index: number): string {
+  const nvidiaColors = ['#76b900', '#5a9e00', '#8fd400', '#4a8400', '#a0e800', '#3d6e00'];
+  const amdColors = ['#ed1c24', '#c41920', '#ff4d52'];
+
+  if (spec.vendor === 'nvidia') {
+    const nvidiaGpus = GPU_SPECS.filter((s) => s.vendor === 'nvidia');
+    const nvidiaIdx = nvidiaGpus.indexOf(spec);
+    return nvidiaColors[nvidiaIdx % nvidiaColors.length];
+  }
+  const amdGpus = GPU_SPECS.filter((s) => s.vendor === 'amd');
+  const amdIdx = amdGpus.indexOf(spec);
+  return amdColors[amdIdx % amdColors.length];
+}
+
+interface NormalizedGpu {
+  gpu: GpuSpec;
+  values: (number | null)[];
+  color: string;
+}
+
+export function normalizeGpuData(specs: GpuSpec[], metrics: typeof RADAR_METRICS): NormalizedGpu[] {
+  const maxValues = metrics.map((metric) => {
+    const values = specs
+      .map((spec) => metric.getValue(spec))
+      .filter((v): v is number => v !== null);
+    return Math.max(...values, 1);
+  });
+
+  return specs.map((spec, idx) => ({
+    gpu: spec,
+    values: metrics.map((metric, i) => {
+      const raw = metric.getValue(spec);
+      if (raw === null) return null;
+      return raw / maxValues[i];
+    }),
+    color: getGpuColor(spec, idx),
+  }));
+}
+
+interface GpuSpecsRadarChartProps {
+  caption?: ReactNode;
+}
+
+const RADAR_STRINGS = {
+  en: {
+    empty: 'Select at least one chip to display the radar chart',
+    note: 'Values are normalized to percentages of the maximum across all chips for each metric. chips without FP4 support show 0% on the FP4 axis.',
+  },
+  zh: {
+    empty: '请至少选择一款芯片以显示雷达图',
+    note: '每项指标均按所有芯片中的最大值归一化为百分比；不支持 FP4 的芯片在 FP4 轴上显示为 0%。',
+  },
+} as const;
+
+export function GpuSpecsRadarChart({ caption }: GpuSpecsRadarChartProps) {
+  const [selectedGpus, setSelectedGpus] = useState<Set<string>>(
+    () => new Set(GPU_SPECS.map((s) => s.name)),
+  );
+  const [isLegendExpanded, setIsLegendExpanded] = useState(true);
+  const locale = useLocale();
+  const t = RADAR_STRINGS[locale];
+
+  const metrics = RADAR_METRICS;
+
+  const allNormalized = useMemo(() => normalizeGpuData(GPU_SPECS, metrics), [metrics]);
+
+  const visibleData = useMemo(
+    () => allNormalized.filter((d) => selectedGpus.has(d.gpu.name)),
+    [allNormalized, selectedGpus],
+  );
+
+  const toggleGpu = useCallback((name: string) => {
+    setSelectedGpus((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) {
+        next.delete(name);
+      } else {
+        next.add(name);
+      }
+      track('gpu_specs_radar_gpu_toggled', { gpu: name, enabled: !prev.has(name) });
+      return next;
+    });
+  }, []);
+
+  const removeGpu = useCallback((name: string) => {
+    setSelectedGpus((prev) => {
+      const next = new Set(prev);
+      next.delete(name);
+      return next;
+    });
+  }, []);
+
+  const selectAll = useCallback(() => {
+    setSelectedGpus(new Set(GPU_SPECS.map((s) => s.name)));
+    track('gpu_specs_radar_select_all');
+  }, []);
+
+  const legendItems = useMemo(
+    () =>
+      GPU_SPECS.map((spec, idx) => ({
+        name: spec.name,
+        label: spec.name,
+        color: getGpuColor(spec, idx),
+        lineDasharray: 'none',
+        isActive: selectedGpus.has(spec.name),
+        onClick: () => toggleGpu(spec.name),
+      })),
+    [selectedGpus, toggleGpu],
+  );
+
+  const radarLayer = useMemo(
+    (): LayerConfig<NormalizedGpu> => ({
+      type: 'radar',
+      key: 'gpu-radar',
+      data: visibleData,
+      config: {
+        axes: metrics.map((m) => ({
+          label: locale === 'zh' ? m.labelZh : m.label,
+          unit: locale === 'zh' ? m.unitZh : m.unit,
+        })),
+        getValue: (d, i) => d.values[i],
+        getRawValue: (d, i) => metrics[i].getValue(d.gpu),
+        getColor: (d) => d.color,
+        getLabel: (d) => d.gpu.name,
+        keyFn: (d) => d.gpu.name,
+      },
+    }),
+    [visibleData, metrics, locale],
+  );
+
+  const tooltip = useMemo(
+    () => ({
+      rulerType: 'none' as const,
+      content: (dot: RadarDot<NormalizedGpu>, _isPinned: boolean) => {
+        const { item, axisIndex } = dot;
+        const metric = metrics[axisIndex];
+        const rawValue = metric.getValue(item.gpu);
+        const zh = locale === 'zh';
+        return chartHoverCard({
+          title: item.gpu.name,
+          subtitle: item.gpu.vendor === 'nvidia' ? 'NVIDIA' : 'AMD',
+          color: dot.color,
+          metrics: [
+            {
+              value: rawValue === null ? '—' : rawValue.toLocaleString(zh ? 'zh-CN' : 'en-US'),
+              label: zh
+                ? `${metric.labelZh}（${metric.unitZh}）`
+                : `${metric.label} (${metric.unit})`,
+            },
+          ],
+        });
+      },
+      onHoverStart: (sel: d3.Selection<any, RadarDot<NormalizedGpu>, any, any>) => {
+        sel.attr('r', 5.5);
+      },
+      onHoverEnd: (sel: d3.Selection<any, RadarDot<NormalizedGpu>, any, any>) => {
+        sel.attr('r', 3.5);
+      },
+      attachToLayer: 0,
+    }),
+    [locale, metrics],
+  );
+
+  const layers = useMemo(() => [radarLayer], [radarLayer]);
+
+  if (selectedGpus.size === 0) {
+    return (
+      <div data-testid="gpu-specs-radar-chart">
+        <EmptyState bare className="h-60">
+          {t.empty}
+        </EmptyState>
+      </div>
+    );
+  }
+
+  return (
+    <div data-testid="gpu-specs-radar-chart">
+      <D3Chart<RadarDot<NormalizedGpu>>
+        chartId="gpu-radar-chart"
+        data={visibleData as unknown as RadarDot<NormalizedGpu>[]}
+        height={520}
+        margin={{ top: 0, right: 0, bottom: 0, left: 0 }}
+        watermark="logo"
+        clipContent={false}
+        layers={layers as LayerConfig<RadarDot<NormalizedGpu>>[]}
+        tooltip={tooltip}
+        caption={caption}
+        legendElement={
+          <ChartLegend
+            variant="sidebar"
+            legendItems={legendItems}
+            onItemRemove={removeGpu}
+            isLegendExpanded={isLegendExpanded}
+            onExpandedChange={(expanded) => {
+              setIsLegendExpanded(expanded);
+              track('gpu_specs_radar_legend_expanded', { enabled: expanded });
+            }}
+            reset={{
+              id: 'radar-reset-filter',
+              disabled: selectedGpus.size >= GPU_SPECS.length,
+              onClick: () => {
+                selectAll();
+                track('gpu_specs_radar_reset_filter');
+              },
+            }}
+          />
+        }
+      />
+      <div className="px-4 md:px-8 pt-2">
+        <p className="text-xs text-muted-foreground">{t.note}</p>
+      </div>
+    </div>
+  );
+}

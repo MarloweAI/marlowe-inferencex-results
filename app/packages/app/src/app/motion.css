@@ -1,0 +1,153 @@
+:root {
+  --motion-ease-enter: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .motion-press {
+    transition-property: color, background-color, border-color, opacity, transform;
+    transition-duration: 150ms;
+    transition-timing-function: var(--motion-ease-enter);
+  }
+
+  .motion-press:active {
+    transform: scale(0.98);
+  }
+}
+
+:root {
+  --motion-dur-fast: 150ms;
+  --motion-dur-base: 220ms;
+  --motion-ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --motion-ease-exit: cubic-bezier(0.3, 0, 1, 1);
+}
+
+@view-transition {
+  navigation: auto;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  ::view-transition-old(root),
+  ::view-transition-old(*.vt-page) {
+    animation: motion-vt-out 90ms var(--motion-ease-exit) forwards;
+  }
+
+  ::view-transition-new(root),
+  ::view-transition-new(*.vt-page) {
+    animation: motion-vt-in var(--motion-dur-base) var(--motion-ease-enter) both;
+  }
+
+  .vt-site-header {
+    view-transition-name: site-header;
+  }
+
+  .vt-dashboard-tabs {
+    view-transition-name: dashboard-tabs;
+  }
+
+  .vt-compare-title {
+    view-transition-name: compare-title;
+  }
+}
+
+@keyframes motion-vt-out {
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes motion-vt-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*),
+  ::view-transition-image-pair(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation-duration: 0.01ms !important;
+  }
+}
+
+.motion-stale {
+  transition: opacity var(--motion-dur-fast) ease;
+}
+
+.motion-stale[data-stale='true'] {
+  opacity: 0.55;
+}
+
+.motion-nav-pending[data-pending='true'] {
+  opacity: 0.6;
+}
+
+/* A 1px bar stretched with scaleX, so the move animates transform only. */
+.tab-indicator {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 1px;
+  height: 2px;
+  transform-origin: left center;
+  will-change: transform;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .tab-indicator {
+    transition: transform var(--motion-dur-base) var(--motion-ease-standard);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .motion-pop-in {
+    animation: motion-pop-in var(--motion-dur-fast) var(--motion-ease-enter) both;
+  }
+}
+
+@keyframes motion-pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* A page-load entrance that needs no script: fade and rise from the first paint, staggered
+   through --motion-delay. */
+@media (prefers-reduced-motion: no-preference) {
+  .motion-enter {
+    animation: motion-enter 500ms var(--motion-ease-enter) both;
+    animation-delay: var(--motion-delay, 0ms);
+  }
+}
+
+@keyframes motion-enter {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* An image that fades in once it loads: `data-loaded` starts false and its load event flips it. */
+@media (prefers-reduced-motion: no-preference) {
+  .motion-media {
+    transition: opacity var(--motion-dur-base) var(--motion-ease-enter);
+  }
+
+  .motion-media[data-loaded='false'] {
+    opacity: 0;
+  }
+}

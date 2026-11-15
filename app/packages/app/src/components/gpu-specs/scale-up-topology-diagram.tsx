@@ -1,0 +1,820 @@
+'use client';
+
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
+import * as d3 from 'd3';
+import { ChevronLeft, ChevronRight } from 'lucide-react';
+import { track } from '@/lib/analytics/analytics';
+import { useDialogCloseTracking } from '@/lib/analytics/use-dialog-close-tracking';
+import { isUnofficialHostname } from '@/lib/runtime/unofficial-domain';
+
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from '@/components/ui/dialog';
+import { Button } from '@/components/ui/button';
+import {
+  formatScaleUpTopology,
+  getScaleUpTopologyConfig,
+  type GpuSpec,
+  type ScaleUpTopologyConfig,
+} from '@/lib/catalog/gpu-specs';
+import { useLocale } from '@/lib/i18n/use-locale';
+
+const STRINGS = {
+  en: {
+    expand: 'Expand',
+    expandHint: 'Click to expand',
+    previous: 'Previous chip',
+    next: 'Next chip',
+    title: 'Scale-up topology',
+    diagram: 'scale-up topology diagram',
+    nodes: 'nodes',
+    chips: 'Chips',
+    interconnect: 'Interconnect:',
+    bandwidth: 'Bandwidth:',
+    topology: 'Topology:',
+    domain: 'Domain:',
+    perChip: 'per Chip (unidirectional)',
+    total: 'Chips total',
+    links: 'links',
+    node: 'Node',
+    chip: 'Chip',
+  },
+  zh: {
+    expand: '展开',
+    expandHint: '点击展开',
+    previous: '上一款芯片',
+    next: '下一款芯片',
+    title: '纵向扩展拓扑',
+    diagram: '纵向扩展拓扑图',
+    nodes: '个节点',
+    chips: '颗芯片',
+    interconnect: '互联技术：',
+    bandwidth: '带宽：',
+    topology: '拓扑：',
+    domain: '互联域：',
+    perChip: '每芯片（单向）',
+    total: '颗芯片',
+    links: '条链路',
+    node: '节点',
+    chip: '芯片',
+  },
+} as const;
+
+export interface ScaleUpTopologyDiagramHandle {
+  openDialog: () => void;
+}
+
+export const ScaleUpTopologyDiagram = forwardRef<
+  ScaleUpTopologyDiagramHandle,
+  { spec: GpuSpec; allSpecs: GpuSpec[] }
+>(({ spec, allSpecs }, ref) => {
+  const locale = useLocale();
+  const t = STRINGS[locale];
+  const [open, setOpen] = useState(false);
+  const [displayedIndex, setDisplayedIndex] = useState(0);
+  const displayedIndexRef = useRef(0);
+  displayedIndexRef.current = displayedIndex;
+
+  const compactConfig = getScaleUpTopologyConfig(spec);
+
+  const displayedSpec = allSpecs[displayedIndex] ?? spec;
+  useDialogCloseTracking(open, 'gpu_specs_scaleup_topology_closed', { gpu: displayedSpec.name });
+  const displayedConfig = getScaleUpTopologyConfig(displayedSpec);
+
+  const navigate = useCallback(
+    (direction: 'prev' | 'next') => {
+      const currentIdx = displayedIndexRef.current;
+      const newIdx =
+        direction === 'prev'
+          ? currentIdx > 0
+            ? currentIdx - 1
+            : allSpecs.length - 1
+          : currentIdx < allSpecs.length - 1
+            ? currentIdx + 1
+            : 0;
+      setDisplayedIndex(newIdx);
+      track('gpu_specs_scaleup_topology_navigated', {
+        gpu: allSpecs[newIdx].name,
+        direction,
+      });
+    },
+    [allSpecs],
+  );
+
+  useImperativeHandle(ref, () => ({
+    openDialog: () => {
+      const idx = allSpecs.findIndex((s) => s.name === spec.name);
+      setDisplayedIndex(Math.max(idx, 0));
+      setOpen(true);
+      track('gpu_specs_scaleup_topology_expanded', { gpu: spec.name });
+    },
+  }));
+
+  useEffect(() => {
+    if (!open) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        navigate('prev');
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        navigate('next');
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [open, navigate]);
+
+  return (
+    <div className="flex flex-col">
+      <div className="flex items-center gap-2 mb-2">
+        <h4 className="text-sm font-medium">{spec.name}</h4>
+        <span className="text-xs text-muted-foreground">
+          {formatScaleUpTopology(spec.scaleUpTopology, locale)} &middot; {compactConfig.techName}
+        </span>
+      </div>
+      <button
+        type="button"
+        className="cursor-pointer rounded-md hover:bg-muted/50 transition-colors p-1 -m-1"
+        onClick={() => {
+          const idx = allSpecs.findIndex((s) => s.name === spec.name);
+          setDisplayedIndex(Math.max(idx, 0));
+          setOpen(true);
+          track('gpu_specs_scaleup_topology_expanded', { gpu: spec.name });
+        }}
+        aria-label={`${t.expand} ${spec.name} ${t.diagram}`}
+      >
+        <ScaleUpTopologyD3 spec={spec} config={compactConfig} compact locale={locale} />
+        <p className="text-3xs text-muted-foreground mt-1 text-center">{t.expandHint}</p>
+      </button>
+
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="max-w-4xl w-[95vw]">
+          <div className="flex items-center gap-2 pr-6">
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => navigate('prev')}
+              aria-label={t.previous}
+              data-testid="scaleup-topology-nav-prev"
+            >
+              <ChevronLeft className="size-4" />
+            </Button>
+            <DialogHeader className="flex-1">
+              <DialogTitle>
+                {displayedSpec.name} {t.title}
+              </DialogTitle>
+              <DialogDescription>
+                {displayedSpec.scaleUpBandwidth}{' '}
+                {formatScaleUpTopology(displayedSpec.scaleUpTopology, locale)} &middot;{' '}
+                {displayedConfig.techName}
+                {displayedConfig.nodeCount > 1 &&
+                  ` · ${displayedConfig.nodeCount} ${t.nodes} × ${displayedConfig.gpusPerNode} ${t.chips}`}
+                <span className="ml-2 opacity-60">
+                  ({displayedIndex + 1} / {allSpecs.length})
+                </span>
+              </DialogDescription>
+            </DialogHeader>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => navigate('next')}
+              aria-label={t.next}
+              data-testid="scaleup-topology-nav-next"
+            >
+              <ChevronRight className="size-4" />
+            </Button>
+          </div>
+          <div className="overflow-x-auto">
+            <ScaleUpTopologyD3
+              spec={displayedSpec}
+              config={displayedConfig}
+              compact={false}
+              locale={locale}
+            />
+          </div>
+          <div className="text-xs text-muted-foreground space-y-1">
+            <p>
+              <span className="font-medium">{t.interconnect}</span> {displayedConfig.techName}
+            </p>
+            <p>
+              <span className="font-medium">{t.bandwidth}</span> {displayedSpec.scaleUpBandwidth}{' '}
+              {t.perChip}
+            </p>
+            <p>
+              <span className="font-medium">{t.topology}</span>{' '}
+              {formatScaleUpTopology(displayedSpec.scaleUpTopology, locale)}
+              {displayedConfig.switchCount > 0 && ` · ${displayedConfig.switchCount} NVSwitches`}
+              {displayedConfig.type === 'mesh' &&
+                ` · ${(displayedConfig.gpuCount * (displayedConfig.gpuCount - 1)) / 2} ${t.links}`}
+            </p>
+            {displayedConfig.nodeCount > 1 && (
+              <p>
+                <span className="font-medium">{t.domain}</span> {displayedConfig.nodeCount}{' '}
+                {t.nodes} × {displayedConfig.gpusPerNode} {t.chips} = {displayedConfig.gpuCount}{' '}
+                {t.total}
+              </p>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+});
+
+interface ScaleUpD3Props {
+  spec: GpuSpec;
+  config: ScaleUpTopologyConfig;
+  compact: boolean;
+  locale: 'en' | 'zh';
+}
+
+function ScaleUpTopologyD3({ spec, config, compact, locale }: ScaleUpD3Props) {
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!containerRef.current) return;
+
+    const container = d3.select(containerRef.current);
+    container.selectAll('*').remove();
+
+    if (config.type === 'mesh') {
+      renderMeshTopology(container, spec, config, compact, locale);
+    } else if (config.nodeCount > 1) {
+      renderSwitchedNvl72Topology(container, spec, config, compact, locale);
+    } else {
+      renderSwitchedTopology(container, spec, config, compact, locale);
+    }
+
+    return () => {
+      container.selectAll('*').remove();
+    };
+  }, [spec, config, compact, locale]);
+
+  return <div ref={containerRef} />;
+}
+
+function renderSwitchedTopology(
+  container: d3.Selection<HTMLDivElement, unknown, null, undefined>,
+  spec: GpuSpec,
+  config: ScaleUpTopologyConfig,
+  compact: boolean,
+  locale: 'en' | 'zh',
+) {
+  const { gpuCount, switchCount } = config;
+  const isNvidia = spec.vendor === 'nvidia';
+  const vendorColor = isNvidia ? '#76b900' : '#ed1c24';
+  const fontSize = compact ? '8px' : '11px';
+  const smallFont = compact ? '7px' : '9px';
+
+  const swBoxW = compact ? 52 : 72;
+  const swBoxH = compact ? 20 : 28;
+  const swGap = compact ? 10 : 16;
+
+  const gpuBoxW = compact ? 36 : 50;
+  const gpuBoxH = compact ? 18 : 24;
+  const gpuGap = compact ? 4 : 7;
+
+  const swRowW = switchCount * swBoxW + (switchCount - 1) * swGap;
+  const gpuRowW = gpuCount * gpuBoxW + (gpuCount - 1) * gpuGap;
+  const contentW = Math.max(swRowW, gpuRowW);
+  const padX = compact ? 12 : 20;
+  const totalW = contentW + 2 * padX;
+
+  const topPad = compact ? 8 : 14;
+  const swY = topPad;
+  const gap = compact ? 40 : 60;
+  const gpuY = swY + swBoxH + gap;
+  const bottomPad = compact ? 12 : 18;
+  const viewBoxH = gpuY + gpuBoxH + bottomPad;
+
+  const swStartX = padX + (contentW - swRowW) / 2;
+  const gpuStartX = padX + (contentW - gpuRowW) / 2;
+
+  const swPositions = Array.from({ length: switchCount }, (_, i) => ({
+    x: swStartX + i * (swBoxW + swGap),
+    cx: swStartX + i * (swBoxW + swGap) + swBoxW / 2,
+  }));
+  const gpuPositions = Array.from({ length: gpuCount }, (_, i) => ({
+    x: gpuStartX + i * (gpuBoxW + gpuGap),
+    cx: gpuStartX + i * (gpuBoxW + gpuGap) + gpuBoxW / 2,
+  }));
+
+  const svg = container
+    .append('svg')
+    .attr('viewBox', `0 0 ${totalW} ${viewBoxH}`)
+    .attr('class', compact ? 'w-full max-w-[500px]' : 'w-full min-w-[600px]')
+    .attr('role', 'img')
+    .attr(
+      'aria-label',
+      `${spec.name} ${formatScaleUpTopology(spec.scaleUpTopology, locale)} ${STRINGS[locale].diagram}`,
+    );
+
+  if (!isUnofficialHostname(window.location.hostname)) {
+    const patternId = `logo-scaleup-sw-${spec.name.replaceAll(/\s+/gu, '-')}-${compact ? 'c' : 'e'}`;
+    svg
+      .append('defs')
+      .append('pattern')
+      .attr('id', patternId)
+      .attr('patternUnits', 'userSpaceOnUse')
+      .attr('width', totalW)
+      .attr('height', viewBoxH)
+      .append('image')
+      .attr('href', '/brand/logo-color.webp')
+      .attr('width', totalW * 0.3)
+      .attr('height', viewBoxH * 0.3)
+      .attr('x', (totalW - totalW * 0.3) / 2)
+      .attr('y', (viewBoxH - viewBoxH * 0.3) / 2)
+      .attr('opacity', 0.1);
+
+    svg
+      .insert('rect', ':first-child')
+      .attr('width', totalW)
+      .attr('height', viewBoxH)
+      .attr('fill', `url(#${patternId})`);
+  }
+
+  const conns = svg.append('g').attr('class', 'connections');
+  for (const gpu of gpuPositions) {
+    for (const sw of swPositions) {
+      conns
+        .append('line')
+        .attr('x1', gpu.cx)
+        .attr('y1', gpuY)
+        .attr('x2', sw.cx)
+        .attr('y2', swY + swBoxH)
+        .attr('stroke', vendorColor)
+        .attr('stroke-opacity', 0.2)
+        .attr('stroke-width', compact ? 0.75 : 1);
+    }
+  }
+
+  const swGroup = svg.append('g').attr('class', 'nvswitches');
+  for (let i = 0; i < switchCount; i++) {
+    const pos = swPositions[i];
+    const g = swGroup.append('g');
+    g.append('rect')
+      .attr('x', pos.x)
+      .attr('y', swY)
+      .attr('width', swBoxW)
+      .attr('height', swBoxH)
+      .attr('rx', 4)
+      .attr('class', 'fill-muted stroke-muted-foreground/40')
+      .attr('stroke-width', 1);
+    g.append('text')
+      .attr('x', pos.cx)
+      .attr('y', swY + swBoxH / 2 + (compact ? 3 : 4))
+      .attr('text-anchor', 'middle')
+      .attr('class', 'fill-foreground font-medium')
+      .style('font-size', fontSize)
+      .text(`NVSwitch ${i}`);
+  }
+
+  const gpuGroup = svg.append('g').attr('class', 'gpus');
+  for (let i = 0; i < gpuCount; i++) {
+    const pos = gpuPositions[i];
+    const g = gpuGroup.append('g');
+    g.append('rect')
+      .attr('x', pos.x)
+      .attr('y', gpuY)
+      .attr('width', gpuBoxW)
+      .attr('height', gpuBoxH)
+      .attr('rx', 4)
+      .attr('fill', vendorColor)
+      .attr('fill-opacity', 0.15)
+      .attr('stroke', vendorColor)
+      .attr('stroke-width', 1)
+      .attr('stroke-opacity', 0.5);
+    g.append('text')
+      .attr('x', pos.cx)
+      .attr('y', gpuY + gpuBoxH / 2 + (compact ? 3 : 4))
+      .attr('text-anchor', 'middle')
+      .attr('class', 'font-medium')
+      .style('font-size', fontSize)
+      .attr('fill', vendorColor)
+      .text(`${STRINGS[locale].chip} ${i}`);
+  }
+
+  if (!compact) {
+    svg
+      .append('text')
+      .attr('x', totalW / 2)
+      .attr('y', viewBoxH - 4)
+      .attr('text-anchor', 'middle')
+      .attr('class', 'fill-muted-foreground')
+      .style('font-size', smallFont)
+      .html(
+        `${spec.scaleUpBandwidth} &middot; ${switchCount} NVSwitches &middot; ${formatScaleUpTopology(spec.scaleUpTopology, locale)}`,
+      );
+  }
+}
+
+function renderMeshTopology(
+  container: d3.Selection<HTMLDivElement, unknown, null, undefined>,
+  spec: GpuSpec,
+  config: ScaleUpTopologyConfig,
+  compact: boolean,
+  locale: 'en' | 'zh',
+) {
+  const { gpuCount } = config;
+  const vendorColor = '#ed1c24';
+  const fontSize = compact ? '8px' : '11px';
+  const smallFont = compact ? '7px' : '9px';
+
+  const gpuBoxW = compact ? 38 : 52;
+  const gpuBoxH = compact ? 18 : 24;
+
+  const radius = compact ? 70 : 110;
+  const cx = radius + gpuBoxW / 2 + (compact ? 10 : 16);
+  const cy = radius + gpuBoxH / 2 + (compact ? 10 : 16);
+  const totalW = cx * 2;
+  const totalH = cy * 2;
+
+  const gpuPositions = Array.from({ length: gpuCount }, (_, i) => {
+    const angle = (-3 * Math.PI) / 8 + (i * 2 * Math.PI) / gpuCount;
+    return {
+      x: cx + radius * Math.cos(angle) - gpuBoxW / 2,
+      y: cy + radius * Math.sin(angle) - gpuBoxH / 2,
+      cx: cx + radius * Math.cos(angle),
+      cy: cy + radius * Math.sin(angle),
+    };
+  });
+
+  const pairs: [number, number][] = [];
+  for (let i = 0; i < gpuCount; i++) {
+    for (let j = i + 1; j < gpuCount; j++) {
+      pairs.push([i, j]);
+    }
+  }
+
+  const svg = container
+    .append('svg')
+    .attr('viewBox', `0 0 ${totalW} ${totalH}`)
+    .attr(
+      'class',
+      compact ? 'w-full max-w-[300px] mx-auto' : 'w-full max-w-[400px] mx-auto min-w-[350px]',
+    )
+    .attr('role', 'img')
+    .attr(
+      'aria-label',
+      `${spec.name} ${formatScaleUpTopology(spec.scaleUpTopology, locale)} ${STRINGS[locale].diagram}`,
+    );
+
+  if (!isUnofficialHostname(window.location.hostname)) {
+    const patternId = `logo-scaleup-mesh-${spec.name.replaceAll(/\s+/gu, '-')}-${compact ? 'c' : 'e'}`;
+    svg
+      .append('defs')
+      .append('pattern')
+      .attr('id', patternId)
+      .attr('patternUnits', 'userSpaceOnUse')
+      .attr('width', totalW)
+      .attr('height', totalH)
+      .append('image')
+      .attr('href', '/brand/logo-color.webp')
+      .attr('width', totalW * 0.3)
+      .attr('height', totalH * 0.3)
+      .attr('x', (totalW - totalW * 0.3) / 2)
+      .attr('y', (totalH - totalH * 0.3) / 2)
+      .attr('opacity', 0.1);
+
+    svg
+      .insert('rect', ':first-child')
+      .attr('width', totalW)
+      .attr('height', totalH)
+      .attr('fill', `url(#${patternId})`);
+  }
+
+  const meshConns = svg.append('g').attr('class', 'mesh-connections');
+  for (const [i, j] of pairs) {
+    meshConns
+      .append('line')
+      .attr('x1', gpuPositions[i].cx)
+      .attr('y1', gpuPositions[i].cy)
+      .attr('x2', gpuPositions[j].cx)
+      .attr('y2', gpuPositions[j].cy)
+      .attr('stroke', vendorColor)
+      .attr('stroke-opacity', 0.2)
+      .attr('stroke-width', compact ? 1 : 1.5);
+  }
+
+  const gpuGroup = svg.append('g').attr('class', 'gpus');
+  for (let i = 0; i < gpuCount; i++) {
+    const pos = gpuPositions[i];
+    const g = gpuGroup.append('g');
+    g.append('rect')
+      .attr('x', pos.x)
+      .attr('y', pos.y)
+      .attr('width', gpuBoxW)
+      .attr('height', gpuBoxH)
+      .attr('rx', 4)
+      .style('fill', 'var(--card)');
+    g.append('rect')
+      .attr('x', pos.x)
+      .attr('y', pos.y)
+      .attr('width', gpuBoxW)
+      .attr('height', gpuBoxH)
+      .attr('rx', 4)
+      .attr('fill', vendorColor)
+      .attr('fill-opacity', 0.15)
+      .attr('stroke', vendorColor)
+      .attr('stroke-width', 1)
+      .attr('stroke-opacity', 0.5);
+    g.append('text')
+      .attr('x', pos.cx)
+      .attr('y', pos.cy + (compact ? 3 : 4))
+      .attr('text-anchor', 'middle')
+      .attr('class', 'font-medium')
+      .style('font-size', fontSize)
+      .attr('fill', vendorColor)
+      .text(`${STRINGS[locale].chip} ${i}`);
+  }
+
+  if (!compact) {
+    svg
+      .append('text')
+      .attr('x', cx)
+      .attr('y', cy)
+      .attr('text-anchor', 'middle')
+      .attr('dominant-baseline', 'middle')
+      .attr('class', 'fill-muted-foreground')
+      .style('font-size', smallFont)
+      .text(spec.scaleUpBandwidth);
+  }
+}
+
+function renderSwitchedNvl72Topology(
+  container: d3.Selection<HTMLDivElement, unknown, null, undefined>,
+  spec: GpuSpec,
+  config: ScaleUpTopologyConfig,
+  compact: boolean,
+  locale: 'en' | 'zh',
+) {
+  const { switchCount, gpusPerNode, nodeCount } = config;
+  const vendorColor = '#76b900';
+  const fontSize = compact ? '8px' : '10px';
+  const smallFont = compact ? '7px' : '9px';
+
+  const gpuBoxW = compact ? 30 : 42;
+  const gpuBoxH = compact ? 16 : 22;
+  const gpuGap = compact ? 4 : 8;
+  const nodePad = compact ? 6 : 10;
+  const nodeLabelH = compact ? 10 : 14;
+  const gpuRowW = gpusPerNode * gpuBoxW + (gpusPerNode - 1) * gpuGap;
+  const node1W = gpuRowW + 2 * nodePad;
+  const node1H = gpuBoxH + nodeLabelH + 2 * nodePad;
+
+  const absBoxW = compact ? 20 : 32;
+  const absBoxH = node1H;
+  const absGap = compact ? 4 : 6;
+  const dotsW = compact ? 14 : 22;
+  const absAreaW = 2 * absBoxW + absGap + dotsW + absGap;
+
+  const swBoxW = compact ? 42 : 58;
+  const swBoxH = compact ? 16 : 22;
+  const swGap = compact ? 4 : 6;
+  const swDotsW = compact ? 14 : 22;
+  const swRowW = 3 * swBoxW + 2 * swGap + swDotsW + swGap;
+
+  const nodeGap = compact ? 8 : 14;
+  const nodeAreaW = node1W + nodeGap + absAreaW;
+  const contentW = Math.max(nodeAreaW, swRowW);
+  const padX = compact ? 10 : 18;
+  const totalW = contentW + 2 * padX;
+
+  const topPad = compact ? 8 : 14;
+  const nodeY = topPad;
+  const vertGap = compact ? 32 : 48;
+  const swY = nodeY + node1H + vertGap;
+  const bottomPad = compact ? 14 : 20;
+  const viewBoxH = swY + swBoxH + bottomPad;
+
+  const nodeAreaStartX = padX + (contentW - nodeAreaW) / 2;
+  const node1X = nodeAreaStartX;
+  const gpuRowX = node1X + nodePad;
+  const gpuY = nodeY + nodeLabelH + nodePad;
+
+  const gpuPositions = Array.from({ length: gpusPerNode }, (_, i) => ({
+    x: gpuRowX + i * (gpuBoxW + gpuGap),
+    cx: gpuRowX + i * (gpuBoxW + gpuGap) + gpuBoxW / 2,
+  }));
+
+  const absStartX = node1X + node1W + nodeGap;
+  const abs2X = absStartX;
+  const absDotsX = abs2X + absBoxW + absGap + dotsW / 2;
+  const abs18X = absStartX + absBoxW + absGap + dotsW + absGap;
+
+  const swStartX = padX + (contentW - swRowW) / 2;
+  const sw1X = swStartX;
+  const sw2X = sw1X + swBoxW + swGap;
+  const swDotsX = sw2X + swBoxW + swGap + swDotsW / 2;
+  const sw18X = sw2X + swBoxW + swGap + swDotsW + swGap;
+  const swCenters = [sw1X + swBoxW / 2, sw2X + swBoxW / 2, sw18X + swBoxW / 2];
+
+  const svg = container
+    .append('svg')
+    .attr('viewBox', `0 0 ${totalW} ${viewBoxH}`)
+    .attr('class', compact ? 'w-full max-w-[500px]' : 'w-full min-w-[550px]')
+    .attr('role', 'img')
+    .attr(
+      'aria-label',
+      `${spec.name} ${formatScaleUpTopology(spec.scaleUpTopology, locale)} ${STRINGS[locale].diagram}`,
+    );
+
+  if (!isUnofficialHostname(window.location.hostname)) {
+    const patternId = `logo-scaleup-nvl72-${spec.name.replaceAll(/\s+/gu, '-')}-${compact ? 'c' : 'e'}`;
+    svg
+      .append('defs')
+      .append('pattern')
+      .attr('id', patternId)
+      .attr('patternUnits', 'userSpaceOnUse')
+      .attr('width', totalW)
+      .attr('height', viewBoxH)
+      .append('image')
+      .attr('href', '/brand/logo-color.webp')
+      .attr('width', totalW * 0.3)
+      .attr('height', viewBoxH * 0.3)
+      .attr('x', (totalW - totalW * 0.3) / 2)
+      .attr('y', (viewBoxH - viewBoxH * 0.3) / 2)
+      .attr('opacity', 0.1);
+
+    svg
+      .insert('rect', ':first-child')
+      .attr('width', totalW)
+      .attr('height', viewBoxH)
+      .attr('fill', `url(#${patternId})`);
+  }
+
+  const gpuSwConns = svg.append('g').attr('class', 'gpu-switch-connections');
+  for (const gpu of gpuPositions) {
+    for (const swCx of swCenters) {
+      gpuSwConns
+        .append('line')
+        .attr('x1', gpu.cx)
+        .attr('y1', gpuY + gpuBoxH)
+        .attr('x2', swCx)
+        .attr('y2', swY)
+        .attr('stroke', vendorColor)
+        .attr('stroke-opacity', 0.15)
+        .attr('stroke-width', compact ? 0.75 : 1);
+    }
+  }
+
+  const absSwConns = svg.append('g').attr('class', 'abs-switch-connections');
+  const absNodeCenters = [abs2X + absBoxW / 2, abs18X + absBoxW / 2];
+  for (const nx of absNodeCenters) {
+    for (const swCx of swCenters) {
+      absSwConns
+        .append('line')
+        .attr('x1', nx)
+        .attr('y1', nodeY + absBoxH)
+        .attr('x2', swCx)
+        .attr('y2', swY)
+        .attr('class', 'stroke-muted-foreground/10')
+        .attr('stroke-width', compact ? 0.5 : 0.75)
+        .attr('stroke-dasharray', '3 2');
+    }
+  }
+
+  svg
+    .append('rect')
+    .attr('x', node1X)
+    .attr('y', nodeY)
+    .attr('width', node1W)
+    .attr('height', node1H)
+    .attr('rx', 6)
+    .attr('class', 'fill-none stroke-muted-foreground/30')
+    .attr('stroke-width', 1)
+    .attr('stroke-dasharray', '4 2');
+  svg
+    .append('text')
+    .attr('x', node1X + nodePad)
+    .attr('y', nodeY + nodeLabelH - 2)
+    .attr('class', 'fill-muted-foreground')
+    .style('font-size', smallFont)
+    .style('font-weight', '500')
+    .text(`${STRINGS[locale].node} 0`);
+
+  const gpuGroup = svg.append('g').attr('class', 'gpus');
+  for (let i = 0; i < gpusPerNode; i++) {
+    const pos = gpuPositions[i];
+    const g = gpuGroup.append('g');
+    g.append('rect')
+      .attr('x', pos.x)
+      .attr('y', gpuY)
+      .attr('width', gpuBoxW)
+      .attr('height', gpuBoxH)
+      .attr('rx', 4)
+      .attr('fill', vendorColor)
+      .attr('fill-opacity', 0.15)
+      .attr('stroke', vendorColor)
+      .attr('stroke-width', 1)
+      .attr('stroke-opacity', 0.5);
+    g.append('text')
+      .attr('x', pos.cx)
+      .attr('y', gpuY + gpuBoxH / 2 + (compact ? 3 : 4))
+      .attr('text-anchor', 'middle')
+      .attr('class', 'font-medium')
+      .style('font-size', fontSize)
+      .attr('fill', vendorColor)
+      .text(`${STRINGS[locale].chip} ${i}`);
+  }
+
+  const absGroup = svg.append('g').attr('class', 'abstracted-nodes');
+
+  absGroup
+    .append('rect')
+    .attr('x', abs2X)
+    .attr('y', nodeY)
+    .attr('width', absBoxW)
+    .attr('height', absBoxH)
+    .attr('rx', 4)
+    .attr('class', 'fill-muted/30 stroke-muted-foreground/20')
+    .attr('stroke-width', 1);
+  absGroup
+    .append('text')
+    .attr('x', abs2X + absBoxW / 2)
+    .attr('y', nodeY + absBoxH / 2 + 3)
+    .attr('text-anchor', 'middle')
+    .attr('class', 'fill-muted-foreground')
+    .style('font-size', smallFont)
+    .text('1');
+
+  absGroup
+    .append('text')
+    .attr('x', absDotsX)
+    .attr('y', nodeY + absBoxH / 2 + 3)
+    .attr('text-anchor', 'middle')
+    .attr('class', 'fill-muted-foreground/60')
+    .style('font-size', fontSize)
+    .html('&bull;&bull;&bull;');
+
+  absGroup
+    .append('rect')
+    .attr('x', abs18X)
+    .attr('y', nodeY)
+    .attr('width', absBoxW)
+    .attr('height', absBoxH)
+    .attr('rx', 4)
+    .attr('class', 'fill-muted/30 stroke-muted-foreground/20')
+    .attr('stroke-width', 1);
+  absGroup
+    .append('text')
+    .attr('x', abs18X + absBoxW / 2)
+    .attr('y', nodeY + absBoxH / 2 + 3)
+    .attr('text-anchor', 'middle')
+    .attr('class', 'fill-muted-foreground')
+    .style('font-size', smallFont)
+    .text(`${nodeCount - 1}`);
+
+  const swGroup = svg.append('g').attr('class', 'nvswitches');
+  const switchItems = [
+    { x: sw1X, label: 'NVSwitch 0' },
+    { x: sw2X, label: 'NVSwitch 1' },
+    { x: sw18X, label: `NVSwitch ${switchCount - 1}` },
+  ];
+
+  for (const sw of switchItems) {
+    const g = swGroup.append('g');
+    g.append('rect')
+      .attr('x', sw.x)
+      .attr('y', swY)
+      .attr('width', swBoxW)
+      .attr('height', swBoxH)
+      .attr('rx', 4)
+      .attr('class', 'fill-muted stroke-muted-foreground/40')
+      .attr('stroke-width', 1);
+    g.append('text')
+      .attr('x', sw.x + swBoxW / 2)
+      .attr('y', swY + swBoxH / 2 + (compact ? 3 : 4))
+      .attr('text-anchor', 'middle')
+      .attr('class', 'fill-foreground font-medium')
+      .style('font-size', smallFont)
+      .text(sw.label);
+  }
+
+  svg
+    .append('text')
+    .attr('x', swDotsX)
+    .attr('y', swY + swBoxH / 2 + 3)
+    .attr('text-anchor', 'middle')
+    .attr('class', 'fill-muted-foreground/60')
+    .style('font-size', fontSize)
+    .html('&bull;&bull;&bull;');
+
+  if (!compact) {
+    svg
+      .append('text')
+      .attr('x', totalW / 2)
+      .attr('y', viewBoxH - 4)
+      .attr('text-anchor', 'middle')
+      .attr('class', 'fill-muted-foreground')
+      .style('font-size', smallFont)
+      .html(
+        `${spec.scaleUpBandwidth} &middot; ${switchCount} NVSwitches &middot; ${nodeCount} ${STRINGS[locale].nodes} &times; ${gpusPerNode} ${STRINGS[locale].chips}`,
+      );
+  }
+}

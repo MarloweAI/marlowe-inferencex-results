@@ -1,0 +1,607 @@
+import { describe, it, expect } from 'vitest';
+import { configCacheKey } from './config-cache';
+import { mapEvalRow, mapAggEvalRow } from './eval-mapper';
+import { createSkipTracker } from './skip-tracker';
+
+function makeMeta(overrides: Record<string, any> = {}): Record<string, any> {
+  return {
+    infmax_model_prefix: 'dsr1',
+    hw: 'h200-nv',
+    framework: 'vllm',
+    precision: 'fp8',
+    tp: 8,
+    ep: 1,
+    isl: 1024,
+    osl: 8192,
+    conc: 64,
+    ...overrides,
+  };
+}
+
+function makeResults(overrides: Record<string, any> = {}): Record<string, any> {
+  return {
+    lm_eval_version: '0.4.7',
+    results: {
+      gsm8k: {
+        'exact_match,strict-match': 0.85,
+        'exact_match_stderr,strict-match': 0.01,
+        'exact_match,flexible-extract': 0.9,
+        'exact_match_stderr,flexible-extract': 0.008,
+        alias: 'gsm8k',
+      },
+    },
+    'n-samples': {
+      gsm8k: { effective: 1000 },
+    },
+    ...overrides,
+  };
+}
+
+function makeAggRow(overrides: Record<string, any> = {}): Record<string, any> {
+  return {
+    infmax_model_prefix: 'dsr1',
+    hw: 'h200-nv',
+    framework: 'vllm',
+    precision: 'fp8',
+    tp: 8,
+    ep: 1,
+    task: 'gsm8k',
+    em_strict: 0.85,
+    em_strict_se: 0.01,
+    em_flexible: 0.9,
+    em_flexible_se: 0.008,
+    n_eff: 1000,
+    source: 'eval_dsr1_1k8k_12345678.zip',
+    ...overrides,
+  };
+}
+
+describe('mapEvalRow', () => {
+  it('reassigns the framework for a registered run framework override', () => {
+    const meta = makeMeta({ infmax_model_prefix: 'qwen3.5', hw: 'tpuv7', precision: 'fp8' });
+    const [overridden] = mapEvalRow(meta, makeResults(), createSkipTracker(), 40744397059);
+    expect(overridden.config.framework).toBe('llmd-vllm');
+    const [otherRun] = mapEvalRow(meta, makeResults(), createSkipTracker(), 40744397060);
+    expect(otherRun.config.framework).toBe('vllm');
+    const [noRun] = mapEvalRow(meta, makeResults(), createSkipTracker());
+    expect(noRun.config.framework).toBe('vllm');
+  });
+
+  it('maps valid meta + results to EvalParams array', () => {
+    const tracker = createSkipTracker();
+    const result = mapEvalRow(makeMeta(), makeResults(), tracker);
+
+    expect(result).toHaveLength(1);
+    const ev = result[0];
+    expect(ev.config.hardware).toBe('h200');
+    expect(ev.config.framework).toBe('vllm');
+    expect(ev.config.model).toBe('dsr1');
+    expect(ev.config.precision).toBe('fp8');
+    expect(ev.config.specMethod).toBe('none');
+    expect(ev.config.disagg).toBe(false);
+    expect(ev.task).toBe('gsm8k');
+    expect(ev.isl).toBe(1024);
+    expect(ev.osl).toBe(8192);
+    expect(ev.conc).toBe(64);
+    expect(ev.lmEvalVersion).toBe('0.4.7');
+  });
+
+  it('renames lm-eval metric keys to standardized names', () => {
+    const tracker = createSkipTracker();
+    const result = mapEvalRow(makeMeta(), makeResults(), tracker);
+    const metrics = result[0].metrics;
+
+    expect(metrics.em_strict).toBe(0.85);
+    expect(metrics.em_strict_se).toBe(0.01);
+    expect(metrics.em_flexible).toBe(0.9);
+    expect(metrics.em_flexible_se).toBe(0.008);
+  });
+
+  it('extracts n_eff from n-samples top-level dict', () => {
+    const tracker = createSkipTracker();
+    const result = mapEvalRow(makeMeta(), makeResults(), tracker);
+
+    expect(result[0].metrics.n_eff).toBe(1000);
+  });
+
+  it('excludes alias from metrics', () => {
+    const tracker = createSkipTracker();
+    const result = mapEvalRow(makeMeta(), makeResults(), tracker);
+
+    expect(result[0].metrics).not.toHaveProperty('alias');
+  });
+
+  it('returns multiple EvalParams for multiple tasks', () => {
+    const tracker = createSkipTracker();
+    const results = makeResults({
+      results: {
+        gsm8k: { 'exact_match,strict-match': 0.85 },
+        humaneval: { 'exact_match,strict-match': 0.42 },
+      },
+    });
+    const evs = mapEvalRow(makeMeta(), results, tracker);
+
+    expect(evs).toHaveLength(2);
+    const tasks = evs.map((e) => e.task).toSorted();
+    expect(tasks).toEqual(['gsm8k', 'humaneval']);
+  });
+
+  it('sets parallelism correctly (v1 single tp/ep)', () => {
+    const tracker = createSkipTracker();
+    const result = mapEvalRow(makeMeta({ tp: 4, ep: 2 }), makeResults(), tracker);
+    const cfg = result[0].config;
+
+    expect(cfg.prefillTp).toBe(4);
+    expect(cfg.prefillEp).toBe(2);
+    expect(cfg.decodeTp).toBe(4);
+    expect(cfg.decodeEp).toBe(2);
+    expect(cfg.numPrefillGpu).toBe(8);
+    expect(cfg.numDecodeGpu).toBe(8);
+  });
+
+  it('uses v2 prefill_*/decode_* when present on meta_env', () => {
+    const tracker = createSkipTracker();
+    const meta = makeMeta({
+      is_multinode: true,
+      tp: 4,
+      ep: 1,
+      prefill_tp: 4,
+      prefill_ep: 1,
+      prefill_dp_attention: 'true',
+      prefill_num_workers: 7,
+      decode_tp: 8,
+      decode_ep: 8,
+      decode_dp_attention: 'true',
+      decode_num_workers: 1,
+    });
+    const result = mapEvalRow(meta, makeResults(), tracker);
+    const cfg = result[0].config;
+
+    expect(cfg.isMultinode).toBe(true);
+    expect(cfg.disagg).toBe(true);
+    expect(cfg.prefillTp).toBe(4);
+    expect(cfg.prefillNumWorkers).toBe(7);
+    expect(cfg.decodeTp).toBe(8);
+    expect(cfg.decodeEp).toBe(8);
+    expect(cfg.decodeNumWorkers).toBe(1);
+  });
+
+  it('returns null isl/osl/conc when missing from meta', () => {
+    const tracker = createSkipTracker();
+    const meta = makeMeta();
+    delete meta.isl;
+    delete meta.osl;
+    delete meta.conc;
+    const result = mapEvalRow(meta, makeResults(), tracker);
+
+    expect(result[0].isl).toBeNull();
+    expect(result[0].osl).toBeNull();
+    expect(result[0].conc).toBeNull();
+  });
+
+  it('maps AgentX zero-length sentinels to the aggregate eval identity', () => {
+    const [individual] = mapEvalRow(
+      makeMeta({ isl: '0', osl: 0 }),
+      makeResults(),
+      createSkipTracker(),
+    );
+    const aggregate = mapAggEvalRow(
+      makeAggRow({ source: 'eval_dsr1_agentic/results.json', conc: 64 }),
+      createSkipTracker(),
+    )!;
+
+    expect([individual.isl, individual.osl]).toEqual([null, null]);
+    expect([individual.task, individual.isl, individual.osl, individual.conc]).toEqual([
+      aggregate.task,
+      aggregate.isl,
+      aggregate.osl,
+      aggregate.conc,
+    ]);
+    expect(configCacheKey(individual.config)).toBe(configCacheKey(aggregate.config));
+  });
+
+  it('returns null lmEvalVersion when missing from results', () => {
+    const tracker = createSkipTracker();
+    const results = makeResults();
+    delete results.lm_eval_version;
+    const ev = mapEvalRow(makeMeta(), results, tracker);
+
+    expect(ev[0].lmEvalVersion).toBeNull();
+  });
+
+  describe('edge cases', () => {
+    it('handles results with non-object results dict', () => {
+      const tracker = createSkipTracker();
+      const result = mapEvalRow(
+        makeMeta(),
+        { lm_eval_version: '0.4.7', results: 'invalid' },
+        tracker,
+      );
+
+      expect(result).toEqual([]);
+    });
+
+    it('handles task with no numeric metrics', () => {
+      const tracker = createSkipTracker();
+      const results = makeResults({
+        results: { gsm8k: { alias: 'gsm8k' } },
+      });
+      const evs = mapEvalRow(makeMeta(), results, tracker);
+
+      expect(evs).toHaveLength(1);
+      expect(evs[0].metrics).not.toHaveProperty('alias');
+    });
+
+    it('handles n-samples missing for a task', () => {
+      const tracker = createSkipTracker();
+      const results = makeResults({ 'n-samples': {} });
+      const evs = mapEvalRow(makeMeta(), results, tracker);
+
+      expect(evs).toHaveLength(1);
+      expect(evs[0].metrics).not.toHaveProperty('n_eff');
+    });
+
+    it('defaults to empty string when precision absent and flags as unmapped', () => {
+      const tracker = createSkipTracker();
+      const meta = makeMeta();
+      delete meta.precision;
+      const result = mapEvalRow(meta, makeResults(), tracker);
+
+      expect(result[0].config.precision).toBe('');
+      expect(tracker.unmappedPrecisions.has('')).toBe(true);
+    });
+
+    it('handles dp_attention as string "True"', () => {
+      const tracker = createSkipTracker();
+      const result = mapEvalRow(makeMeta({ dp_attention: 'True' }), makeResults(), tracker);
+
+      expect(result[0].config.prefillDpAttn).toBe(true);
+    });
+  });
+
+  describe('skip tracking', () => {
+    it('skips unmapped model and tracks it', () => {
+      const tracker = createSkipTracker();
+      const result = mapEvalRow(
+        makeMeta({ infmax_model_prefix: 'nonexistent', model: undefined }),
+        makeResults(),
+        tracker,
+      );
+
+      expect(result).toEqual([]);
+      expect(tracker.skips.unmappedModel).toBe(1);
+      expect(tracker.unmappedModels.has('nonexistent')).toBe(true);
+    });
+
+    it('skips unmapped hardware and tracks it', () => {
+      const tracker = createSkipTracker();
+      const result = mapEvalRow(makeMeta({ hw: 'imaginary-gpu' }), makeResults(), tracker);
+
+      expect(result).toEqual([]);
+      expect(tracker.skips.unmappedHw).toBe(1);
+      expect(tracker.unmappedHws.has('imaginary-gpu')).toBe(true);
+    });
+
+    it('returns empty array when results dict is missing', () => {
+      const tracker = createSkipTracker();
+      const result = mapEvalRow(makeMeta(), { lm_eval_version: '0.4.7' }, tracker);
+
+      expect(result).toEqual([]);
+    });
+
+    it('returns empty array when results dict is empty', () => {
+      const tracker = createSkipTracker();
+      const result = mapEvalRow(makeMeta(), { lm_eval_version: '0.4.7', results: {} }, tracker);
+
+      expect(result).toEqual([]);
+    });
+  });
+});
+
+function makeV2Row(overrides: Record<string, any> = {}): Record<string, any> {
+  return makeAggRow({
+    hw: 'B300',
+    framework: 'dynamo-trt',
+    is_multinode: true,
+    tp: 4,
+    ep: 1,
+    dp_attention: 'true',
+    prefill_tp: 4,
+    prefill_ep: 1,
+    prefill_dp_attention: 'true',
+    prefill_num_workers: 7,
+    decode_tp: 8,
+    decode_ep: 8,
+    decode_dp_attention: 'true',
+    decode_num_workers: 1,
+    conc: 3072,
+    ...overrides,
+  });
+}
+
+describe('mapAggEvalRow', () => {
+  it('maps a valid agg row to EvalParams', () => {
+    const tracker = createSkipTracker();
+    const result = mapAggEvalRow(makeAggRow(), tracker);
+
+    expect(result).not.toBeNull();
+    expect(result!.config.hardware).toBe('h200');
+    expect(result!.config.framework).toBe('vllm');
+    expect(result!.config.model).toBe('dsr1');
+    expect(result!.task).toBe('gsm8k');
+  });
+
+  it('parses ISL/OSL from source filename', () => {
+    const tracker = createSkipTracker();
+    const result = mapAggEvalRow(makeAggRow({ source: 'eval_dsr1_1k8k_12345678.zip' }), tracker);
+
+    expect(result!.isl).toBe(1024);
+    expect(result!.osl).toBe(8192);
+  });
+
+  it('returns null isl/osl when source is missing', () => {
+    const tracker = createSkipTracker();
+    const row = makeAggRow();
+    delete row.source;
+    const result = mapAggEvalRow(row, tracker);
+
+    expect(result!.isl).toBeNull();
+    expect(result!.osl).toBeNull();
+  });
+
+  it('captures standard eval metrics', () => {
+    const tracker = createSkipTracker();
+    const result = mapAggEvalRow(makeAggRow({ score: 0.92, score_se: 0.005 }), tracker);
+
+    expect(result!.metrics.em_strict).toBe(0.85);
+    expect(result!.metrics.em_flexible).toBe(0.9);
+    expect(result!.metrics.n_eff).toBe(1000);
+    expect(result!.metrics.score).toBe(0.92);
+    expect(result!.metrics.score_se).toBe(0.005);
+  });
+
+  it('lowercases task name', () => {
+    const tracker = createSkipTracker();
+    const result = mapAggEvalRow(makeAggRow({ task: 'GSM8K' }), tracker);
+
+    expect(result!.task).toBe('gsm8k');
+  });
+
+  it('sets parallelism from flat tp/ep fields', () => {
+    const tracker = createSkipTracker();
+    const result = mapAggEvalRow(makeAggRow({ tp: 4, ep: 2 }), tracker);
+
+    expect(result!.config.prefillTp).toBe(4);
+    expect(result!.config.prefillEp).toBe(2);
+    expect(result!.config.numPrefillGpu).toBe(8);
+    expect(result!.config.numDecodeGpu).toBe(8);
+  });
+
+  it('sets isMultinode to false when row omits it', () => {
+    const tracker = createSkipTracker();
+    const result = mapAggEvalRow(makeAggRow(), tracker);
+
+    expect(result!.config.isMultinode).toBe(false);
+  });
+
+  describe('v2 schema (disagg / multinode)', () => {
+    it('reads prefill_*/decode_* instead of top-level tp/ep', () => {
+      const tracker = createSkipTracker();
+      const result = mapAggEvalRow(makeV2Row(), tracker);
+      const cfg = result!.config;
+
+      expect(cfg.prefillTp).toBe(4);
+      expect(cfg.prefillEp).toBe(1);
+      expect(cfg.prefillNumWorkers).toBe(7);
+      expect(cfg.prefillDpAttn).toBe(true);
+      expect(cfg.decodeTp).toBe(8);
+      expect(cfg.decodeEp).toBe(8);
+      expect(cfg.decodeNumWorkers).toBe(1);
+      expect(cfg.decodeDpAttn).toBe(true);
+    });
+
+    it('preserves is_multinode', () => {
+      const tracker = createSkipTracker();
+      const result = mapAggEvalRow(makeV2Row(), tracker);
+
+      expect(result!.config.isMultinode).toBe(true);
+    });
+
+    it('marks disagg=true when is_multinode is set', () => {
+      const tracker = createSkipTracker();
+      const result = mapAggEvalRow(makeV2Row(), tracker);
+
+      expect(result!.config.disagg).toBe(true);
+    });
+
+    it('marks disagg=true when either side has num_workers > 0 (single-node disagg)', () => {
+      const tracker = createSkipTracker();
+      const result = mapAggEvalRow(
+        makeV2Row({ is_multinode: false, prefill_num_workers: 1, decode_num_workers: 2 }),
+        tracker,
+      );
+
+      expect(result!.config.disagg).toBe(true);
+    });
+
+    it('framework dynamo-trt forces disagg=true even with zero workers / not multinode', () => {
+      const tracker = createSkipTracker();
+      const result = mapAggEvalRow(
+        makeV2Row({ is_multinode: false, prefill_num_workers: 0, decode_num_workers: 0 }),
+        tracker,
+      );
+
+      expect(result!.config.disagg).toBe(true);
+    });
+
+    it.each(['dynamo-trt', 'mori-sglang'])(
+      'preserves explicit aggregate eval topology for %s',
+      (framework) => {
+        const tracker = createSkipTracker();
+        const result = mapAggEvalRow(
+          makeV2Row({
+            framework,
+            disagg: false,
+            prefill_tp: 8,
+            prefill_ep: 1,
+            prefill_num_workers: 1,
+            num_prefill_gpu: 16,
+            decode_tp: 0,
+            decode_ep: 0,
+            decode_num_workers: 0,
+            num_decode_gpu: 0,
+          }),
+          tracker,
+        );
+
+        expect(result!.config.framework).toBe(framework);
+        expect(result!.config.disagg).toBe(false);
+        expect(result!.config.isMultinode).toBe(true);
+        expect(result!.config.prefillTp).toBe(8);
+        expect(result!.config.decodeTp).toBe(8);
+        expect(result!.config.numPrefillGpu).toBe(16);
+        expect(result!.config.numDecodeGpu).toBe(16);
+      },
+    );
+
+    it('treats a decode worker pool as disaggregated despite a legacy false field', () => {
+      const tracker = createSkipTracker();
+      const result = mapAggEvalRow(makeV2Row({ disagg: false }), tracker);
+
+      expect(result!.config.disagg).toBe(true);
+    });
+
+    it('keeps disagg=false for a non-dynamo/mori framework with zero workers / not multinode', () => {
+      const tracker = createSkipTracker();
+      const result = mapAggEvalRow(
+        makeV2Row({
+          framework: 'vllm',
+          is_multinode: false,
+          prefill_num_workers: 0,
+          decode_num_workers: 0,
+        }),
+        tracker,
+      );
+
+      expect(result!.config.disagg).toBe(false);
+    });
+
+    it('reads explicit num_prefill_gpu / num_decode_gpu when present', () => {
+      const tracker = createSkipTracker();
+      const result = mapAggEvalRow(makeV2Row({ num_prefill_gpu: 28, num_decode_gpu: 64 }), tracker);
+
+      expect(result!.config.numPrefillGpu).toBe(28);
+      expect(result!.config.numDecodeGpu).toBe(64);
+    });
+
+    it('does not collide distinct disagg variants onto the same config key', () => {
+      const tracker = createSkipTracker();
+      const a = mapAggEvalRow(makeV2Row(), tracker)!.config;
+      const b = mapAggEvalRow(
+        makeV2Row({
+          prefill_tp: 2,
+          prefill_ep: 2,
+          prefill_num_workers: 11,
+          decode_tp: 4,
+          decode_ep: 4,
+          decode_num_workers: 3,
+        }),
+        tracker,
+      )!.config;
+
+      expect(configCacheKey(a)).not.toBe(configCacheKey(b));
+    });
+  });
+
+  describe('skip tracking', () => {
+    it('skips unmapped model', () => {
+      const tracker = createSkipTracker();
+      const result = mapAggEvalRow(
+        makeAggRow({ infmax_model_prefix: 'nonexistent', model: 'nonexistent' }),
+        tracker,
+      );
+
+      expect(result).toBeNull();
+      expect(tracker.skips.unmappedModel).toBe(1);
+    });
+
+    it('skips unmapped hardware', () => {
+      const tracker = createSkipTracker();
+      const result = mapAggEvalRow(makeAggRow({ hw: 'imaginary-gpu' }), tracker);
+
+      expect(result).toBeNull();
+      expect(tracker.skips.unmappedHw).toBe(1);
+    });
+
+    it('returns null when task is empty', () => {
+      const tracker = createSkipTracker();
+      const result = mapAggEvalRow(makeAggRow({ task: '' }), tracker);
+
+      expect(result).toBeNull();
+    });
+  });
+
+  describe('edge cases', () => {
+    it('does not reject whitespace-only task (no trim)', () => {
+      const tracker = createSkipTracker();
+      const result = mapAggEvalRow(makeAggRow({ task: '  ' }), tracker);
+
+      expect(result).not.toBeNull();
+      expect(result!.task).toBe('  ');
+    });
+
+    it('handles source with unparseable ISL/OSL format', () => {
+      const tracker = createSkipTracker();
+      const result = mapAggEvalRow(makeAggRow({ source: 'eval_dsr1_unknown_format.zip' }), tracker);
+
+      expect(result!.isl).toBeNull();
+      expect(result!.osl).toBeNull();
+    });
+
+    it('defaults to empty string when precision absent and flags as unmapped', () => {
+      const tracker = createSkipTracker();
+      const row = makeAggRow();
+      delete row.precision;
+      const result = mapAggEvalRow(row, tracker);
+
+      expect(result!.config.precision).toBe('');
+      expect(tracker.unmappedPrecisions.has('')).toBe(true);
+    });
+
+    it('skips undefined metric values', () => {
+      const tracker = createSkipTracker();
+      const row = makeAggRow();
+      delete row.em_strict;
+      delete row.em_strict_se;
+      const result = mapAggEvalRow(row, tracker);
+
+      expect(result!.metrics).not.toHaveProperty('em_strict');
+      expect(result!.metrics).not.toHaveProperty('em_strict_se');
+      expect(result!.metrics.em_flexible).toBe(0.9);
+    });
+  });
+
+  it('normalizes framework for agg row', () => {
+    const tracker = createSkipTracker();
+    const result = mapAggEvalRow(makeAggRow({ framework: 'sglang-disagg' }), tracker);
+
+    expect(result!.config.framework).toBe('mori-sglang');
+    expect(result!.config.disagg).toBe(true);
+  });
+
+  it('reads conc from agg row', () => {
+    const tracker = createSkipTracker();
+    const result = mapAggEvalRow(makeAggRow({ conc: 32 }), tracker);
+
+    expect(result!.conc).toBe(32);
+  });
+
+  it('returns null conc when absent', () => {
+    const tracker = createSkipTracker();
+    const row = makeAggRow();
+    delete row.conc;
+    const result = mapAggEvalRow(row, tracker);
+
+    expect(result!.conc).toBeNull();
+  });
+});

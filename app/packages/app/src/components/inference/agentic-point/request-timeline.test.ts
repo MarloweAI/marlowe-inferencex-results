@@ -1,0 +1,450 @@
+import { describe, expect, it } from 'vitest';
+
+import type { RequestRecord } from '@/hooks/api/use-request-timeline';
+
+import {
+  buildRequestTimelineRows,
+  computeStableRowIndex,
+  conversationHref,
+  parseTimelineViewSnapshot,
+  requestIdleStats,
+  shouldHandleTimelineBarClick,
+  splitTimelineCid,
+  timelineWheelZoomDirection,
+  type TimelineViewSnapshot,
+} from './request-timeline';
+
+const request = (start: number, end: number): RequestRecord => ({
+  cid: 'conversation',
+  ti: start,
+  wid: 'worker',
+  ad: 0,
+  phase: 'profiling',
+  credit: start,
+  start,
+  ack: null,
+  end,
+  ttftMs: null,
+  tpotMs: null,
+  isl: null,
+  osl: null,
+  cancelled: false,
+});
+
+describe('requestIdleStats', () => {
+  it('sums only gaps where no requests overlap', () => {
+    expect(
+      requestIdleStats([
+        request(0, 10),
+        request(5, 20),
+        request(30, 40),
+        request(35, 50),
+        request(70, 80),
+      ]),
+    ).toEqual({ idleNs: 30, spanNs: 80 });
+  });
+
+  it('handles unsorted and nested requests without double-counting busy time', () => {
+    expect(requestIdleStats([request(20, 30), request(0, 100), request(10, 40)])).toEqual({
+      idleNs: 0,
+      spanNs: 100,
+    });
+  });
+
+  it('does not count time before the first start or after the final end', () => {
+    expect(requestIdleStats([request(100, 200), request(300, 400)])).toEqual({
+      idleNs: 100,
+      spanNs: 300,
+    });
+  });
+
+  it('returns zeroes for an empty timeline', () => {
+    expect(requestIdleStats([])).toEqual({ idleNs: 0, spanNs: 0 });
+  });
+});
+
+describe('subagent timeline hierarchy', () => {
+  it('parses aux lanes separately from their parent subagent id', () => {
+    expect(splitTimelineCid('conv::sa:subagent_001_abcd:aux:011')).toEqual({
+      parent: 'conv',
+      subagentBase: 'subagent_001_abcd',
+      stream: null,
+      aux: '011',
+    });
+  });
+
+  it('renders aux requests as always-visible children of their subagent', () => {
+    const records = [
+      { ...request(0, 10), cid: 'conv' },
+      { ...request(10, 30), cid: 'conv::sa:subagent_001_abcd' },
+      { ...request(12, 20), cid: 'conv::sa:subagent_001_abcd:aux:011' },
+      { ...request(14, 24), cid: 'conv::sa:subagent_001_abcd:aux:012' },
+      { ...request(40, 50), cid: 'conv::sa:subagent_002_ef01' },
+    ];
+
+    const rows = buildRequestTimelineRows(records, 'conversation', new Set());
+    expect(rows.map(({ kind, depth }) => ({ kind, depth }))).toEqual([
+      { kind: 'parent', depth: 0 },
+      { kind: 'subagent', depth: 1 },
+      { kind: 'aux', depth: 2 },
+      { kind: 'aux', depth: 2 },
+      { kind: 'subagent', depth: 1 },
+    ]);
+    expect(rows[1]!.requests.map((record) => record.cid)).toEqual(['conv::sa:subagent_001_abcd']);
+    expect(rows[1]!.auxCount).toBe(2);
+    expect(rows[2]!.label).toBe('aux 011 · parallel');
+    expect(rows[3]!.label).toBe('aux 012 · parallel');
+  });
+
+  it('keeps aux lanes visible while primary streams remain collapsed', () => {
+    const records = [
+      { ...request(10, 20), cid: 'conv::sa:subagent_001_abcd:s0' },
+      { ...request(12, 22), cid: 'conv::sa:subagent_001_abcd:s1' },
+      { ...request(14, 18), cid: 'conv::sa:subagent_001_abcd:aux:001' },
+    ];
+
+    const rows = buildRequestTimelineRows(records, 'conversation', new Set());
+    expect(rows.map((row) => row.kind)).toEqual(['parent', 'subagent', 'aux']);
+    expect(rows[1]!.requests).toHaveLength(2);
+    expect(rows[2]!.requests).toHaveLength(1);
+  });
+
+  it('parses aux lanes hanging directly off the main conversation', () => {
+    expect(splitTimelineCid('conv::aux:000')).toEqual({
+      parent: 'conv',
+      subagentBase: null,
+      stream: null,
+      aux: '000',
+    });
+    expect(splitTimelineCid('conv::aux:red:002')).toEqual({
+      parent: 'conv',
+      subagentBase: null,
+      stream: null,
+      aux: 'red:002',
+    });
+    expect(splitTimelineCid('conv::sa:subagent_001_abcd:aux:red:002')).toEqual({
+      parent: 'conv',
+      subagentBase: 'subagent_001_abcd',
+      stream: null,
+      aux: 'red:002',
+    });
+  });
+
+  it('nests main-agent aux lanes under the parent conversation row', () => {
+    const records = [
+      { ...request(0, 10), cid: 'conv' },
+      { ...request(2, 8), cid: 'conv::aux:001' },
+      { ...request(4, 12), cid: 'conv::aux:red:002' },
+      { ...request(20, 30), cid: 'conv::sa:subagent_001_abcd' },
+    ];
+
+    const rows = buildRequestTimelineRows(records, 'conversation', new Set());
+    expect(rows.map(({ kind, depth }) => ({ kind, depth }))).toEqual([
+      { kind: 'parent', depth: 0 },
+      { kind: 'aux', depth: 1 },
+      { kind: 'aux', depth: 1 },
+      { kind: 'subagent', depth: 1 },
+    ]);
+    expect(rows[0]!.requests.map((record) => record.cid)).toEqual(['conv']);
+    expect(rows[1]!.label).toBe('aux 001 · parallel');
+    expect(rows[1]!.parentRowKey).toBe('conv');
+    expect(rows[2]!.label).toBe('aux red:002 · parallel');
+    expect(rows[1]!.color).toBe(rows[0]!.color);
+    expect(rows[2]!.color).toBe(rows[0]!.color);
+  });
+
+  it('groups main-agent aux requests with their parent for stable order/color', () => {
+    const records = [
+      { ...request(50, 60), cid: 'other' },
+      { ...request(0, 10), cid: 'conv::aux:000' },
+      { ...request(5, 15), cid: 'conv' },
+    ];
+    const index = computeStableRowIndex(records, 'conversation');
+    expect([...index.keys()].toSorted()).toEqual(['conv', 'other']);
+    expect(index.get('conv')).toBe(0);
+    expect(index.get('other')).toBe(1);
+  });
+
+  it('deep-links a main-agent aux request to the parent conversation without sa', () => {
+    expect(conversationHref('slug', { ...request(0, 10), cid: 'abc123::aux:red:002', ti: 3 })).toBe(
+      '/infx/agentx/slug/conversations/abc123?turn=3',
+    );
+  });
+});
+
+describe('reused conversation replay lanes', () => {
+  it('renders overlapping replays of one source conversation on separate rows', () => {
+    const records = [
+      { ...request(0, 100), cid: 'reused-conversation', ti: 26, ri: 0 },
+      { ...request(110, 180), cid: 'reused-conversation', ti: 27, ri: 0 },
+      { ...request(50, 140), cid: 'reused-conversation', ti: 40, ri: 1 },
+      {
+        ...request(70, 120),
+        cid: 'reused-conversation::sa:subagent_001_abcd',
+        ti: 40,
+        ri: 1,
+      },
+    ];
+
+    const rows = buildRequestTimelineRows(records, 'conversation', new Set());
+    const parents = rows.filter((row) => row.kind === 'parent');
+    expect(parents.map((row) => row.label)).toEqual([
+      'reused-conversation · replay 1',
+      'reused-conversation · replay 2',
+    ]);
+    expect(parents.map((row) => row.requests.map((record) => record.ti))).toEqual([[26, 27], [40]]);
+    expect(rows.find((row) => row.kind === 'subagent')?.key).toContain('replay-lane:1');
+  });
+
+  it('localizes replay labels in the Chinese timeline', () => {
+    const rows = buildRequestTimelineRows(
+      [{ ...request(0, 10), cid: 'conversation', ri: 2 }],
+      'conversation',
+      new Set(),
+      undefined,
+      'zh',
+    );
+    expect(rows[0]?.label).toBe('conversation · 重放 3');
+  });
+
+  it('keeps a replay lane stable across warmup and profiling filters', () => {
+    const records = [
+      { ...request(0, 10), cid: 'conversation', ri: 0, phase: 'warmup' },
+      { ...request(100, 110), cid: 'conversation', ri: 0, phase: 'profiling' },
+      { ...request(50, 60), cid: 'conversation', ri: 1, phase: 'profiling' },
+    ];
+    const index = computeStableRowIndex(records, 'conversation');
+    const warmup = buildRequestTimelineRows(
+      records.filter((record) => record.phase === 'warmup'),
+      'conversation',
+      new Set(),
+      index,
+    );
+    const profiling = buildRequestTimelineRows(
+      records.filter((record) => record.phase === 'profiling'),
+      'conversation',
+      new Set(),
+      index,
+    );
+
+    expect(warmup[0]?.label).toBe('conversation · replay 1');
+    expect(profiling[0]?.label).toBe('conversation · replay 1');
+    expect(warmup[0]?.color).toBe(profiling[0]?.color);
+  });
+});
+
+describe('conversationHref', () => {
+  it('builds a turn-carrying dataset link for a main-conversation request', () => {
+    expect(
+      conversationHref('cc-traces-weka-062126', { ...request(0, 10), cid: 'abc123', ti: 4 }),
+    ).toBe('/infx/agentx/cc-traces-weka-062126/conversations/abc123?turn=4');
+  });
+
+  it('keeps Chinese conversation links inside the /zh tree', () => {
+    expect(
+      conversationHref('cc-traces-weka-062126', { ...request(0, 10), cid: 'abc123', ti: 4 }, 'zh'),
+    ).toBe('/zh/infx/agentx/cc-traces-weka-062126/conversations/abc123?turn=4');
+  });
+
+  it('carries the subagent id and strips the ::sa suffix from the conv id', () => {
+    expect(
+      conversationHref('slug', {
+        ...request(0, 10),
+        cid: 'abc123::sa:subagent_001_bf1c5c16:s2',
+        ti: 7,
+      }),
+    ).toBe('/infx/agentx/slug/conversations/abc123?turn=7&sa=subagent_001_bf1c5c16');
+  });
+
+  it('uses raw source provenance for flattened-agent dataset links', () => {
+    expect(
+      conversationHref('slug', {
+        ...request(0, 10),
+        cid: '02bc0afb13f7a2d9efa86c28511261d85c0e::fa:003',
+        ti: 3,
+        srcTrace: '02bc0afb13f7a2d9efa86c28511261d85c0e',
+        srcOuter: 204,
+        srcKind: 'weka_flat',
+      }),
+    ).toBe('/infx/agentx/slug/conversations/02bc0afb13f7a2d9efa86c28511261d85c0e?turn=3&raw=204');
+  });
+
+  it('uses raw nested source provenance for subagent child links', () => {
+    expect(
+      conversationHref('slug', {
+        ...request(0, 10),
+        cid: '117ebe75819d050f308a0a81647893abd02d::sa:subagent_010_32ee2daa',
+        ti: 16,
+        srcTrace: '117ebe75819d050f308a0a81647893abd02d',
+        srcOuter: 39,
+        srcInner: 16,
+        srcKind: 'weka_subagent',
+      }),
+    ).toBe(
+      '/infx/agentx/slug/conversations/117ebe75819d050f308a0a81647893abd02d?turn=16&raw=39&inner=16',
+    );
+  });
+});
+
+describe('shouldHandleTimelineBarClick', () => {
+  it('uses SPA navigation only for an unmodified primary-button click', () => {
+    expect(shouldHandleTimelineBarClick({ button: 0 })).toBe(true);
+    expect(shouldHandleTimelineBarClick({ button: 0, metaKey: true })).toBe(false);
+    expect(shouldHandleTimelineBarClick({ button: 0, ctrlKey: true })).toBe(false);
+    expect(shouldHandleTimelineBarClick({ button: 0, shiftKey: true })).toBe(false);
+    expect(shouldHandleTimelineBarClick({ button: 0, altKey: true })).toBe(false);
+    expect(shouldHandleTimelineBarClick({ button: 1 })).toBe(false);
+  });
+});
+
+describe('timelineWheelZoomDirection', () => {
+  it('reports the same direction the zoom step applies, including horizontal-only wheels', () => {
+    expect(timelineWheelZoomDirection({ deltaX: 0, deltaY: -100 })).toBe('in');
+    expect(timelineWheelZoomDirection({ deltaX: 0, deltaY: 100 })).toBe('out');
+    // Shift+wheel on many platforms arrives as deltaX with deltaY === 0.
+    expect(timelineWheelZoomDirection({ deltaX: 100, deltaY: 0 })).toBe('out');
+    expect(timelineWheelZoomDirection({ deltaX: -100, deltaY: 0 })).toBe('in');
+    // Vertical wins when both are present.
+    expect(timelineWheelZoomDirection({ deltaX: 100, deltaY: -100 })).toBe('in');
+  });
+});
+
+const rec = (
+  cid: string,
+  phase: RequestRecord['phase'],
+  start: number,
+  end: number,
+): RequestRecord => ({ ...request(start, end), cid, phase });
+
+describe('stable row order + color across phase filters', () => {
+  const full: RequestRecord[] = [
+    rec('A', 'warmup', 0, 5),
+    rec('A', 'profiling', 100, 110),
+    rec('B', 'warmup', 10, 15),
+    rec('B', 'profiling', 120, 130),
+    rec('C', 'profiling', 50, 60),
+  ];
+
+  it('keeps each conversation in the same position and color when the phase changes', () => {
+    const index = computeStableRowIndex(full, 'conversation');
+    const warmupRows = buildRequestTimelineRows(
+      full.filter((r) => r.phase === 'warmup'),
+      'conversation',
+      new Set(),
+      index,
+    ).filter((r) => r.kind === 'parent');
+    const profilingRows = buildRequestTimelineRows(
+      full.filter((r) => r.phase === 'profiling'),
+      'conversation',
+      new Set(),
+      index,
+    ).filter((r) => r.kind === 'parent');
+
+    expect(warmupRows.map((r) => r.label)).toEqual(['A', 'B']);
+    expect(profilingRows.map((r) => r.label)).toEqual(['A', 'B', 'C']);
+
+    const warmupColors = Object.fromEntries(warmupRows.map((r) => [r.label, r.color]));
+    const profilingColors = Object.fromEntries(profilingRows.map((r) => [r.label, r.color]));
+    expect(warmupColors.A).toBe(profilingColors.A);
+    expect(warmupColors.B).toBe(profilingColors.B);
+    expect(warmupColors.A).not.toBe(warmupColors.B);
+  });
+
+  it('phase-spanning conversations occupy the same ABSOLUTE row in both phase views', () => {
+    const data: RequestRecord[] = [
+      rec('W1', 'warmup', 0, 2),
+      rec('W2', 'warmup', 3, 4),
+      rec('A', 'warmup', 5, 8),
+      rec('A', 'profiling', 100, 110),
+      rec('B', 'warmup', 10, 15),
+      rec('B', 'profiling', 120, 130),
+      rec('P', 'profiling', 50, 60),
+    ];
+    const index = computeStableRowIndex(data, 'conversation');
+    const parentLabels = (phase: RequestRecord['phase']) =>
+      buildRequestTimelineRows(
+        data.filter((r) => r.phase === phase),
+        'conversation',
+        new Set(),
+        index,
+      )
+        .filter((r) => r.kind === 'parent')
+        .map((r) => r.label);
+    expect(parentLabels('warmup')).toEqual(['A', 'B', 'W1', 'W2']);
+    expect(parentLabels('profiling')).toEqual(['A', 'B', 'P']);
+  });
+
+  it('without a shared index, the same subset re-sorts by its own start times (regression guard)', () => {
+    const profilingOnly = buildRequestTimelineRows(
+      full.filter((r) => r.phase === 'profiling'),
+      'conversation',
+      new Set(),
+    ).filter((r) => r.kind === 'parent');
+    expect(profilingOnly.map((r) => r.label)).toEqual(['C', 'A', 'B']);
+  });
+});
+
+describe('parseTimelineViewSnapshot', () => {
+  const full: TimelineViewSnapshot = {
+    viewStart: 1_000,
+    viewEnd: 5_000,
+    rowMode: 'worker',
+    phaseFilter: 'warmup',
+    expanded: ['conv::sa:subagent_001_abcd'],
+    scrollTop: 240,
+    scrollLeft: 80,
+  };
+
+  it('round-trips a full snapshot', () => {
+    expect(parseTimelineViewSnapshot(JSON.stringify(full))).toEqual(full);
+  });
+
+  it('round-trips the profiling phase and rejects the removed "all" value', () => {
+    expect(
+      parseTimelineViewSnapshot(JSON.stringify({ ...full, phaseFilter: 'profiling' }))?.phaseFilter,
+    ).toBe('profiling');
+    expect(
+      parseTimelineViewSnapshot(JSON.stringify({ ...full, phaseFilter: 'all' }))?.phaseFilter,
+    ).toBe('profiling');
+  });
+
+  it('returns null for absent or unparseable input', () => {
+    expect(parseTimelineViewSnapshot(null)).toBeNull();
+    expect(parseTimelineViewSnapshot('')).toBeNull();
+    expect(parseTimelineViewSnapshot('{not json')).toBeNull();
+    expect(parseTimelineViewSnapshot('42')).toBeNull();
+  });
+
+  it('preserves a null viewEnd (not zoomed) and rejects non-finite viewEnd', () => {
+    const restored = parseTimelineViewSnapshot(JSON.stringify({ ...full, viewEnd: null }));
+    expect(restored?.viewEnd).toBeNull();
+    expect(parseTimelineViewSnapshot('{"viewEnd":"oops"}')?.viewEnd).toBeNull();
+  });
+
+  it('falls back to defaults for invalid enums and missing numbers', () => {
+    expect(parseTimelineViewSnapshot('{}')).toEqual({
+      viewStart: 0,
+      viewEnd: null,
+      rowMode: 'conversation',
+      phaseFilter: 'profiling',
+      expanded: [],
+      scrollTop: 0,
+      scrollLeft: 0,
+    });
+    const bogus = parseTimelineViewSnapshot(
+      JSON.stringify({ rowMode: 'nope', phaseFilter: 'nope', viewStart: 'x', scrollTop: null }),
+    )!;
+    expect(bogus.rowMode).toBe('conversation');
+    expect(bogus.phaseFilter).toBe('profiling');
+    expect(bogus.viewStart).toBe(0);
+    expect(bogus.scrollTop).toBe(0);
+  });
+
+  it('drops non-string entries from the expanded list', () => {
+    expect(parseTimelineViewSnapshot('{"expanded":["a",1,null,"b"]}')!.expanded).toEqual([
+      'a',
+      'b',
+    ]);
+    expect(parseTimelineViewSnapshot('{"expanded":"nope"}')!.expanded).toEqual([]);
+  });
+});

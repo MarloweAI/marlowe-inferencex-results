@@ -1,0 +1,353 @@
+'use client';
+
+import { useMemo, useState } from 'react';
+import { usePathname, useRouter } from 'next/navigation';
+import { ChevronLeft, ChevronRight } from 'lucide-react';
+
+import type { BenchmarkSibling, BenchmarkSku } from '@/hooks/api/use-benchmark-siblings';
+import {
+  meaningfulParallelismSize,
+  parallelismLabel,
+} from '@/components/inference/utils/parallelism-label';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { Button } from '@/components/ui/button';
+import { cn } from '@/lib/shared/utils';
+import { track } from '@/lib/analytics/analytics';
+import { isZhPathname, ZH_PREFIX } from '@/lib/i18n/i18n';
+import { useLocale } from '@/lib/i18n/use-locale';
+import { getDashboardRoute } from '@/lib/routing/dashboard-routes';
+
+const HW_LABELS: Record<string, string> = {
+  b200: 'B200',
+  b300: 'B300',
+  gb200: 'GB200',
+  gb300: 'GB300',
+  h100: 'H100',
+  h200: 'H200',
+  mi300x: 'MI300X',
+  mi325x: 'MI325X',
+  mi355x: 'MI355X',
+};
+
+const MODEL_LABELS: Record<string, string> = {
+  dsr1: 'DeepSeek R1',
+  dsv4: 'DeepSeek V4 Pro',
+  glm5: 'GLM-5',
+  'glm5.1': 'GLM-5.1',
+  gptoss120b: 'gpt-oss 120B',
+  kimik2: 'Kimi K2',
+  'kimik2.5': 'Kimi K2.5',
+  'kimik2.6': 'Kimi K2.6',
+  llama70b: 'Llama 3.3 70B',
+  'minimaxm2.5': 'MiniMax M2.5',
+  'minimaxm2.7': 'MiniMax M2.7',
+  'qwen3.5': 'Qwen 3.5',
+};
+
+function hwLabel(hw: string) {
+  return HW_LABELS[hw] ?? hw.toUpperCase();
+}
+function modelLabel(m: string) {
+  return MODEL_LABELS[m] ?? m;
+}
+function frameworkLabel(fw: string) {
+  if (fw === 'vllm') return 'vLLM';
+  if (fw === 'sglang') return 'SGLang';
+  if (fw === 'trt') return 'TRT';
+  if (fw === 'mori-sglang') return 'Mori-SGLang';
+  if (fw.startsWith('dynamo-')) return `Dynamo ${fw.slice('dynamo-'.length).toUpperCase()}`;
+  return fw;
+}
+
+export function chipLabel(s: BenchmarkSibling): string {
+  const usePrefill =
+    !s.disagg &&
+    (s.decode_tp <= 0 ||
+      s.decode_ep <= 0 ||
+      (s.decode_num_workers <= 0 &&
+        s.num_decode_gpu <= 0 &&
+        (s.prefill_num_workers > 0 || s.num_prefill_gpu > 0)));
+  const aggregatePp =
+    !s.disagg && (s.prefill_pp !== null || s.decode_pp !== null)
+      ? Math.max(s.prefill_pp ?? 1, s.decode_pp ?? 1)
+      : undefined;
+  const aggregateDcp = s.disagg
+    ? undefined
+    : meaningfulParallelismSize(s.prefill_dcp_size, s.decode_dcp_size);
+  const aggregatePcp = s.disagg
+    ? undefined
+    : meaningfulParallelismSize(s.prefill_pcp_size, s.decode_pcp_size);
+  const parallel = parallelismLabel({
+    tp: usePrefill ? s.prefill_tp : s.decode_tp,
+    ep: usePrefill ? s.prefill_ep : s.decode_ep,
+    pp: s.disagg
+      ? usePrefill
+        ? (s.prefill_pp ?? undefined)
+        : (s.decode_pp ?? undefined)
+      : aggregatePp,
+    dcp: s.disagg
+      ? usePrefill
+        ? (s.prefill_dcp_size ?? undefined)
+        : (s.decode_dcp_size ?? undefined)
+      : aggregateDcp,
+    pcp: s.disagg
+      ? usePrefill
+        ? (s.prefill_pcp_size ?? undefined)
+        : (s.decode_pcp_size ?? undefined)
+      : aggregatePcp,
+    dpAttention: usePrefill ? s.prefill_dp_attention : s.decode_dp_attention,
+    disagg: s.disagg,
+    isMultinode: s.is_multinode,
+    prefillTp: s.prefill_tp,
+    prefillEp: s.prefill_ep,
+    prefillPp: s.prefill_pp ?? undefined,
+    prefillDcp: s.prefill_dcp_size ?? undefined,
+    prefillPcp: s.prefill_pcp_size ?? undefined,
+    prefillDwdp: s.prefill_dwdp_size ?? undefined,
+    prefillDpAttention: s.prefill_dp_attention,
+    prefillNumWorkers: s.prefill_num_workers,
+    decodeTp: s.decode_tp,
+    decodeEp: s.decode_ep,
+    decodePp: s.decode_pp ?? undefined,
+    decodeDcp: s.decode_dcp_size ?? undefined,
+    decodePcp: s.decode_pcp_size ?? undefined,
+    decodeDpAttention: s.decode_dp_attention,
+    decodeNumWorkers: s.decode_num_workers,
+  });
+  const offload = s.offload_mode === 'on' ? ' · off=ON' : '';
+  return `${parallel} · c=${s.conc}${offload}`;
+}
+
+type SortMode = 'default' | 'conc' | 'parallelism' | 'tput' | 'requests';
+
+const SIBLING_STRINGS = {
+  en: {
+    sortOptions: {
+      default: 'Default',
+      conc: 'Concurrency ↑',
+      parallelism: 'Parallelism',
+      tput: 'Throughput/Chip ↓',
+      requests: 'Total requests ↓',
+    },
+    pointCount: (count: number) => `${count} point${count === 1 ? '' : 's'} in this run`,
+    sortBy: 'Sort by',
+    sortAria: 'Sort points',
+    previous: 'Previous',
+    previousAria: 'Previous point',
+    next: 'Next',
+    nextAria: 'Next point',
+    noTrace: 'No stored trace data',
+  },
+  zh: {
+    sortOptions: {
+      default: '默认顺序',
+      conc: '并发数 ↑',
+      parallelism: '并行配置',
+      tput: '单芯片吞吐量 ↓',
+      requests: '请求总数 ↓',
+    },
+    pointCount: (count: number) => `本次运行共 ${count} 个数据点`,
+    sortBy: '排序方式',
+    sortAria: '数据点排序',
+    previous: '上一个',
+    previousAria: '上一个数据点',
+    next: '下一个',
+    nextAria: '下一个数据点',
+    noTrace: '未存储 trace 数据',
+  },
+} as const;
+
+const SORT_VALUES: SortMode[] = ['default', 'conc', 'parallelism', 'tput', 'requests'];
+
+const parallelRank = (
+  s: BenchmarkSibling,
+): [number, number, number, number, number, number, number, number] => {
+  const usePrefill = !s.disagg && s.decode_tp <= 0 && s.prefill_tp > 0;
+  return [
+    usePrefill ? s.prefill_ep : s.decode_ep,
+    usePrefill ? s.prefill_tp : s.decode_tp,
+    (usePrefill ? s.prefill_pp : s.decode_pp) ?? 1,
+    (usePrefill ? s.prefill_dcp_size : s.decode_dcp_size) ?? 1,
+    (usePrefill ? s.prefill_pcp_size : s.decode_pcp_size) ?? 1,
+    s.prefill_dwdp_size ?? 1,
+    (usePrefill ? s.prefill_dp_attention : s.decode_dp_attention) ? 1 : 0,
+    s.disagg ? 1 : 0,
+  ];
+};
+
+function sortSiblings(siblings: BenchmarkSibling[], mode: SortMode): BenchmarkSibling[] {
+  if (mode === 'default') return siblings;
+  const out = [...siblings];
+  if (mode === 'conc') {
+    out.sort((a, b) => a.conc - b.conc);
+  } else if (mode === 'tput') {
+    out.sort((a, b) => (b.tput_per_gpu ?? -Infinity) - (a.tput_per_gpu ?? -Infinity));
+  } else if (mode === 'requests') {
+    out.sort((a, b) => (b.total_requests ?? -Infinity) - (a.total_requests ?? -Infinity));
+  } else {
+    out.sort((a, b) => {
+      const ra = parallelRank(a);
+      const rb = parallelRank(b);
+      for (let i = 0; i < ra.length; i++) {
+        if (ra[i] !== rb[i]) return ra[i] - rb[i];
+      }
+      const oa = a.offload_mode === 'on' ? 1 : 0;
+      const ob = b.offload_mode === 'on' ? 1 : 0;
+      return oa - ob || a.conc - b.conc;
+    });
+  }
+  return out;
+}
+
+const isSortMode = (v: string | null): v is SortMode =>
+  v !== null && SORT_VALUES.includes(v as SortMode);
+
+export function SiblingNav({ sku, siblings }: { sku: BenchmarkSku; siblings: BenchmarkSibling[] }) {
+  const router = useRouter();
+  const pathname = usePathname();
+  const locale = useLocale();
+  const t = SIBLING_STRINGS[locale];
+  const sortOptions = SORT_VALUES.map((value) => ({ value, label: t.sortOptions[value] }));
+  const agenticBase = isZhPathname(pathname)
+    ? `${ZH_PREFIX}${getDashboardRoute('inference').path}/agentic`
+    : `${getDashboardRoute('inference').path}/agentic`;
+  const [sortMode, setSortMode] = useState<SortMode>(() => {
+    if (typeof window === 'undefined') return 'default';
+    const v = new URLSearchParams(window.location.search).get('sort');
+    return isSortMode(v) ? v : 'default';
+  });
+
+  const sorted = useMemo(() => sortSiblings(siblings, sortMode), [siblings, sortMode]);
+
+  const currentIdx = sorted.findIndex((s) => s.is_current);
+  const prev = currentIdx > 0 ? sorted[currentIdx - 1] : null;
+  const next = currentIdx !== -1 && currentIdx < sorted.length - 1 ? sorted[currentIdx + 1] : null;
+
+  const hrefFor = (id: number) =>
+    sortMode === 'default' ? `${agenticBase}/${id}` : `${agenticBase}/${id}?sort=${sortMode}`;
+
+  const currentId = siblings.find((s) => s.is_current)?.id;
+
+  const skuLabel = `${hwLabel(sku.hardware)} · ${modelLabel(sku.model)} · ${sku.precision.toUpperCase()} · ${frameworkLabel(sku.framework)}`;
+
+  return (
+    <div className="border-b border-border/40 pb-4 mb-4">
+      <div className="flex flex-col items-start gap-1 mb-3 sm:flex-row sm:items-baseline sm:justify-between sm:gap-3">
+        <h1 className="min-w-0 break-words text-xl font-semibold text-foreground sm:text-2xl">
+          {skuLabel}
+        </h1>
+        <span className="text-xs text-muted-foreground">
+          {t.pointCount(siblings.length)} ·{' '}
+          {locale === 'zh'
+            ? `${Number(sku.date.slice(0, 4))}年${Number(sku.date.slice(5, 7))}月${Number(sku.date.slice(8, 10))}日`
+            : sku.date}
+        </span>
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex items-center gap-1.5">
+          <span className="text-xs text-muted-foreground">{t.sortBy}</span>
+          <Select
+            value={sortMode}
+            onValueChange={(v) => {
+              const mode = v as SortMode;
+              setSortMode(mode);
+              track('agentic_siblings_sorted', { mode });
+              if (currentId !== undefined) {
+                const href =
+                  mode === 'default'
+                    ? `${agenticBase}/${currentId}`
+                    : `${agenticBase}/${currentId}?sort=${mode}`;
+                router.replace(href, { scroll: false });
+              }
+            }}
+          >
+            <SelectTrigger
+              size="sm"
+              className="w-40 text-xs"
+              aria-label={t.sortAria}
+              data-testid="sibling-sort-select"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {sortOptions.map((o) => (
+                <SelectItem key={o.value} value={o.value} className="text-xs">
+                  {o.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="flex items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            disabled={!prev}
+            onClick={() => {
+              if (prev) {
+                track('agentic_siblings_navigated', { direction: 'prev', target_id: prev.id });
+                router.push(hrefFor(prev.id));
+              }
+            }}
+            aria-label={t.previousAria}
+          >
+            <ChevronLeft />
+            {t.previous}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            disabled={!next}
+            onClick={() => {
+              if (next) {
+                track('agentic_siblings_navigated', { direction: 'next', target_id: next.id });
+                router.push(hrefFor(next.id));
+              }
+            }}
+            aria-label={t.nextAria}
+          >
+            {t.next}
+            <ChevronRight />
+          </Button>
+        </div>
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-1.5">
+        {sorted.map((s) => {
+          const active = s.is_current;
+          return (
+            <Button
+              key={s.id}
+              type="button"
+              variant="outline"
+              size="xs"
+              aria-current={active ? 'page' : undefined}
+              onClick={() => {
+                if (!active) {
+                  track('agentic_siblings_navigated', { direction: 'chip', target_id: s.id });
+                  router.push(hrefFor(s.id));
+                }
+              }}
+              className={cn(
+                'font-normal tabular-nums',
+                !s.has_trace && 'text-muted-foreground',
+                active &&
+                  'border-primary bg-primary font-medium text-foreground hover:bg-primary hover:text-foreground dark:border-primary dark:bg-primary dark:text-primary-foreground dark:hover:bg-primary dark:hover:text-primary-foreground',
+              )}
+              title={s.has_trace ? undefined : t.noTrace}
+            >
+              {chipLabel(s)}
+            </Button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}

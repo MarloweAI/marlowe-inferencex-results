@@ -1,0 +1,639 @@
+import { describe, expect, it } from 'vitest';
+
+import type { HardwareConfig } from '@/components/inference/types';
+import { CHART_TYPE } from '@/lib/d3-chart/typography';
+
+import { formatProfitUsd, type ProfitEstimatorRow } from './profit-estimator';
+import {
+  barLabelSlotPx,
+  buildProfitSegments,
+  revenueLabelStyle,
+  generateProfitTooltipHTML,
+  profitPointDetails,
+  estimateTextWidth,
+  lossLabelStyle,
+  lossLabelText,
+  slantedMargins,
+  splitAxisLabel,
+  splitHistoryLabel,
+  xLabelLayout,
+  operatorMarginLabel,
+  LOSS_FOOTROOM_PX,
+  profitAxisTickFormat,
+  profitYDomain,
+  BAR_ICON_MAX_HEIGHT,
+  BAR_ICON_MIN_HEIGHT,
+  barMarkHeight,
+  CHART_HEIGHT,
+  CHART_HEIGHT_MIN,
+  CHART_VIEWPORT_RESERVE,
+  chartHeightForViewport,
+  STACK_HEADROOM_PX,
+  stackHeadroomPx,
+  rowLabel,
+  rowStepPx,
+  rowValueRoomPx,
+  segmentLabelLines,
+  stackTopValue,
+  wrapRowLabel,
+  wrapWords,
+} from './ProfitEstimatorChart';
+
+function row(overrides: Partial<ProfitEstimatorRow> = {}): ProfitEstimatorRow {
+  return {
+    hwKey: 'h200',
+    resultKey: 'h200',
+    gpuHours: 6_394_160_584,
+    revenuePerGpuHour: 3,
+    revenue: 1000,
+    tco: 400,
+    grossMargin: 600,
+    labCut: 180,
+    profit: 420,
+    ...overrides,
+  };
+}
+
+describe('profitAxisTickFormat', () => {
+  it('drops zero cents when the axis steps in whole dollars', () => {
+    const format = profitAxisTickFormat('chip-hour', [0, 33]);
+    expect([0, 5, 35].map(format)).toEqual(['$0', '$5', '$35']);
+  });
+
+  it('keeps cents on every tick when the step is fractional', () => {
+    const format = profitAxisTickFormat('chip-hour', [0, 3.2]);
+    expect([0, 0.5, 1].map(format)).toEqual(['$0.00', '$0.50', '$1.00']);
+  });
+
+  it('leaves the compact gigawatt-year ticks alone', () => {
+    expect(profitAxisTickFormat('gw-year', [0, 40e9])(35e9)).toBe('$35B');
+  });
+});
+
+const hardwareConfig = {
+  h200: { name: 'NVIDIA H200', label: 'H200', gpu: 'H200', framework: 'vllm' },
+  'evil-chip': { name: 'Evil', label: '<img>', gpu: 'Evil', framework: 'vllm' },
+} as unknown as HardwareConfig;
+
+describe('buildProfitSegments', () => {
+  it('stacks TCO, license fee, and profit from zero upward for a profitable SKU', () => {
+    const segments = buildProfitSegments([row()]);
+    expect(segments.map((s) => s.kind)).toEqual(['tco', 'labCut', 'profit']);
+    expect(segments[0]).toMatchObject({ y0: 0, y1: 400 });
+    expect(segments[1]).toMatchObject({ y0: 400, y1: 580 });
+    expect(segments[2]).toMatchObject({ y0: 580, y1: 1000 });
+    expect(segments[2].y1).toBeCloseTo(1000);
+  });
+
+  it('draws a loss below zero and omits the license fee when margin is negative', () => {
+    const segments = buildProfitSegments([
+      row({ revenue: 300, tco: 400, grossMargin: -100, labCut: 0, profit: -100 }),
+    ]);
+    expect(segments.map((s) => s.kind)).toEqual(['tco', 'loss']);
+    expect(segments[1]).toMatchObject({ y0: -100, y1: 0 });
+  });
+
+  it('keys segments by result key so repeated SKUs with different precisions stay distinct', () => {
+    const segments = buildProfitSegments([
+      row({ resultKey: 'h200_fp8', precision: 'fp8' }),
+      row({ resultKey: 'h200_fp4', precision: 'fp4' }),
+    ]);
+    const keys = new Set(segments.map((s) => s.key));
+    expect(keys.size).toBe(segments.length);
+    expect(keys.has('h200_fp8|tco')).toBe(true);
+    expect(keys.has('h200_fp4|profit')).toBe(true);
+  });
+});
+
+describe('barMarkHeight', () => {
+  it('grows the vendor mark with the bar between the phone and desktop bounds', () => {
+    expect(barMarkHeight(0)).toBe(BAR_ICON_MIN_HEIGHT);
+    expect(barMarkHeight(40)).toBe(BAR_ICON_MIN_HEIGHT);
+    expect(barMarkHeight(100)).toBeCloseTo(30, 5);
+    expect(barMarkHeight(400)).toBe(BAR_ICON_MAX_HEIGHT);
+    expect(stackHeadroomPx(BAR_ICON_MAX_HEIGHT) - STACK_HEADROOM_PX).toBe(
+      BAR_ICON_MAX_HEIGHT - BAR_ICON_MIN_HEIGHT,
+    );
+  });
+});
+
+describe('stackTopValue', () => {
+  it('is revenue for a profitable bar, whose stack ends at revenue', () => {
+    expect(stackTopValue(row())).toBe(1000);
+  });
+
+  it('is TCO plus the license fee for a loss bar, so above-bar labels clear the drawn stack', () => {
+    const loss = row({ revenue: 4.4, tco: 9.5, grossMargin: -5.1, labCut: 1.3, profit: -6.4 });
+    expect(stackTopValue(loss)).toBeCloseTo(10.8);
+    expect(stackTopValue(loss)).toBeGreaterThan(Math.max(loss.revenue, loss.tco));
+  });
+
+  it('is TCO for a loss bar with no license fee', () => {
+    expect(stackTopValue(row({ revenue: 300, tco: 400, labCut: 0, profit: -100 }))).toBe(400);
+  });
+});
+
+describe('profitYDomain', () => {
+  it('falls back to a unit domain with no rows', () => {
+    expect(profitYDomain([])).toEqual([0, 1]);
+  });
+
+  it('always includes zero and leaves headroom above the tallest bar', () => {
+    const [bottom, top] = profitYDomain([row()]);
+    expect(bottom).toBe(0);
+    expect(top).toBeGreaterThan(1000);
+  });
+
+  it('sizes the headroom to the label stack in pixels once the plot height is known', () => {
+    const [, top] = profitYDomain([row()], 500);
+    const pxPerUnit = 500 / top;
+    expect((top - 1000) * pxPerUnit).toBeCloseTo(STACK_HEADROOM_PX, 5);
+    expect(profitYDomain([row()], 1000)[1]).toBeLessThan(top);
+    expect(top).toBeLessThan(1300);
+    const [, roomy] = profitYDomain([row()], 500, stackHeadroomPx(BAR_ICON_MAX_HEIGHT));
+    expect(roomy).toBeGreaterThan(top);
+    expect((roomy - 1000) * (500 / roomy)).toBeCloseTo(stackHeadroomPx(BAR_ICON_MAX_HEIGHT), 5);
+  });
+
+  it('reserves pixel footroom under the deepest loss once the plot height is known', () => {
+    const losing = row({ revenue: 300, tco: 400, grossMargin: -100, labCut: 0, profit: -100 });
+    const [bottom, top] = profitYDomain([losing], 500);
+    const pxPerUnit = 500 / (top - bottom);
+    expect((-100 - bottom) * pxPerUnit).toBeCloseTo(LOSS_FOOTROOM_PX, 5);
+    expect((top - 400) * pxPerUnit).toBeCloseTo(STACK_HEADROOM_PX, 5);
+    const deep = row({ revenue: 100, tco: 2000, grossMargin: -1900, labCut: 0, profit: -1900 });
+    const [deepBottom, deepTop] = profitYDomain([deep], 300);
+    expect((-1900 - deepBottom) * (300 / (deepTop - deepBottom))).toBeCloseTo(LOSS_FOOTROOM_PX, 5);
+  });
+
+  it('reserves no footroom when nothing loses money', () => {
+    expect(profitYDomain([row()], 500)[0]).toBe(0);
+  });
+
+  it('extends below zero when any SKU loses money, and covers TCO when it exceeds revenue', () => {
+    const [bottom, top] = profitYDomain([
+      row({ revenue: 300, tco: 400, grossMargin: -100, labCut: 0, profit: -100 }),
+    ]);
+    expect(bottom).toBeLessThan(-100);
+    expect(top).toBeGreaterThan(400);
+  });
+
+  it('covers the TCO plus license-fee stack of a loss bar, not just revenue or TCO', () => {
+    const [bottom, top] = profitYDomain([
+      row({ revenue: 300, tco: 400, grossMargin: -100, labCut: 90, profit: -190 }),
+    ]);
+    expect(bottom).toBeLessThan(-190);
+    expect(top).toBeGreaterThan(490);
+  });
+});
+
+describe('rowLabel', () => {
+  it('uses the hardware display label and appends precision in upper case', () => {
+    expect(rowLabel(row({ precision: 'fp8' }), hardwareConfig)).toBe('H200 (FP8)');
+    expect(rowLabel(row(), hardwareConfig)).toBe('H200');
+  });
+
+  it('falls back to the registry entry when the chart config lacks the key', () => {
+    expect(rowLabel(row(), {} as HardwareConfig)).toBe('H200');
+  });
+
+  it('names the run date of a compare-history bar after the config', () => {
+    expect(rowLabel(row({ precision: 'fp8', date: '2026-06-14' }), hardwareConfig)).toBe(
+      'H200 (FP8) • 2026-06-14',
+    );
+  });
+
+  it('labels a historical omission without current hardware metadata or pricing', () => {
+    const skipped = {
+      hwKey: 'b300_vllm',
+      precision: 'fp8',
+      reason: 'no-measured-power',
+      date: '2026-06-14',
+      dateLabel: '2026-06-14 (run 2)',
+    };
+    expect(rowLabel(skipped, hardwareConfig)).toBe('B300 (vLLM) (FP8) • 2026-06-14 (run 2)');
+  });
+});
+
+describe('splitHistoryLabel', () => {
+  it('splits a dated label into its config and date', () => {
+    expect(splitHistoryLabel('B200 (FP4) • 2026-06-14')).toEqual(['B200 (FP4)', '2026-06-14']);
+  });
+
+  it('leaves an undated label whole', () => {
+    expect(splitHistoryLabel('B200 (FP4)')).toEqual(['B200 (FP4)', '']);
+  });
+});
+
+describe('profitPointDetails', () => {
+  const assumptions = { utilizationPct: 60, labCutPct: 30, basis: 'gw-year' } as const;
+  const text = (details: ReturnType<typeof profitPointDetails>) =>
+    JSON.stringify(details) + generateProfitTooltipHTML(row(), hardwareConfig, assumptions, 'en');
+
+  it('lists revenue, TCO, license fee, and profit with the configured percentages', () => {
+    const details = profitPointDetails(row(), hardwareConfig, assumptions, 'en');
+    expect(details.metrics[0]).toEqual({ value: '$420', label: 'Profit' });
+    const all = text(details);
+    expect(all).toContain('$1.0k');
+    expect(all).toContain('$400');
+    expect(all).toContain('30%');
+    expect(all).toContain('60%');
+  });
+
+  it('puts the run date of a compare-history bar in the date line, not the title', () => {
+    const details = profitPointDetails(
+      row({ date: '2026-06-14' }),
+      hardwareConfig,
+      assumptions,
+      'en',
+    );
+    expect(details.date).toBe('Run date 2026-06-14');
+    expect(details.title).not.toContain('2026-06-14');
+    expect(profitPointDetails(row(), hardwareConfig, assumptions, 'en').date).toBeUndefined();
+  });
+
+  it('labels a negative result as a loss and still lists the license fee, which is a share of revenue', () => {
+    const details = profitPointDetails(
+      row({ revenue: 300, tco: 400, grossMargin: -100, labCut: 90, profit: -190 }),
+      hardwareConfig,
+      assumptions,
+      'en',
+    );
+    expect(details.metrics[0]).toEqual({ value: '−$190', label: 'Loss' });
+    expect(JSON.stringify(details.rows)).toContain('Model license fee');
+    expect(JSON.stringify(details.rows)).toContain('$90');
+  });
+
+  it('formats cents and keeps revenue per GPU-hour on both bases', () => {
+    const details = profitPointDetails(
+      row({ revenue: 2.16, tco: 1.73, grossMargin: 0.43, labCut: 0.648, profit: -0.218 }),
+      hardwareConfig,
+      { ...assumptions, basis: 'chip-hour' },
+      'en',
+    );
+    expect(details.summary).toContain('$2.16');
+    expect(details.metrics[0]?.value).toBe('−$0.22');
+    expect(details.rows).toContainEqual({ label: 'Revenue per GPU-hour', value: '$3.00/GPU/hr' });
+    expect(JSON.stringify(details)).not.toContain('GPU-hours per GW-year');
+    const perGw = profitPointDetails(row(), hardwareConfig, assumptions, 'en');
+    expect(perGw.rows).toContainEqual({ label: 'Revenue per GPU-hour', value: '$3.00/GPU/hr' });
+    expect(perGw.rows).toContainEqual({
+      label: 'GPU-hours per GW-year',
+      value: '6,394,160,584',
+    });
+    const zh = profitPointDetails(row(), hardwareConfig, assumptions, 'zh');
+    expect(zh.rows).toContainEqual({ label: '每吉瓦年 GPU 小时数', value: '6,394,160,584' });
+  });
+
+  it('renders Chinese copy', () => {
+    const details = profitPointDetails(row(), hardwareConfig, assumptions, 'zh');
+    expect(details.metrics[0]?.label).toBe('利润');
+    expect(generateProfitTooltipHTML(row(), hardwareConfig, assumptions, 'zh')).toContain('利润');
+  });
+
+  it('escapes HTML in the hardware label', () => {
+    const html = generateProfitTooltipHTML(
+      row({ hwKey: 'evil-chip', resultKey: 'evil-chip' }),
+      hardwareConfig,
+      assumptions,
+      'en',
+    );
+    expect(html).not.toContain('<img>');
+    expect(html).toContain('&lt;img&gt;');
+  });
+});
+
+const SEGMENT_WORDS = {
+  tco: 'Compute expense',
+  labCut: 'Model license fee',
+  profit: 'Profit',
+  loss: 'Loss',
+};
+
+describe('segmentLabelLines', () => {
+  it('names the segment and its amount when the rectangle is tall enough', () => {
+    expect(segmentLabelLines('tco', row(), 40, SEGMENT_WORDS)).toEqual(['Compute expense', '$400']);
+    expect(segmentLabelLines('labCut', row(), 40, SEGMENT_WORDS)).toEqual([
+      'Model license fee',
+      '$180',
+    ]);
+    expect(segmentLabelLines('profit', row(), 40, SEGMENT_WORDS)).toEqual(['Profit', '$420']);
+  });
+
+  it('drops to the amount alone, then to nothing, as the rectangle shrinks', () => {
+    expect(segmentLabelLines('profit', row(), 20, SEGMENT_WORDS)).toEqual(['$420']);
+    expect(
+      segmentLabelLines('profit', row({ profit: 0.5 }), 40, SEGMENT_WORDS, undefined, 'chip-hour'),
+    ).toEqual(['Profit', '$0.50']);
+    expect(segmentLabelLines('profit', row(), 10, SEGMENT_WORDS)).toEqual([]);
+  });
+
+  it('labels a loss with the loss word and the negative amount', () => {
+    const lossRow = row({ tco: 1300, grossMargin: -300, labCut: 300, profit: -600 });
+    expect(segmentLabelLines('loss', lossRow, 40, SEGMENT_WORDS)).toEqual(['Loss', '−$600']);
+  });
+
+  it('drops the name, then the amount, when the bar is too narrow (phones)', () => {
+    expect(segmentLabelLines('tco', row(), 40, SEGMENT_WORDS, 200)).toEqual([
+      'Compute expense',
+      '$400',
+    ]);
+    expect(segmentLabelLines('tco', row(), 40, SEGMENT_WORDS, 60)).toEqual(['$400']);
+    expect(segmentLabelLines('tco', row(), 40, SEGMENT_WORDS, 20)).toEqual([]);
+  });
+});
+
+describe('splitAxisLabel', () => {
+  it('puts the SKU name on the first line and the parenthesised detail on the second', () => {
+    expect(splitAxisLabel('GB300 NVL72 (Dynamo vLLM) (FP4)')).toEqual([
+      'GB300 NVL72',
+      '(Dynamo vLLM) (FP4)',
+    ]);
+    expect(splitAxisLabel('B200')).toEqual(['B200', '']);
+  });
+});
+
+describe('xLabelLayout', () => {
+  const labels = ['GB300 NVL72 (Dynamo vLLM) (FP4)', 'B200 (SGLang) (FP4)'];
+  it('stands labels upright on two lines when every slot has room', () => {
+    expect(xLabelLayout(labels, 200, 10)).toBe('stacked');
+  });
+  it('falls back to the slanted single line on narrow slots or with no data', () => {
+    expect(xLabelLayout(labels, 80, 10)).toBe('slanted');
+    expect(xLabelLayout([], 200, 10)).toBe('slanted');
+    expect(xLabelLayout(labels, 0, 10)).toBe('slanted');
+  });
+  it('measures a compare-history date as its own line rather than widening the detail line', () => {
+    const dated = labels.map((label) => `${label} • 2026-06-14`);
+    expect(xLabelLayout(dated, 200, 10)).toBe('stacked');
+  });
+});
+
+describe('slantedMargins', () => {
+  const base = { top: 44, right: 8, bottom: 140, left: 64 };
+  it('widens the left and bottom margins so a long slanted label stays inside the SVG', () => {
+    const m = slantedMargins(['GB300 NVL72 (Dynamo vLLM) (FP4)'], 40, 10, base);
+    expect(m.left).toBeGreaterThan(base.left);
+    expect(m.bottom).toBeGreaterThan(base.bottom);
+    expect(m.top).toBe(base.top);
+    expect(m.right).toBe(base.right);
+  });
+  it('never shrinks below the base margins', () => {
+    expect(slantedMargins(['B200'], 200, 10, base)).toEqual(base);
+    expect(slantedMargins([], 200, 10, base)).toEqual(base);
+  });
+});
+
+describe('estimateTextWidth', () => {
+  it('scales with glyph count and font size', () => {
+    expect(estimateTextWidth('abcd', 10)).toBeCloseTo(22);
+    expect(estimateTextWidth('', 10)).toBe(0);
+  });
+});
+
+describe('barLabelSlotPx', () => {
+  it('lets a label overhang a wide bar by the gap allowance', () => {
+    expect(barLabelSlotPx(100, 143)).toBe(112);
+  });
+
+  it('stops short of the neighbouring label when the gap is narrower than the allowance', () => {
+    const slot = barLabelSlotPx(26.2, 37.4);
+    expect(slot).toBeLessThan(26.2 + 12);
+    expect(slot).toBeCloseTo(37.4 - 4);
+    expect(slot).toBeLessThan(37.4);
+  });
+
+  it('is empty for an unmeasured bar and never wider than its own bar plus the allowance', () => {
+    expect(barLabelSlotPx(0, 40)).toBe(0);
+    expect(barLabelSlotPx(Number.NaN, 40)).toBe(0);
+    expect(barLabelSlotPx(30, Number.NaN)).toBe(26);
+  });
+});
+
+const boldWidth = (text: string, fontPx: number) => estimateTextWidth(text, fontPx) * 1.1;
+
+const digitsWidth = (digits: number, fontPx: number) =>
+  boldWidth(formatProfitUsd(110.3e9, 'gw-year', digits), fontPx);
+
+describe('revenueLabelStyle', () => {
+  const phoneRows = [137.1e9, 110.3e9, 108.7e9, 38.5e9, 33.7e9, 32.7e9, 21.7e9].map((revenue) =>
+    row({ revenue }),
+  );
+
+  it('keeps full precision at the axis size when every figure fits its slot', () => {
+    expect(revenueLabelStyle(phoneRows, 'gw-year', barLabelSlotPx(100, 143))).toEqual({
+      digits: 1,
+      fontPx: CHART_TYPE.axisLabel,
+    });
+    expect(revenueLabelStyle(phoneRows, 'gw-year')).toEqual({
+      digits: 1,
+      fontPx: CHART_TYPE.axisLabel,
+    });
+  });
+
+  it('narrows every figure until the widest fits a phone-width slot', () => {
+    const slot = barLabelSlotPx(26.2, 37.4);
+    const style = revenueLabelStyle(phoneRows, 'gw-year', slot);
+    expect(style).not.toEqual({ digits: 1, fontPx: CHART_TYPE.axisLabel });
+    for (const r of phoneRows) {
+      const text = formatProfitUsd(r.revenue, 'gw-year', style.digits);
+      expect(boldWidth(text, style.fontPx)).toBeLessThanOrEqual(slot);
+    }
+  });
+
+  it('shrinks before it rounds, and rounds before it shrinks again', () => {
+    const rows = [row({ revenue: 110.3e9 })];
+    expect(revenueLabelStyle(rows, 'gw-year', digitsWidth(1, CHART_TYPE.annotation))).toEqual({
+      digits: 1,
+      fontPx: CHART_TYPE.annotation,
+    });
+    expect(revenueLabelStyle(rows, 'gw-year', digitsWidth(0, CHART_TYPE.axisLabel))).toEqual({
+      digits: 0,
+      fontPx: CHART_TYPE.axisLabel,
+    });
+    expect(revenueLabelStyle(rows, 'gw-year', digitsWidth(0, CHART_TYPE.annotation))).toEqual({
+      digits: 0,
+      fontPx: CHART_TYPE.annotation,
+    });
+  });
+
+  it('falls back to the smallest style rather than failing when nothing fits', () => {
+    expect(revenueLabelStyle(phoneRows, 'gw-year', 1)).toEqual({
+      digits: 0,
+      fontPx: CHART_TYPE.annotation,
+    });
+    expect(revenueLabelStyle([], 'gw-year', 1)).toEqual({
+      digits: 1,
+      fontPx: CHART_TYPE.axisLabel,
+    });
+  });
+
+  it('only changes size per chip-hour, where the formatter keeps its two decimals', () => {
+    const rows = [row({ revenue: 3.96 })];
+    const style = revenueLabelStyle(rows, 'chip-hour', boldWidth('$3.96', CHART_TYPE.annotation));
+    expect(style.fontPx).toBe(CHART_TYPE.annotation);
+    expect(formatProfitUsd(3.96, 'chip-hour', style.digits)).toBe('$3.96');
+  });
+});
+
+const styleWidth = (style: { word: boolean; digits: number }) => {
+  const amount = formatProfitUsd(-561.2e6, 'gw-year', style.digits);
+  return boldWidth(style.word ? `Loss ${amount}` : amount, CHART_TYPE.annotation);
+};
+
+describe('lossLabelStyle', () => {
+  const flashRows = [
+    row({ revenue: 14e9, profit: 5.14e9 }),
+    row({ revenue: 11.9e9, profit: 1.46e9 }),
+    row({ revenue: 9.7e9, profit: 1.01e9 }),
+    row({ revenue: 9e9, profit: -561.2e6 }),
+    row({ revenue: 2.9e9, profit: -4.9e9 }),
+  ];
+  const phoneSlot = barLabelSlotPx(38.2, 54.6);
+
+  it('keeps the word and the decimal when every loss figure fits its slot', () => {
+    expect(lossLabelStyle(flashRows, 'Loss', 'gw-year')).toEqual({ word: true, digits: 1 });
+    expect(lossLabelStyle(flashRows, 'Loss', 'gw-year', barLabelSlotPx(100, 143))).toEqual({
+      word: true,
+      digits: 1,
+    });
+    expect(lossLabelText(-561.2e6, 'Loss', 'gw-year')).toBe('Loss −$561.2M');
+  });
+
+  it('narrows every loss figure until the widest fits a phone-width slot', () => {
+    const style = lossLabelStyle(flashRows, 'Loss', 'gw-year', phoneSlot);
+    expect(style).not.toEqual({ word: true, digits: 1 });
+    for (const losing of flashRows.filter((r) => r.profit < 0)) {
+      const text = lossLabelText(losing.profit, 'Loss', 'gw-year', style, phoneSlot);
+      expect(boldWidth(text, CHART_TYPE.annotation)).toBeLessThanOrEqual(phoneSlot);
+      expect(text).toMatch(/^(?:Loss )?−\$\d+(?:\.\d)?[MB]$/);
+    }
+  });
+
+  it('lets a bar keep its decimal when only a wider neighbour had to lose it', () => {
+    const style = lossLabelStyle(flashRows, 'Loss', 'gw-year', phoneSlot);
+    expect(style).toEqual({ word: false, digits: 0 });
+    expect(lossLabelText(-561.2e6, 'Loss', 'gw-year', style, phoneSlot)).toBe('−$561M');
+    expect(lossLabelText(-4.9e9, 'Loss', 'gw-year', style, phoneSlot)).toBe('−$4.9B');
+    expect(lossLabelText(-4.9e9, 'Loss', 'gw-year', { word: true, digits: 0 })).toBe('Loss −$5B');
+  });
+
+  it('drops the decimal before the word, and the word before the last decimal', () => {
+    const rows = [row({ profit: -561.2e6 })];
+    expect(lossLabelStyle(rows, 'Loss', 'gw-year', styleWidth({ word: true, digits: 0 }))).toEqual({
+      word: true,
+      digits: 0,
+    });
+    expect(lossLabelStyle(rows, 'Loss', 'gw-year', styleWidth({ word: false, digits: 1 }))).toEqual(
+      {
+        word: false,
+        digits: 1,
+      },
+    );
+    expect(lossLabelStyle(rows, 'Loss', 'gw-year', styleWidth({ word: false, digits: 0 }))).toEqual(
+      {
+        word: false,
+        digits: 0,
+      },
+    );
+    expect(lossLabelText(-561.2e6, 'Loss', 'gw-year', { word: false, digits: 0 })).toBe('−$561M');
+  });
+
+  it('ignores profitable rows and falls back to the smallest style when nothing fits', () => {
+    expect(lossLabelStyle([row({ profit: 420 })], 'Loss', 'gw-year', 1)).toEqual({
+      word: true,
+      digits: 1,
+    });
+    expect(lossLabelStyle(flashRows, 'Loss', 'gw-year', 1)).toEqual({ word: false, digits: 0 });
+  });
+
+  it('only drops the word per chip-hour, where the formatter keeps its two decimals', () => {
+    const rows = [row({ profit: -0.57 })];
+    const style = lossLabelStyle(
+      rows,
+      'Loss',
+      'chip-hour',
+      boldWidth('−$0.57', CHART_TYPE.annotation),
+    );
+    expect(style.word).toBe(false);
+    expect(lossLabelText(-0.57, 'Loss', 'chip-hour', style)).toBe('−$0.57');
+  });
+});
+
+describe('operatorMarginLabel', () => {
+  it('formats profit as a share of revenue with the caller-supplied word', () => {
+    expect(operatorMarginLabel(row(), 'margin')).toBe('42.0% margin');
+    expect(operatorMarginLabel(row({ profit: -600 }), '利润率')).toBe('-60.0% 利润率');
+  });
+
+  it('returns nothing when there is no revenue to divide by', () => {
+    expect(operatorMarginLabel(row({ revenue: 0 }), 'margin')).toBe('');
+  });
+
+  it('keeps only the percentage when the bar is too narrow for the word', () => {
+    expect(operatorMarginLabel(row(), 'margin', 40)).toBe('42.0%');
+    expect(operatorMarginLabel(row(), 'margin', 200)).toBe('42.0% margin');
+  });
+});
+
+describe('chartHeightForViewport', () => {
+  it('uses the full height when the viewport has room', () => {
+    expect(chartHeightForViewport(1200)).toBe(CHART_HEIGHT);
+    expect(chartHeightForViewport(CHART_HEIGHT + CHART_VIEWPORT_RESERVE)).toBe(CHART_HEIGHT);
+  });
+
+  it('shrinks to fit a laptop viewport so title and x labels share the screen', () => {
+    expect(chartHeightForViewport(872)).toBe(872 - CHART_VIEWPORT_RESERVE);
+    expect(chartHeightForViewport(872)).toBeLessThan(CHART_HEIGHT);
+  });
+
+  it('never goes below the minimum where in-bar labels collide', () => {
+    expect(chartHeightForViewport(500)).toBe(CHART_HEIGHT_MIN);
+    expect(chartHeightForViewport(100)).toBe(CHART_HEIGHT_MIN);
+  });
+
+  it('falls back to the maximum before mount', () => {
+    expect(chartHeightForViewport(undefined)).toBe(CHART_HEIGHT);
+    expect(chartHeightForViewport(Number.NaN)).toBe(CHART_HEIGHT);
+  });
+});
+
+describe('phone row layout', () => {
+  it('wraps words to the width budget and keeps a long word whole', () => {
+    expect(wrapWords('Revenue per provisioned GW-year ($ USD)', 140, 12)).toEqual([
+      'Revenue per',
+      'provisioned GW-year',
+      '($ USD)',
+    ]);
+    expect(wrapWords('Supercalifragilistic', 20, 12)).toEqual(['Supercalifragilistic']);
+  });
+
+  it('puts the chip name first and wraps the qualifiers and date as muted lines', () => {
+    expect(wrapRowLabel('GB300 NVL72 (Dynamo vLLM) (FP4) • Nov 6', 110)).toEqual([
+      { text: 'GB300 NVL72', sub: false },
+      { text: '(Dynamo vLLM) (FP4)', sub: true },
+      { text: 'Nov 6', sub: true },
+    ]);
+    expect(wrapRowLabel('GB300 NVL72 (Dynamo vLLM) (FP4)', 80)).toEqual([
+      { text: 'GB300 NVL72', sub: false },
+      { text: '(Dynamo vLLM)', sub: true },
+      { text: '(FP4)', sub: true },
+    ]);
+  });
+
+  it('grows the row step only when a wrapped label needs more than the minimum', () => {
+    expect(rowStepPx([])).toBe(52);
+    expect(rowStepPx([[{ text: 'B200', sub: false }]])).toBe(52);
+    const tall = Array.from({ length: 4 }, (_, index) => ({ text: `${index}`, sub: index > 0 }));
+    expect(rowStepPx([tall])).toBe(14 + 3 * 12 + 12);
+  });
+
+  it('reserves room beside the bars for the widest revenue or margin label', () => {
+    const room = rowValueRoomPx([row(), row({ revenue: 25.24 })], 'chip-hour');
+    expect(room).toBeCloseTo(
+      estimateTextWidth(formatProfitUsd(1000, 'chip-hour', 1), CHART_TYPE.axisLabel) * 1.1 + 6,
+      5,
+    );
+    expect(rowValueRoomPx([], 'chip-hour')).toBe(6);
+  });
+});

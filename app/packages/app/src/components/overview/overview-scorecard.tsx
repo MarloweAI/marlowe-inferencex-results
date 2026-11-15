@@ -1,0 +1,1327 @@
+'use client';
+
+import { type ComponentPropsWithoutRef, type CSSProperties, useEffect, useRef } from 'react';
+
+import { track } from '@/lib/analytics/analytics';
+
+import { buttonVariants } from '@/components/ui/button';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { SEGMENTED_CONTAINER_STYLE, SEGMENT_RADIUS_STYLE } from '@/components/ui/control-styles';
+import { Label } from '@/components/ui/label';
+import { ModelLogo } from '@/components/ui/model-logo';
+import {
+  OVERVIEW_DEFAULT_HISTORY_WINDOW,
+  OVERVIEW_DEFAULT_REFERENCE_HARDWARE,
+  OVERVIEW_DEFAULT_ROW_SCOPE,
+  OVERVIEW_HARDWARE,
+  OVERVIEW_HISTORY_WINDOW_DAYS,
+  OVERVIEW_HISTORY_WINDOWS,
+  overviewHardwareLabel,
+  type OverviewComparisonMode,
+  type OverviewEngineScope,
+  type OverviewHardwareRowScope,
+  type OverviewHistoricalComparison,
+  type OverviewModelScope,
+  type OverviewModelSummary,
+  type OverviewPlatformResult,
+  type OverviewReferenceHardware,
+  type OverviewRowScope,
+  type OverviewTier,
+} from '@/lib/overview/overview-data';
+import {
+  buildOverviewDashboardHref,
+  buildOverviewHistoryDashboardHref,
+  detailHref,
+  overviewEngineScopeHref,
+  overviewHref,
+} from '@/lib/overview/overview-links';
+
+import { OverviewApiCell, OverviewApiRatioBadge } from './overview-api-cell';
+import { OverviewDetailLink } from './overview-detail-link';
+import { OverviewHistoryDetailLink } from './overview-history-detail-link';
+import { OverviewHistoryWindowSelect } from './overview-history-window-select';
+import { OverviewNavLink } from './overview-nav-link';
+import { type OverviewNavControl, useOverviewNavigation } from './overview-navigation';
+import { OverviewReferenceSelect } from './overview-reference-select';
+import { type OverviewLocale, type OverviewStrings } from './overview-strings';
+import { OverviewTierSlider } from './overview-tier-slider';
+
+interface Formatters {
+  cost: Intl.NumberFormat;
+  percent: Intl.NumberFormat;
+  percentAbs: Intl.NumberFormat;
+  shortDate: (date: string) => string;
+}
+
+function buildOverviewFormatters(locale: OverviewLocale): Formatters {
+  const tag = locale === 'zh' ? 'zh-CN' : 'en-US';
+  const shortDateFormat = new Intl.DateTimeFormat(tag, {
+    month: 'short',
+    day: 'numeric',
+    timeZone: 'UTC',
+  });
+  return {
+    cost: new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: 'USD',
+      minimumFractionDigits: 3,
+      maximumFractionDigits: 3,
+    }),
+    percent: new Intl.NumberFormat(tag, {
+      style: 'percent',
+      maximumFractionDigits: 0,
+      signDisplay: 'exceptZero',
+    }),
+    percentAbs: new Intl.NumberFormat(tag, { style: 'percent', maximumFractionDigits: 0 }),
+    shortDate: (date) => shortDateFormat.format(new Date(`${date}T00:00:00Z`)),
+  };
+}
+
+const FORMATTER_CACHE = new Map<OverviewLocale, Formatters>();
+
+export function overviewFormatters(locale: OverviewLocale): Formatters {
+  let cached = FORMATTER_CACHE.get(locale);
+  if (cached === undefined) {
+    cached = buildOverviewFormatters(locale);
+    FORMATTER_CACHE.set(locale, cached);
+  }
+  return cached;
+}
+
+function formatEvidenceDate(
+  formatters: Formatters,
+  evidenceDate: { from: string; to: string },
+): string {
+  const from = formatters.shortDate(evidenceDate.from);
+  return evidenceDate.from === evidenceDate.to
+    ? from
+    : `${from}–${formatters.shortDate(evidenceDate.to)}`;
+}
+
+function missingReasonCopy(platform: OverviewPlatformResult, strings: OverviewStrings): string {
+  const reason = platform.missingReason;
+  return reason === null ? '' : strings.missingReasons(platform.read.tier)[reason];
+}
+
+const RAW_SOURCE_LINK_CLASS =
+  "relative inline-flex items-center rounded-sm underline decoration-dotted underline-offset-4 after:absolute after:inset-x-0 after:-inset-y-3 after:content-[''] hover:decoration-solid focus-visible:outline-none xl:after:hidden";
+
+function CellMissing({ hardware, reason }: { hardware: string; reason: string }) {
+  return (
+    <div
+      data-testid="overview-pair-missing"
+      data-hardware={hardware}
+      title={reason === '' ? undefined : reason}
+      className="text-sm text-muted-foreground"
+    >
+      <span>{'—'}</span>
+      {reason === '' ? null : <span className="sr-only">{reason}</span>}
+    </div>
+  );
+}
+
+function isPlatformBlank(platform: OverviewPlatformResult): boolean {
+  return (
+    platform.missingReason !== null || platform.read.value === null || platform.costPerMtok === null
+  );
+}
+
+function NoResultsRow({ text }: { text: string }) {
+  return (
+    <p data-testid="overview-row-no-results" className="text-sm text-muted-foreground">
+      {text}
+    </p>
+  );
+}
+
+const COST_DELTA_NEUTRAL_BAND = 0.05;
+const COST_DELTA_SATURATION = 0.5;
+const COST_DELTA_CLASS = {
+  cheaper: 'text-[color-mix(in_oklch,var(--success)_60%,var(--foreground))]',
+  pricier: 'text-[color-mix(in_oklch,var(--destructive)_60%,var(--foreground))]',
+  even: 'text-muted-foreground',
+  'no-baseline': 'text-muted-foreground',
+} as const;
+const COST_DELTA_TOKEN = {
+  cheaper: '--success',
+  pricier: '--destructive',
+} as const;
+
+type CostDeltaPolarity = keyof typeof COST_DELTA_CLASS;
+
+interface DisplayedComparison {
+  status: Exclude<OverviewHistoricalComparison['status'], 'no_newer_result'>;
+  pct: number | null;
+  baselineDate: string | null;
+}
+
+function displayedComparison(
+  platform: OverviewPlatformResult,
+  comparisonMode: OverviewComparisonMode,
+  referenceHardware: OverviewReferenceHardware,
+  referenceCost: number | null,
+): DisplayedComparison | null {
+  if (platform.costPerMtok === null) return null;
+  if (comparisonMode !== 'hardware') {
+    const comparison = platform.historicalComparison;
+    return comparison?.status === 'comparable' && comparison.costDeltaPct !== null
+      ? {
+          status: comparison.status,
+          pct: comparison.costDeltaPct,
+          baselineDate: comparison.baselineDate,
+        }
+      : null;
+  }
+  if (platform.hardware === referenceHardware) return null;
+  const pct =
+    referenceCost === null || platform.costPerMtok === null
+      ? null
+      : platform.costPerMtok / referenceCost - 1;
+  return {
+    status: pct === null ? 'no_baseline' : 'comparable',
+    pct,
+    baselineDate: null,
+  };
+}
+
+function costDeltaPolarity(pct: number): CostDeltaPolarity {
+  if (Math.abs(pct) < COST_DELTA_NEUTRAL_BAND) return 'even';
+  return pct < 0 ? 'cheaper' : 'pricier';
+}
+
+function comparisonPolarity(comparison: DisplayedComparison): CostDeltaPolarity {
+  return comparison.status !== 'comparable' || comparison.pct === null
+    ? 'no-baseline'
+    : costDeltaPolarity(comparison.pct);
+}
+
+function comparisonAria(
+  comparison: DisplayedComparison,
+  comparisonMode: OverviewComparisonMode,
+  polarity: CostDeltaPolarity,
+  formatters: Formatters,
+  strings: OverviewStrings,
+  referenceLabel: string,
+): string {
+  if (comparison.status === 'no_baseline' || comparison.pct === null) {
+    return strings.noBaselineAria(referenceLabel);
+  }
+  if (comparisonMode === 'hardware') {
+    return polarity === 'even'
+      ? strings.costDeltaEvenAria(referenceLabel)
+      : strings.costDeltaAria(
+          formatters.percentAbs.format(Math.abs(comparison.pct)),
+          polarity === 'cheaper',
+          referenceLabel,
+        );
+  }
+
+  const baselineDate =
+    comparison.baselineDate === null ? '' : formatters.shortDate(comparison.baselineDate);
+  return polarity === 'even'
+    ? strings.historicalEvenAria(baselineDate)
+    : strings.historicalDeltaAria(
+        formatters.percentAbs.format(Math.abs(comparison.pct)),
+        polarity === 'cheaper',
+        baselineDate,
+      );
+}
+
+function costDeltaAlpha(pct: number): number {
+  const strength = Math.min(Math.abs(pct), COST_DELTA_SATURATION) / COST_DELTA_SATURATION;
+  return 0.08 + strength * 0.24;
+}
+
+export function costDeltaCellStyle(
+  platform: OverviewPlatformResult,
+  comparisonMode: OverviewComparisonMode = 'hardware',
+  referenceHardware: OverviewReferenceHardware = OVERVIEW_DEFAULT_REFERENCE_HARDWARE,
+  referenceCost: number | null = null,
+): { backgroundColor: string } | undefined {
+  const comparison = displayedComparison(
+    platform,
+    comparisonMode,
+    referenceHardware,
+    referenceCost,
+  );
+  if (comparison === null) return undefined;
+  const polarity = comparisonPolarity(comparison);
+  if (polarity === 'no-baseline' || polarity === 'even' || comparison.pct === null)
+    return undefined;
+  const mix = Math.round(costDeltaAlpha(comparison.pct) * 100);
+  return {
+    backgroundColor: `color-mix(in oklch, var(${COST_DELTA_TOKEN[polarity]}) ${mix}%, transparent)`,
+  };
+}
+
+function CostDeltaBadge({
+  comparison,
+  comparisonMode,
+  hardware,
+  formatters,
+  strings,
+  referenceLabel,
+  phoneRow,
+}: {
+  comparison: DisplayedComparison;
+  comparisonMode: OverviewComparisonMode;
+  hardware: string;
+  formatters: Formatters;
+  strings: OverviewStrings;
+  referenceLabel: string;
+  phoneRow: boolean;
+}) {
+  const { pct, status } = comparison;
+  const polarity = comparisonPolarity(comparison);
+  const aria = comparisonAria(
+    comparison,
+    comparisonMode,
+    polarity,
+    formatters,
+    strings,
+    referenceLabel,
+  );
+  return (
+    <span
+      data-testid="overview-cost-delta"
+      data-hardware={hardware}
+      data-cost-polarity={polarity}
+      data-history-status={comparisonMode === 'hardware' ? undefined : status}
+      title={aria}
+      className={`inline-flex items-center whitespace-nowrap rounded-sm px-1 py-0.5 text-xs font-medium tabular-nums ${
+        phoneRow
+          ? 'col-start-2 justify-self-start'
+          : pct === null
+            ? 'self-center'
+            : 'xl:col-start-2 xl:justify-self-end'
+      } ${COST_DELTA_CLASS[polarity]}`}
+    >
+      {pct === null ? (
+        <span aria-hidden="true" className="text-base leading-none">
+          ∞
+        </span>
+      ) : (
+        <span aria-hidden="true">{formatters.percent.format(pct)}</span>
+      )}
+      <span className="sr-only">{aria}</span>
+    </span>
+  );
+}
+
+function CellValue({
+  locale,
+  model,
+  member,
+  formatters,
+  strings,
+  comparisonMode,
+  referenceHardware,
+  referenceCost,
+  referenceLabel,
+  phoneRow = false,
+}: {
+  locale: OverviewLocale;
+  model: OverviewModelSummary;
+  member: OverviewPlatformResult;
+  formatters: Formatters;
+  strings: OverviewStrings;
+  comparisonMode: OverviewComparisonMode;
+  referenceHardware: OverviewReferenceHardware;
+  referenceCost: number | null;
+  referenceLabel: string;
+  phoneRow?: boolean;
+}) {
+  const { config, evidenceDate, evidenceTopologies } = member.read;
+  if (isPlatformBlank(member) || member.costPerMtok === null) {
+    return <CellMissing hardware={member.hardware} reason={missingReasonCopy(member, strings)} />;
+  }
+  const precisionLabel = config?.precision.toUpperCase() ?? member.precision?.toUpperCase() ?? null;
+  const evidenceSpecLabel =
+    config === null
+      ? null
+      : config.specMethod === 'none' || config.specMethod === ''
+        ? strings.standardDecodeLabel
+        : config.specLabel;
+  const decodeLabel =
+    config !== null && (config.specMethod === 'none' || config.specMethod === '')
+      ? strings.standardDecodeLabel
+      : null;
+  const stackPrefix =
+    config === null || precisionLabel === null
+      ? null
+      : [config.frameworkLabel, precisionLabel].join(' · ');
+  const stackBadge =
+    stackPrefix === null
+      ? null
+      : decodeLabel === null
+        ? stackPrefix
+        : [stackPrefix, decodeLabel].join(' · ');
+  const stack =
+    config === null || evidenceSpecLabel === null
+      ? null
+      : [
+          member.hardwareLabel,
+          config.frameworkLabel,
+          config.precision.toUpperCase(),
+          evidenceSpecLabel,
+        ].join(' · ');
+  const evidenceDateLabel =
+    evidenceDate === null ? '' : formatEvidenceDate(formatters, evidenceDate);
+  const formattedValue = formatters.cost.format(member.costPerMtok);
+  const estimateExplanation = member.read.estimated
+    ? strings.estimatedTooltip(evidenceTopologies)
+    : undefined;
+  const evidenceAria =
+    config === null || stack === null
+      ? null
+      : strings.rawDashboardAria(evidenceDateLabel, model.modelLabel, stack);
+  const costText = formattedValue;
+  const comparison = displayedComparison(member, comparisonMode, referenceHardware, referenceCost);
+  const historicalConfig =
+    comparisonMode !== 'hardware' && member.historicalComparison?.status === 'comparable'
+      ? member.historicalComparison.baselineConfig
+      : null;
+  return (
+    <div className="min-w-0 space-y-0.5 text-sm">
+      <div
+        className={
+          phoneRow
+            ? 'grid grid-cols-[max-content_minmax(0,1fr)] items-baseline gap-x-1.5 gap-y-0.5'
+            : comparison?.pct === null
+              ? 'flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5'
+              : 'flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5 xl:grid xl:grid-cols-[minmax(max-content,1fr)_3.5rem]'
+        }
+      >
+        <span
+          data-testid="overview-pair-value"
+          data-hardware={member.hardware}
+          className="whitespace-nowrap font-semibold tabular-nums"
+        >
+          {evidenceAria === null || config === null ? (
+            <span title={estimateExplanation}>
+              {estimateExplanation === undefined ? null : (
+                <span className="sr-only">
+                  {strings.estimatedAria(formattedValue, estimateExplanation)}
+                </span>
+              )}
+              {costText}
+            </span>
+          ) : (
+            <a
+              data-testid="overview-cost-evidence-link"
+              href={buildOverviewDashboardHref(locale, model, config)}
+              title={
+                estimateExplanation === undefined
+                  ? evidenceAria
+                  : `${estimateExplanation} ${evidenceAria}`
+              }
+              aria-label={
+                estimateExplanation === undefined
+                  ? `${formattedValue}. ${evidenceAria}`
+                  : `${strings.estimatedAria(formattedValue, estimateExplanation)} ${evidenceAria}`
+              }
+              className={RAW_SOURCE_LINK_CLASS}
+            >
+              {costText}
+            </a>
+          )}
+        </span>
+        {comparison === null ? null : (
+          <CostDeltaBadge
+            comparison={comparison}
+            comparisonMode={comparisonMode}
+            hardware={member.hardware}
+            formatters={formatters}
+            strings={strings}
+            referenceLabel={referenceLabel}
+            phoneRow={phoneRow}
+          />
+        )}
+      </div>
+      {member.precision === null ? null : (
+        <div className="min-w-0 text-2xs leading-tight font-normal text-muted-foreground">
+          {config === null ? (
+            member.precision.toUpperCase()
+          ) : phoneRow && stackPrefix !== null && decodeLabel !== null ? (
+            <>
+              <span className="block">{stackPrefix}</span>
+              <span className="block">{decodeLabel}</span>
+            </>
+          ) : (
+            stackBadge
+          )}
+        </div>
+      )}
+      <OverviewApiRatioBadge
+        model={model.model}
+        scenario={model.scenario}
+        hardware={member.hardware}
+        hardwareLabel={member.hardwareLabel}
+        hardwareCostPerMtok={member.costPerMtok}
+        strings={strings}
+        cost={formatters.cost}
+      />
+      {config === null || historicalConfig === null ? null : (
+        <OverviewHistoryDetailLink
+          href={buildOverviewHistoryDashboardHref(locale, model, config, historicalConfig)}
+          model={model.model}
+          hardware={member.hardware}
+          ariaLabel={strings.compareCurvesAria(model.modelLabel, member.hardwareLabel)}
+        >
+          {strings.compareCurvesLink}
+        </OverviewHistoryDetailLink>
+      )}
+    </div>
+  );
+}
+
+function PlatformCell(props: {
+  locale: OverviewLocale;
+  model: OverviewModelSummary;
+  platform: OverviewPlatformResult;
+  formatters: Formatters;
+  strings: OverviewStrings;
+  comparisonMode: OverviewComparisonMode;
+  referenceHardware: OverviewReferenceHardware;
+  referenceCost: number | null;
+  referenceLabel: string;
+  phoneRow?: boolean;
+}) {
+  return (
+    <div data-testid="overview-platform" data-hardware={props.platform.hardware}>
+      <CellValue
+        locale={props.locale}
+        model={props.model}
+        member={props.platform}
+        formatters={props.formatters}
+        strings={props.strings}
+        comparisonMode={props.comparisonMode}
+        referenceHardware={props.referenceHardware}
+        referenceCost={props.referenceCost}
+        referenceLabel={props.referenceLabel}
+        phoneRow={props.phoneRow}
+      />
+    </div>
+  );
+}
+
+function ModelName({ model, strings }: { model: OverviewModelSummary; strings: OverviewStrings }) {
+  const badge = strings.categoryBadges[model.category];
+  const label = strings.scenarioLabels[model.scenario];
+  const shortLabel = strings.scenarioLabelsShort[model.scenario];
+  return (
+    <div>
+      <h2 className="text-sm font-semibold leading-snug">
+        <ModelLogo model={model.model} className="mr-1.5" />
+        {model.modelLabel}
+        {badge === undefined ? null : (
+          <span
+            data-testid="overview-model-category-badge"
+            data-category={model.category}
+            title={strings.categoryBadgeTitle}
+            className="ml-1.5 inline-block rounded-sm border border-border/60 px-1 align-middle text-3xs font-medium text-muted-foreground"
+          >
+            {badge}
+            <span className="sr-only normal-case">{strings.categoryBadgeTitle}</span>
+          </span>
+        )}
+      </h2>
+      <p
+        data-testid="overview-model-scenario"
+        title={label}
+        className="mt-0.5 text-2xs font-normal leading-tight text-muted-foreground"
+      >
+        {shortLabel === label ? (
+          label
+        ) : (
+          <>
+            <span className="sr-only">{label}</span>
+            <span aria-hidden="true">{shortLabel}</span>
+          </>
+        )}
+      </p>
+    </div>
+  );
+}
+
+interface SurfaceProps {
+  models: OverviewModelSummary[];
+  locale: OverviewLocale;
+  formatters: Formatters;
+  strings: OverviewStrings;
+  comparisonMode: OverviewComparisonMode;
+  referenceHardware: OverviewReferenceHardware;
+}
+
+const HEADER_EDGE_COVER =
+  'relative after:absolute after:inset-x-0 after:top-full after:hidden after:h-0.5 after:bg-inherit [@container_scroll-state(stuck:top)]:after:block';
+
+function referenceBandStyle(
+  platforms: readonly OverviewPlatformResult[],
+  comparisonMode: OverviewComparisonMode,
+  referenceHardware: OverviewReferenceHardware,
+): CSSProperties | undefined {
+  const index = platforms.findIndex((platform) => platform.hardware === referenceHardware);
+  if (comparisonMode !== 'hardware' || index === -1) return undefined;
+  const start = `${(index / platforms.length) * 100}%`;
+  const end = `${((index + 1) / platforms.length) * 100}%`;
+  return {
+    backgroundImage: `linear-gradient(to right, transparent ${start}, var(--border) ${start}, var(--border) calc(${start} + 1px), var(--ref-fill) calc(${start} + 1px), var(--ref-fill) calc(${end} - 1px), var(--border) calc(${end} - 1px), var(--border) ${end}, transparent ${end})`,
+  };
+}
+
+export function DesktopOverviewMatrix({
+  models,
+  locale,
+  formatters,
+  strings,
+  comparisonMode,
+  referenceHardware,
+  presenting = false,
+}: SurfaceProps & { presenting?: boolean }) {
+  const platforms = models[0]?.platforms ?? [];
+  const referenceLabel = overviewHardwareLabel(referenceHardware);
+  return (
+    <div className={presenting ? 'block' : 'hidden xl:block'}>
+      <table data-testid="overview-desktop-matrix" className="w-full border-collapse text-sm">
+        <caption className="sr-only">
+          {comparisonMode === 'hardware'
+            ? strings.caption
+            : strings.historyCaption(OVERVIEW_HISTORY_WINDOW_DAYS[comparisonMode])}
+        </caption>
+        <colgroup>
+          <col className="w-[19%]" />
+          {platforms.map((platform) => (
+            <col key={platform.hardware} className="w-[13.8%]" />
+          ))}
+          <col className="w-[12%]" />
+        </colgroup>
+        <thead className="sticky top-14 z-20 bg-card [container-type:scroll-state]">
+          <tr className="text-xs text-muted-foreground">
+            <th
+              scope="col"
+              className={`h-10 bg-card px-4 text-left font-medium shadow-[inset_0_-1px_0_var(--border),0_6px_6px_-6px_rgb(0_0_0/0.25)] lg:px-6 ${HEADER_EDGE_COVER}`}
+            >
+              {strings.modelHeader}
+            </th>
+            {platforms.map((platform) => (
+              <th
+                key={platform.hardware}
+                scope="col"
+                className={`h-10 px-3 text-left ${HEADER_EDGE_COVER} ${comparisonMode === 'hardware' && platform.hardware === referenceHardware ? 'bg-[color-mix(in_srgb,var(--muted)_15%,var(--card))] font-semibold text-foreground shadow-[inset_0_-1px_0_var(--border),inset_1px_0_0_var(--border),inset_-1px_0_0_var(--border),0_6px_6px_-6px_rgb(0_0_0/0.25)] after:shadow-[inset_1px_0_0_var(--border),inset_-1px_0_0_var(--border)] dark:bg-[color-mix(in_srgb,var(--muted)_50%,var(--card))]' : 'bg-card font-medium shadow-[inset_0_-1px_0_var(--border),0_6px_6px_-6px_rgb(0_0_0/0.25)]'}`}
+              >
+                {comparisonMode === 'hardware' && platform.hardware === referenceHardware
+                  ? `${platform.hardwareLabel} · ${strings.referenceHeader}`
+                  : platform.hardwareLabel}
+              </th>
+            ))}
+            <th
+              scope="col"
+              data-testid="overview-api-header"
+              title={strings.apiHeaderTitle}
+              className={`h-10 bg-card px-3 text-left font-normal text-muted-foreground shadow-[inset_0_-1px_0_var(--border),inset_1px_0_0_var(--border),0_6px_6px_-6px_rgb(0_0_0/0.25)] ${HEADER_EDGE_COVER}`}
+            >
+              {strings.apiHeader}
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {models.map((model) => {
+            const referenceCost =
+              model.platforms.find((platform) => platform.hardware === referenceHardware)
+                ?.costPerMtok ?? null;
+            const rowBlank = model.platforms.every(isPlatformBlank);
+            return (
+              <tr
+                key={`${model.model}-${model.scenario}`}
+                data-testid="overview-desktop-model"
+                data-model={model.model}
+                data-scenario={model.scenario}
+                className="border-b border-border/50 last:border-b-0"
+              >
+                <th scope="row" className="px-4 py-2.5 text-left align-top font-normal lg:px-6">
+                  <ModelName model={model} strings={strings} />
+                  {comparisonMode === 'hardware' && (
+                    <OverviewDetailLink
+                      href={detailHref(locale, model)}
+                      model={model.model}
+                      ariaLabel={strings.detailAria(
+                        model.modelLabel,
+                        strings.scenarioLabels[model.scenario],
+                      )}
+                      className="mt-1 text-xs xl:min-h-6"
+                    >
+                      {strings.detailLink}
+                    </OverviewDetailLink>
+                  )}
+                </th>
+                {rowBlank ? (
+                  <td
+                    colSpan={model.platforms.length}
+                    style={referenceBandStyle(model.platforms, comparisonMode, referenceHardware)}
+                    className="px-3 py-2.5 align-top [--ref-fill:color-mix(in_srgb,var(--muted)_15%,transparent)] dark:[--ref-fill:color-mix(in_srgb,var(--muted)_50%,transparent)]"
+                  >
+                    <NoResultsRow text={strings.noResultsRow} />
+                  </td>
+                ) : (
+                  model.platforms.map((platform) => (
+                    <td
+                      key={platform.hardware}
+                      style={costDeltaCellStyle(
+                        platform,
+                        comparisonMode,
+                        referenceHardware,
+                        referenceCost,
+                      )}
+                      className={`px-3 py-2.5 align-top ${comparisonMode === 'hardware' && platform.hardware === referenceHardware ? 'bg-muted/15 shadow-[inset_1px_0_0_var(--border),inset_-1px_0_0_var(--border)] dark:bg-muted/50' : ''}`}
+                    >
+                      <PlatformCell
+                        locale={locale}
+                        model={model}
+                        platform={platform}
+                        formatters={formatters}
+                        strings={strings}
+                        comparisonMode={comparisonMode}
+                        referenceHardware={referenceHardware}
+                        referenceCost={referenceCost}
+                        referenceLabel={referenceLabel}
+                      />
+                    </td>
+                  ))
+                )}
+                <td
+                  data-testid="overview-api-cell"
+                  className="bg-muted/10 px-3 py-2.5 align-top shadow-[inset_1px_0_0_var(--border)]"
+                >
+                  <OverviewApiCell
+                    model={model.model}
+                    scenario={model.scenario}
+                    locale={locale}
+                    strings={strings}
+                    cost={formatters.cost}
+                  />
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+export function MobileOverviewList({
+  models,
+  locale,
+  formatters,
+  strings,
+  comparisonMode,
+  referenceHardware,
+}: SurfaceProps) {
+  const referenceLabel = overviewHardwareLabel(referenceHardware);
+  return (
+    <ul data-testid="overview-mobile-list" className="divide-y divide-border/50 xl:hidden">
+      {models.map((model) => {
+        const referenceCost =
+          model.platforms.find((platform) => platform.hardware === referenceHardware)
+            ?.costPerMtok ?? null;
+        return (
+          <li key={`${model.model}-${model.scenario}`}>
+            <article
+              data-testid="overview-mobile-model"
+              data-model={model.model}
+              data-scenario={model.scenario}
+              className="space-y-1 px-4 py-3"
+            >
+              <ModelName model={model} strings={strings} />
+              {model.platforms.every(isPlatformBlank) ? (
+                <NoResultsRow text={strings.noResultsRow} />
+              ) : (
+                <div className="grid grid-cols-1">
+                  {model.platforms.map((platform) => (
+                    <div
+                      key={platform.hardware}
+                      data-testid="overview-mobile-platform-row"
+                      data-hardware={platform.hardware}
+                      style={costDeltaCellStyle(
+                        platform,
+                        comparisonMode,
+                        referenceHardware,
+                        referenceCost,
+                      )}
+                      className="grid min-w-0 grid-cols-[6.5rem_minmax(0,1fr)] items-baseline gap-x-3 border-b border-border/30 py-1 last:border-b-0"
+                    >
+                      <span
+                        data-testid="overview-mobile-hardware"
+                        className="whitespace-nowrap text-xs font-medium text-muted-foreground"
+                      >
+                        {platform.hardwareLabel}
+                      </span>
+                      <PlatformCell
+                        locale={locale}
+                        model={model}
+                        platform={platform}
+                        formatters={formatters}
+                        strings={strings}
+                        comparisonMode={comparisonMode}
+                        referenceHardware={referenceHardware}
+                        referenceCost={referenceCost}
+                        referenceLabel={referenceLabel}
+                        phoneRow
+                      />
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div
+                data-testid="overview-mobile-api-row"
+                className="grid min-w-0 grid-cols-[6.5rem_minmax(0,1fr)] items-baseline gap-x-3 border-t border-dashed border-border/60 pt-1.5"
+              >
+                <span
+                  title={strings.apiHeaderTitle}
+                  className="whitespace-nowrap text-xs font-normal text-muted-foreground"
+                >
+                  {strings.apiHeader}
+                </span>
+                <OverviewApiCell
+                  model={model.model}
+                  scenario={model.scenario}
+                  locale={locale}
+                  strings={strings}
+                  cost={formatters.cost}
+                  phoneRow
+                />
+              </div>
+              {comparisonMode === 'hardware' && (
+                <OverviewDetailLink
+                  href={detailHref(locale, model)}
+                  model={model.model}
+                  ariaLabel={strings.detailAria(
+                    model.modelLabel,
+                    strings.scenarioLabels[model.scenario],
+                  )}
+                  className="min-h-11 text-sm"
+                >
+                  {strings.detailLink}
+                </OverviewDetailLink>
+              )}
+            </article>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+function ActiveSwitcherOption({
+  control,
+  children,
+  ...props
+}: ComponentPropsWithoutRef<'span'> & { control: OverviewNavControl }) {
+  const { focusIntent } = useOverviewNavigation();
+  const ref = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    if (focusIntent.current !== control) return;
+    focusIntent.current = null;
+    ref.current?.focus({ preventScroll: true });
+  }, [control, focusIntent]);
+  return (
+    <span {...props} ref={ref} tabIndex={-1}>
+      {children}
+    </span>
+  );
+}
+
+export function OverviewTierSwitcher({
+  tier,
+  engineScope,
+  comparisonMode,
+  referenceHardware,
+  modelScope,
+  rowScope,
+  hardwareRowScope,
+  locale,
+  strings,
+}: {
+  tier: OverviewTier;
+  engineScope: OverviewEngineScope;
+  comparisonMode: OverviewComparisonMode;
+  referenceHardware: OverviewReferenceHardware;
+  modelScope: OverviewModelScope;
+  rowScope: OverviewRowScope;
+  hardwareRowScope: OverviewHardwareRowScope;
+  locale: OverviewLocale;
+  strings: OverviewStrings;
+}) {
+  return (
+    <OverviewTierSlider
+      tier={tier}
+      engineScope={engineScope}
+      comparisonMode={comparisonMode}
+      referenceHardware={referenceHardware}
+      modelScope={modelScope}
+      rowScope={rowScope}
+      hardwareRowScope={hardwareRowScope}
+      locale={locale}
+      label={strings.tierNavLabel}
+      unit={strings.tierUnit}
+    />
+  );
+}
+
+export function OverviewEngineScopeSwitcher({
+  engineScope,
+  tier,
+  comparisonMode,
+  referenceHardware,
+  modelScope,
+  rowScope,
+  hardwareRowScope,
+  locale,
+  strings,
+}: {
+  engineScope: OverviewEngineScope;
+  tier: OverviewTier;
+  comparisonMode: OverviewComparisonMode;
+  referenceHardware: OverviewReferenceHardware;
+  modelScope: OverviewModelScope;
+  rowScope: OverviewRowScope;
+  hardwareRowScope: OverviewHardwareRowScope;
+  locale: OverviewLocale;
+  strings: OverviewStrings;
+}) {
+  const options: OverviewEngineScope[] = ['community', 'all'];
+  const optionClass = `inline-flex min-h-11 min-w-0 items-center ${SEGMENT_RADIUS_STYLE} px-2 py-1 text-left text-sm font-medium leading-snug focus-visible:outline-none md:min-h-6 md:py-0.5`;
+  const navigation = useOverviewNavigation();
+  const optionHref = (option: OverviewEngineScope) =>
+    overviewEngineScopeHref(
+      locale,
+      option,
+      tier,
+      comparisonMode,
+      referenceHardware,
+      modelScope,
+      rowScope,
+      hardwareRowScope,
+    );
+  return (
+    <nav
+      data-testid="overview-engine-scope-switcher"
+      aria-label={strings.engineScopeNavLabel}
+      className="flex w-full min-w-0 flex-col items-start gap-1.5 text-xs sm:w-auto"
+    >
+      <Label>{strings.engineScopeNavLabel}</Label>
+      <Select
+        value={engineScope}
+        onValueChange={(next: OverviewEngineScope) => {
+          if (next === engineScope) return;
+          track('overview_selector_changed', { control: 'engine', value: next });
+          navigation.push(optionHref(next), ['engine']);
+        }}
+      >
+        <SelectTrigger
+          aria-label={strings.engineScopeNavLabel}
+          className="h-auto min-h-11 w-full whitespace-normal text-left sm:hidden"
+          data-testid="overview-engine-scope-select"
+        >
+          <SelectValue>{strings.engineScopeShortOptions[engineScope]}</SelectValue>
+        </SelectTrigger>
+        <SelectContent>
+          {options.map((option) => (
+            <SelectItem key={option} value={option}>
+              {strings.engineScopeShortOptions[option]}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      <div className={`${SEGMENTED_CONTAINER_STYLE} max-sm:hidden`}>
+        {options.map((option) =>
+          option === engineScope ? (
+            <ActiveSwitcherOption
+              key={option}
+              control="engine"
+              data-overview-engine-scope={option}
+              aria-current="true"
+              className={`${optionClass} bg-muted font-medium text-foreground dark:bg-input`}
+            >
+              {strings.engineScopeOptions[option]}
+            </ActiveSwitcherOption>
+          ) : (
+            <OverviewNavLink
+              key={option}
+              data-overview-engine-scope={option}
+              href={optionHref(option)}
+              analytics={{ control: 'engine', value: option }}
+              searchKeys={['engine']}
+              className={`${optionClass} text-muted-foreground transition-colors hover:text-foreground`}
+            >
+              {strings.engineScopeOptions[option]}
+            </OverviewNavLink>
+          ),
+        )}
+      </div>
+    </nav>
+  );
+}
+
+export function OverviewComparisonSwitcher({
+  comparisonMode,
+  engineScope,
+  tier,
+  referenceHardware,
+  modelScope,
+  rowScope,
+  hardwareRowScope,
+  locale,
+  strings,
+}: {
+  comparisonMode: OverviewComparisonMode;
+  engineScope: OverviewEngineScope;
+  tier: OverviewTier;
+  referenceHardware: OverviewReferenceHardware;
+  modelScope: OverviewModelScope;
+  rowScope: OverviewRowScope;
+  hardwareRowScope: OverviewHardwareRowScope;
+  locale: OverviewLocale;
+  strings: OverviewStrings;
+}) {
+  const referenceLabel = overviewHardwareLabel(referenceHardware);
+  const referenceOptions = OVERVIEW_HARDWARE.map((hardware) => ({
+    value: hardware,
+    label: overviewHardwareLabel(hardware),
+    href: overviewHref(
+      locale,
+      tier,
+      engineScope,
+      'hardware',
+      hardware,
+      modelScope,
+      rowScope,
+      hardwareRowScope,
+    ),
+  }));
+  const windowOptions = OVERVIEW_HISTORY_WINDOWS.map((window) => ({
+    value: window,
+    label: strings.historyWindowOptions[window],
+    href: overviewHref(locale, tier, engineScope, window, referenceHardware, modelScope),
+  }));
+  const optionClass =
+    'relative inline-flex min-h-11 min-w-32 items-center justify-center whitespace-nowrap border-b-2 px-4 py-2 text-sm font-medium transition-colors duration-200 focus-visible:outline-none sm:min-w-36';
+  const inactiveOptionClass =
+    'border-transparent text-muted-foreground hover:border-muted-foreground/30 hover:text-foreground';
+  return (
+    <nav
+      data-testid="overview-comparison-switcher"
+      aria-label={strings.comparisonNavLabel}
+      className="flex flex-wrap justify-start gap-x-1 gap-y-1.5 sm:gap-x-1.5"
+    >
+      {comparisonMode === 'hardware' ? (
+        <ActiveSwitcherOption
+          control="comparison"
+          data-overview-comparison="hardware"
+          aria-current="true"
+          className={`${optionClass} border-brand text-foreground`}
+        >
+          <span className="inline-flex items-center gap-0.5">
+            <span>{locale === 'zh' ? '对比 ' : 'vs '}</span>
+            <OverviewReferenceSelect
+              ariaLabel={strings.referenceSelectorAria}
+              options={referenceOptions}
+            />
+          </span>
+        </ActiveSwitcherOption>
+      ) : (
+        <OverviewNavLink
+          data-overview-comparison="hardware"
+          href={overviewHref(
+            locale,
+            tier,
+            engineScope,
+            'hardware',
+            referenceHardware,
+            modelScope,
+            rowScope,
+            hardwareRowScope,
+          )}
+          analytics={{ control: 'comparison', value: 'hardware' }}
+          searchKeys={['compare']}
+          className={`${optionClass} ${inactiveOptionClass}`}
+        >
+          {strings.hardwareComparisonLabel(referenceLabel)}
+        </OverviewNavLink>
+      )}
+      {comparisonMode === 'hardware' ? (
+        <OverviewNavLink
+          data-overview-comparison={OVERVIEW_DEFAULT_HISTORY_WINDOW}
+          href={overviewHref(
+            locale,
+            tier,
+            engineScope,
+            OVERVIEW_DEFAULT_HISTORY_WINDOW,
+            referenceHardware,
+            modelScope,
+            rowScope,
+            hardwareRowScope,
+          )}
+          analytics={{ control: 'comparison', value: OVERVIEW_DEFAULT_HISTORY_WINDOW }}
+          searchKeys={['compare']}
+          className={`${optionClass} ${inactiveOptionClass}`}
+        >
+          {strings.comparisonOptions.history}
+        </OverviewNavLink>
+      ) : (
+        <ActiveSwitcherOption
+          control="comparison"
+          data-overview-comparison={comparisonMode}
+          aria-current="true"
+          className={`${optionClass} border-brand text-foreground`}
+        >
+          <span className="inline-flex items-center gap-0.5">
+            <span>{locale === 'zh' ? '对比 ' : 'vs '}</span>
+            <OverviewHistoryWindowSelect
+              ariaLabel={strings.historyWindowSelectAria}
+              value={comparisonMode}
+              options={windowOptions}
+            />
+          </span>
+        </ActiveSwitcherOption>
+      )}
+    </nav>
+  );
+}
+
+type OverviewScopeToggleVariant = 'section' | 'toolbar';
+
+const SCOPE_CHIP_CLASS = buttonVariants({ variant: 'outline', size: 'xs' });
+
+function ScopeChipCount({ count }: { count: number }) {
+  return (
+    <span aria-hidden="true" className="tabular-nums text-muted-foreground">
+      {count}
+    </span>
+  );
+}
+
+export function OverviewModelScopeToggle({
+  modelScope,
+  tier,
+  engineScope,
+  comparisonMode,
+  referenceHardware,
+  rowScope,
+  hardwareRowScope,
+  locale,
+  strings,
+  variant = 'section',
+}: {
+  modelScope: OverviewModelScope;
+  tier: OverviewTier;
+  engineScope: OverviewEngineScope;
+  comparisonMode: OverviewComparisonMode;
+  referenceHardware: OverviewReferenceHardware;
+  rowScope: OverviewRowScope;
+  hardwareRowScope: OverviewHardwareRowScope;
+  locale: OverviewLocale;
+  strings: OverviewStrings;
+  variant?: OverviewScopeToggleVariant;
+}) {
+  const target: OverviewModelScope = modelScope === 'all' ? 'default' : 'all';
+  const targetRowScope: OverviewRowScope = target === 'all' ? 'all' : rowScope;
+  const targetHardwareRowScope: OverviewHardwareRowScope =
+    target === 'all' ? 'all' : hardwareRowScope;
+  const sentence = modelScope === 'all' ? strings.modelScopeHide : strings.modelScopeShow;
+  const link = (
+    <OverviewNavLink
+      data-overview-model-scope={target}
+      href={overviewHref(
+        locale,
+        tier,
+        engineScope,
+        comparisonMode,
+        referenceHardware,
+        target,
+        targetRowScope,
+        targetHardwareRowScope,
+      )}
+      analytics={{ control: 'models', value: target }}
+      searchKeys={['models', 'rows', 'hwrows']}
+      aria-label={sentence}
+      title={sentence}
+      className={SCOPE_CHIP_CLASS}
+    >
+      {modelScope === 'all' ? strings.modelScopeChipHide : strings.modelScopeChipShow}
+    </OverviewNavLink>
+  );
+  if (variant === 'toolbar') return link;
+  return (
+    <nav
+      data-testid="overview-model-scope-toggle"
+      aria-label={strings.modelScopeNavLabel}
+      className="text-xs"
+    >
+      {link}
+    </nav>
+  );
+}
+
+export function OverviewRowScopeToggle({
+  rowScope,
+  unchangedRowCount,
+  windowDays,
+  tier,
+  engineScope,
+  referenceHardware,
+  modelScope,
+  locale,
+  strings,
+  variant = 'section',
+}: {
+  rowScope: OverviewRowScope;
+  windowDays: number;
+  unchangedRowCount: number;
+  tier: OverviewTier;
+  engineScope: OverviewEngineScope;
+  referenceHardware: OverviewReferenceHardware;
+  modelScope: OverviewModelScope;
+  locale: OverviewLocale;
+  strings: OverviewStrings;
+  variant?: OverviewScopeToggleVariant;
+}) {
+  if (unchangedRowCount === 0) return null;
+  const target: OverviewRowScope = rowScope === 'all' ? 'changed' : 'all';
+  const sentence =
+    rowScope === 'all'
+      ? strings.rowScopeHide(unchangedRowCount, windowDays)
+      : strings.rowScopeShow(unchangedRowCount, windowDays);
+  const link = (
+    <OverviewNavLink
+      data-overview-row-scope={target}
+      href={overviewHref(
+        locale,
+        tier,
+        engineScope,
+        OVERVIEW_DEFAULT_HISTORY_WINDOW,
+        referenceHardware,
+        modelScope,
+        target,
+      )}
+      analytics={{ control: 'rows', value: target }}
+      searchKeys={['rows']}
+      aria-label={sentence}
+      title={sentence}
+      className={SCOPE_CHIP_CLASS}
+    >
+      {rowScope === 'all' ? strings.rowScopeChipHide : strings.rowScopeChipShow}
+      {variant === 'section' ? <ScopeChipCount count={unchangedRowCount} /> : null}
+    </OverviewNavLink>
+  );
+  if (variant === 'toolbar') return link;
+  return (
+    <nav
+      data-testid="overview-row-scope-toggle"
+      aria-label={strings.rowScopeNavLabel(windowDays)}
+      className="text-xs"
+    >
+      {link}
+    </nav>
+  );
+}
+
+export function OverviewHardwareRowScopeToggle({
+  hardwareRowScope,
+  emptyRowCount,
+  tier,
+  engineScope,
+  referenceHardware,
+  modelScope,
+  locale,
+  strings,
+  variant = 'section',
+}: {
+  hardwareRowScope: OverviewHardwareRowScope;
+  emptyRowCount: number;
+  tier: OverviewTier;
+  engineScope: OverviewEngineScope;
+  referenceHardware: OverviewReferenceHardware;
+  modelScope: OverviewModelScope;
+  locale: OverviewLocale;
+  strings: OverviewStrings;
+  variant?: OverviewScopeToggleVariant;
+}) {
+  if (emptyRowCount === 0) return null;
+  const target: OverviewHardwareRowScope = hardwareRowScope === 'all' ? 'priced' : 'all';
+  const sentence =
+    hardwareRowScope === 'all'
+      ? strings.hardwareRowScopeHide(emptyRowCount)
+      : strings.hardwareRowScopeShow(emptyRowCount);
+  const link = (
+    <OverviewNavLink
+      data-overview-hardware-row-scope={target}
+      href={overviewHref(
+        locale,
+        tier,
+        engineScope,
+        'hardware',
+        referenceHardware,
+        modelScope,
+        OVERVIEW_DEFAULT_ROW_SCOPE,
+        target,
+      )}
+      analytics={{ control: 'hwrows', value: target }}
+      searchKeys={['hwrows']}
+      aria-label={sentence}
+      title={sentence}
+      className={SCOPE_CHIP_CLASS}
+    >
+      {hardwareRowScope === 'all'
+        ? strings.hardwareRowScopeChipHide
+        : strings.hardwareRowScopeChipShow}
+      {variant === 'section' ? <ScopeChipCount count={emptyRowCount} /> : null}
+    </OverviewNavLink>
+  );
+  if (variant === 'toolbar') return link;
+  return (
+    <nav
+      data-testid="overview-hardware-row-scope-toggle"
+      aria-label={strings.hardwareRowScopeNavLabel}
+      className="text-xs"
+    >
+      {link}
+    </nav>
+  );
+}
+
+export function OverviewMethodology({
+  strings,
+  comparisonMode,
+  referenceHardware,
+}: {
+  strings: OverviewStrings;
+  comparisonMode: OverviewComparisonMode;
+  referenceHardware: OverviewReferenceHardware;
+}) {
+  const referenceLabel = overviewHardwareLabel(referenceHardware);
+  return (
+    <div
+      data-testid="overview-methodology"
+      className="space-y-1 text-xs leading-snug text-muted-foreground"
+    >
+      {comparisonMode === 'hardware' ? null : (
+        <p>{strings.historyCaption(OVERVIEW_HISTORY_WINDOW_DAYS[comparisonMode])}</p>
+      )}
+      <p>
+        {comparisonMode === 'hardware'
+          ? strings.cellStateLegend(referenceLabel)
+          : strings.historyCellStateLegend(OVERVIEW_HISTORY_WINDOW_DAYS[comparisonMode])}
+      </p>
+      <p>{strings.methodologyNote}</p>
+      <p data-testid="overview-api-methodology">{strings.apiMethodologyNote}</p>
+    </div>
+  );
+}

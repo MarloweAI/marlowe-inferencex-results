@@ -1,0 +1,493 @@
+import type { DbClient } from '../connection.js';
+import type { PowerAudit, WorkerPower } from '../etl/benchmark-mapper.js';
+import { withStoredPerPoolBasis } from '../etl/disagg-throughput';
+export type { PowerAudit, WorkerPower } from '../etl/benchmark-mapper.js';
+
+/**
+ * One entry in `BenchmarkRow.workers` — mirrors the runner's aggregate_power.py
+ * per-worker payload. Structurally identical to the ingest-side {@link WorkerPower},
+ * so it is aliased to that single definition rather than redeclared, keeping the
+ * shape from drifting within this package. The read side keeps the
+ * `BenchmarkWorkerRow` name used by `BenchmarkRow.workers`.
+ */
+export type BenchmarkWorkerRow = WorkerPower;
+
+export interface BenchmarkRow {
+  /** Stable benchmark_results id used for agentic detail lookups. */
+  id: number;
+  hardware: string;
+  framework: string;
+  model: string;
+  precision: string;
+  spec_method: string;
+  disagg: boolean;
+  is_multinode: boolean;
+  prefill_tp: number;
+  prefill_ep: number;
+  prefill_dp_attention: boolean;
+  prefill_num_workers: number;
+  decode_tp: number;
+  decode_ep: number;
+  decode_dp_attention: boolean;
+  decode_num_workers: number;
+  num_prefill_gpu: number;
+  num_decode_gpu: number;
+  benchmark_type: string;
+  isl: number | null;
+  osl: number | null;
+  conc: number;
+  offload_mode: string;
+  image: string | null;
+  /** Producer-generated identity for the complete recipe; null on legacy rows. */
+  recipe_fingerprint?: string | null;
+  metrics: Record<string, number>;
+  /**
+   * Per-worker measured-power breakdown emitted on multinode / disagg runs.
+   * Stored in the dedicated `workers` JSONB column on `benchmark_results`
+   * (added in migration 006). Null for single-node runs and any run predating
+   * aggregate_power.py's multinode patch — surfaced as undefined here.
+   */
+  workers?: BenchmarkWorkerRow[];
+  /** Producer reason codes for withheld power; null/undefined on other rows. */
+  power_invalid_reasons?: string[] | null;
+  /** Narrowed measurement-window audit; null/undefined on legacy rows. */
+  power_audit?: PowerAudit | null;
+  date: string;
+  /** Producer identity and timestamp; preserved for per-point provenance. */
+  workflow_run_id?: number;
+  run_started_at?: string | null;
+  run_url: string | null;
+  /** Logical snapshot identity. Set when an append-only run carries older points forward. */
+  curve_date?: string;
+  curve_workflow_run_id?: number;
+  curve_run_started_at?: string | null;
+}
+
+const SQL_PIECE = Symbol('sql-piece');
+
+interface SqlPiece {
+  readonly [SQL_PIECE]: true;
+  readonly strings: string[];
+  readonly values: unknown[];
+}
+
+/**
+ * Compose static SQL fragments before invoking a database driver. The final
+ * DbClient call receives one ordinary TemplateStringsArray plus bound values;
+ * neither Neon HTTP nor postgres.js has to interpret driver-specific fragments.
+ */
+function sqlPiece(strings: TemplateStringsArray, ...values: unknown[]): SqlPiece {
+  const composedStrings = [strings[0] ?? ''];
+  const composedValues: unknown[] = [];
+
+  for (const [index, value] of values.entries()) {
+    if (typeof value === 'object' && value !== null && SQL_PIECE in value) {
+      const piece = value as SqlPiece;
+      composedStrings[composedStrings.length - 1] += piece.strings[0] ?? '';
+      for (const [pieceIndex, pieceValue] of piece.values.entries()) {
+        composedValues.push(pieceValue);
+        composedStrings.push(piece.strings[pieceIndex + 1] ?? '');
+      }
+      composedStrings[composedStrings.length - 1] += strings[index + 1] ?? '';
+    } else {
+      composedValues.push(value);
+      composedStrings.push(strings[index + 1] ?? '');
+    }
+  }
+
+  return {
+    [SQL_PIECE]: true,
+    strings: composedStrings,
+    values: composedValues,
+  };
+}
+
+function executeSqlPiece(sql: DbClient, piece: SqlPiece) {
+  const strings = [...piece.strings] as unknown as TemplateStringsArray;
+  Object.defineProperty(strings, 'raw', { value: [...piece.strings] });
+  return sql(strings, ...piece.values);
+}
+
+type AsOf = { runId: number } | { startedAt: string | null };
+
+type RecursiveBenchmarkVariant =
+  | {
+      kind: 'latest';
+      date: string;
+      exact: boolean;
+      asOf?: AsOf;
+    }
+  | {
+      kind: 'run';
+      githubRunId: number;
+    }
+  | {
+      kind: 'history';
+      isl: number | null;
+      osl: number | null;
+      benchmarkType?: string;
+    };
+
+interface RecursiveBenchmarkPlan {
+  runLineFilter: SqlPiece;
+  seed: SqlPiece;
+  pointIdentity: SqlPiece;
+  pointOrder: SqlPiece;
+  metricsExpression: SqlPiece;
+  resultOrder: SqlPiece;
+}
+
+// An AgentX curve spans AGG/disagg and offload lines that may run different images, so
+// append-only runs inherit only while every shared line keeps its image, as InferenceX's
+// append-only check requires. `line_images` is NULL when a line has a missing or second
+function curveRunBase(modelKeys: string[], runLineFilter: SqlPiece): SqlPiece {
+  return sqlPiece`
+    ranked_runs AS (
+      SELECT l.curve_scope, l.workflow_run_id, l.date, l.line_images, l.point_ids,
+        wr.run_started_at, wr.github_run_id, wr.append_only,
+        row_number() OVER (
+          PARTITION BY l.curve_scope
+          ORDER BY l.date DESC, wr.run_started_at DESC NULLS LAST, l.workflow_run_id DESC
+        ) AS run_rank
+      FROM benchmark_curve_run_lines l
+      JOIN latest_workflow_runs wr ON wr.id = l.workflow_run_id
+      WHERE l.model = ANY(${modelKeys})
+        ${runLineFilter}
+    )`;
+}
+
+const CURVE_RECURSION = sqlPiece`
+  UNION ALL
+
+  SELECT
+    older.*,
+    current.chain_images || older.line_images,
+    current.snapshot_date,
+    current.snapshot_workflow_run_id
+  FROM curve_runs current
+  JOIN ranked_runs older
+    ON older.curve_scope = current.curve_scope
+    AND older.run_rank = current.run_rank + 1
+  WHERE current.append_only
+    AND current.chain_images IS NOT NULL
+    AND older.line_images IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM jsonb_each_text(older.line_images) older_line
+      WHERE current.chain_images ->> older_line.key <> older_line.value
+    )`;
+
+const CURVE_POINT_SOURCE = sqlPiece`
+  FROM curve_runs cr
+  CROSS JOIN LATERAL unnest(cr.point_ids) AS point(id)
+  JOIN benchmark_results br ON br.id = point.id`;
+
+function executeRecursiveBenchmarkQuery(
+  sql: DbClient,
+  modelKeys: string[],
+  plan: RecursiveBenchmarkPlan,
+) {
+  const query = sqlPiece`
+    WITH RECURSIVE
+    ${curveRunBase(modelKeys, plan.runLineFilter)},
+    ${plan.seed}
+    ${CURVE_RECURSION}
+    ), selected_points AS (
+      SELECT DISTINCT ON (
+        ${plan.pointIdentity}
+      ) br.id, cr.snapshot_date, cr.snapshot_workflow_run_id
+      ${CURVE_POINT_SOURCE}
+      ORDER BY
+        ${plan.pointOrder}
+    )
+    SELECT
+      br.id,
+      c.hardware,
+      c.framework,
+      c.model,
+      c.precision,
+      c.spec_method,
+      c.disagg,
+      c.is_multinode,
+      c.prefill_tp,
+      c.prefill_ep,
+      c.prefill_dp_attention,
+      c.prefill_num_workers,
+      c.decode_tp,
+      c.decode_ep,
+      c.decode_dp_attention,
+      c.decode_num_workers,
+      c.num_prefill_gpu,
+      c.num_decode_gpu,
+      br.benchmark_type,
+      br.offload_mode,
+      br.isl,
+      br.osl,
+      br.conc,
+      br.image,
+      br.recipe_fingerprint,
+      ${plan.metricsExpression},
+      br.workers,
+      br.power_invalid_reasons,
+      br.power_audit,
+      br.date::text,
+      br.workflow_run_id,
+      wr.run_started_at::text,
+      CASE WHEN wr.github_run_id < 0 THEN wr.html_url WHEN wr.html_url IS NOT NULL THEN wr.html_url || '/attempts/' || wr.run_attempt ELSE NULL END AS run_url,
+      sp.snapshot_date::text AS curve_date,
+      sp.snapshot_workflow_run_id AS curve_workflow_run_id,
+      snapshot_wr.run_started_at::text AS curve_run_started_at
+    FROM selected_points sp
+    JOIN benchmark_results br ON br.id = sp.id
+    JOIN configs c ON c.id = br.config_id
+    JOIN latest_workflow_runs wr ON wr.id = br.workflow_run_id
+    JOIN latest_workflow_runs snapshot_wr ON snapshot_wr.id = sp.snapshot_workflow_run_id
+    ORDER BY ${plan.resultOrder}
+  `;
+  return executeSqlPiece(sql, query);
+}
+
+function queryRecursiveBenchmarks(
+  sql: DbClient,
+  modelKeys: string[],
+  variant: RecursiveBenchmarkVariant,
+) {
+  const pointIdentity = sqlPiece`
+    br.config_id, br.benchmark_type, br.isl, br.osl, br.offload_mode,
+    br.recipe_fingerprint, br.conc`;
+  const pointOrder = sqlPiece`
+    br.config_id, br.benchmark_type, br.isl, br.osl, br.offload_mode,
+    br.recipe_fingerprint, br.conc, cr.run_rank`;
+  const rawMetrics = sqlPiece`br.metrics`;
+
+  switch (variant.kind) {
+    case 'latest': {
+      const datePredicate = variant.exact
+        ? sqlPiece`r.date = ${variant.date}::date`
+        : sqlPiece`r.date <= ${variant.date}::date`;
+      const asOfBound =
+        variant.asOf === undefined
+          ? null
+          : 'startedAt' in variant.asOf
+            ? sqlPiece`${variant.asOf.startedAt}::timestamptz`
+            : sqlPiece`(SELECT lwr.run_started_at FROM latest_workflow_runs lwr WHERE lwr.github_run_id = ${variant.asOf.runId})`;
+      const asOfPredicate =
+        !variant.exact && asOfBound
+          ? sqlPiece`AND (
+              r.run_started_at IS NULL
+              OR r.run_started_at <= COALESCE(${asOfBound}, 'infinity'::timestamptz)
+            )`
+          : sqlPiece``;
+      const seed = sqlPiece`
+        seed_runs AS (
+          SELECT DISTINCT ON (r.curve_scope)
+            r.*
+          FROM ranked_runs r
+          WHERE ${datePredicate}
+            ${asOfPredicate}
+          ORDER BY
+            r.curve_scope,
+            r.date DESC, r.run_started_at DESC NULLS LAST, r.workflow_run_id DESC
+        ), curve_runs AS (
+          SELECT
+            seed_runs.*,
+            seed_runs.line_images AS chain_images,
+            seed_runs.date AS snapshot_date,
+            seed_runs.workflow_run_id AS snapshot_workflow_run_id
+          FROM seed_runs`;
+      return executeRecursiveBenchmarkQuery(sql, modelKeys, {
+        runLineFilter: sqlPiece``,
+        seed,
+        pointIdentity,
+        pointOrder,
+        metricsExpression: rawMetrics,
+        resultOrder: sqlPiece`br.config_id, br.conc, br.isl, br.osl,
+          br.benchmark_type, br.offload_mode, br.recipe_fingerprint`,
+      });
+    }
+    case 'run': {
+      const seed = sqlPiece`
+        curve_runs AS (
+          SELECT
+            ranked_runs.*,
+            ranked_runs.line_images AS chain_images,
+            ranked_runs.date AS snapshot_date,
+            ranked_runs.workflow_run_id AS snapshot_workflow_run_id
+          FROM ranked_runs
+          WHERE github_run_id = ${variant.githubRunId}`;
+      return executeRecursiveBenchmarkQuery(sql, modelKeys, {
+        runLineFilter: sqlPiece``,
+        seed,
+        pointIdentity,
+        pointOrder,
+        metricsExpression: rawMetrics,
+        resultOrder: sqlPiece`br.config_id, br.conc, br.isl, br.osl, br.offload_mode,
+          br.benchmark_type, br.recipe_fingerprint`,
+      });
+    }
+    case 'history': {
+      const runLineFilter =
+        variant.benchmarkType === 'agentic_traces'
+          ? sqlPiece`AND l.benchmark_type = 'agentic_traces'`
+          : sqlPiece`AND l.isl = ${variant.isl} AND l.osl = ${variant.osl}`;
+      const seed = sqlPiece`
+        curve_runs AS (
+          SELECT
+            ranked_runs.*,
+            ranked_runs.line_images AS chain_images,
+            ranked_runs.date AS snapshot_date,
+            ranked_runs.workflow_run_id AS snapshot_workflow_run_id
+          FROM ranked_runs`;
+      return executeRecursiveBenchmarkQuery(sql, modelKeys, {
+        runLineFilter,
+        seed,
+        pointIdentity: sqlPiece`
+          cr.snapshot_workflow_run_id,
+          br.config_id, br.benchmark_type, br.isl, br.osl, br.offload_mode,
+          br.recipe_fingerprint, br.conc`,
+        pointOrder: sqlPiece`
+          cr.snapshot_workflow_run_id,
+          br.config_id, br.benchmark_type, br.isl, br.osl, br.offload_mode,
+          br.recipe_fingerprint, br.conc, cr.run_rank`,
+        metricsExpression: sqlPiece`br.metrics - '{std_ttft,std_tpot,std_e2el,std_intvty,std_itl,mean_ttft,mean_tpot,mean_e2el,mean_intvty,mean_itl}'::text[] AS metrics`,
+        resultOrder: sqlPiece`sp.snapshot_date, c.id, br.conc, sp.snapshot_workflow_run_id,
+          br.benchmark_type, br.isl, br.osl, br.offload_mode, br.recipe_fingerprint`,
+      });
+    }
+  }
+}
+
+/**
+ * Fetch the latest benchmark results for one or more model DB keys across ALL sequences,
+ * up to a given date. Multiple keys support point-release grouping — e.g. passing
+ * `['glm5', 'glm5.1']` unions both buckets under the one display.
+ *
+ * Selection unit is the LINE, not the point. Normally each line comes entirely from
+ * its newest workflow run. Runs explicitly marked append-only are the sole exception:
+ * their new points extend the immediately preceding curve while every shared line keeps
+ * its image, including a consecutive chain of append-only runs back to the nearest full
+ * snapshot.
+ *
+ * The frontend filters by sequence client-side. This eliminates API round-trips when
+ * switching sequences — the data is already cached by React Query.
+ */
+export async function getLatestBenchmarks(
+  sql: DbClient,
+  modelKey: string | string[],
+  date?: string,
+  exact?: boolean,
+  /**
+   * GitHub run id to view the chart "as of" — restricts results to runs that
+   * started no later than this one, so selecting an earlier same-day run shows
+   * the state of the data at that point in time (later runs don't render yet).
+   * No-op when this is the latest run (the filter then includes everything).
+   * Only applied on the date-filtered (non-`exact`) path used by the main chart.
+   */
+  asOfRunId?: string | { startedAt: string | null },
+): Promise<BenchmarkRow[]> {
+  const asOf: AsOf | undefined =
+    exact || !asOfRunId
+      ? undefined
+      : typeof asOfRunId === 'string'
+        ? { runId: Number(asOfRunId) }
+        : asOfRunId;
+
+  const modelKeys = Array.isArray(modelKey) ? modelKey : [modelKey];
+  if (date) {
+    // The latest variant chooses one seed per line under the requested cutoff.
+    // Its recursive history remains unrestricted so an append-only seed can
+    // still reach the nearest earlier full snapshot.
+    const rows = await queryRecursiveBenchmarks(sql, modelKeys, {
+      kind: 'latest',
+      date,
+      exact: exact ?? false,
+      asOf,
+    });
+    return withStoredPerPoolBasis(rows as unknown as BenchmarkRow[]);
+  }
+
+  const rows = await sql`
+    SELECT
+      lb.id,
+      c.hardware,
+      c.framework,
+      c.model,
+      c.precision,
+      c.spec_method,
+      c.disagg,
+      c.is_multinode,
+      c.prefill_tp,
+      c.prefill_ep,
+      c.prefill_dp_attention,
+      c.prefill_num_workers,
+      c.decode_tp,
+      c.decode_ep,
+      c.decode_dp_attention,
+      c.decode_num_workers,
+      c.num_prefill_gpu,
+      c.num_decode_gpu,
+      lb.benchmark_type,
+      lb.offload_mode,
+      lb.isl,
+      lb.osl,
+      lb.conc,
+      lb.image,
+      lb.recipe_fingerprint,
+      lb.metrics,
+      lb.workers,
+      lb.power_invalid_reasons,
+      lb.power_audit,
+      lb.date::text,
+      lb.workflow_run_id,
+      wr.run_started_at::text,
+      CASE WHEN wr.github_run_id < 0 THEN wr.html_url WHEN wr.html_url IS NOT NULL THEN wr.html_url || '/attempts/' || wr.run_attempt ELSE NULL END AS run_url,
+      p.snapshot_date::text AS curve_date,
+      p.snapshot_workflow_run_id AS curve_workflow_run_id,
+      snapshot_wr.run_started_at::text AS curve_run_started_at
+    FROM latest_benchmark_points p
+    JOIN benchmark_results lb ON lb.id = p.id
+    JOIN configs c ON c.id = lb.config_id
+    JOIN workflow_runs wr ON wr.id = lb.workflow_run_id
+    JOIN workflow_runs snapshot_wr ON snapshot_wr.id = p.snapshot_workflow_run_id
+    WHERE p.model = ANY(${modelKeys}) AND c.model = ANY(${modelKeys})
+    ORDER BY lb.config_id, lb.conc, lb.isl, lb.osl, lb.date DESC,
+      lb.benchmark_type, lb.offload_mode, lb.recipe_fingerprint
+  `;
+  return withStoredPerPoolBasis(rows as unknown as BenchmarkRow[]);
+}
+
+/**
+ * Fetch the curve snapshot represented by one workflow run. Ordinary runs return
+ * exactly their own points; append-only runs also include the immediately preceding
+ * curve chain whose shared lines keep their images. Used by GPU comparison for
+ * same-day run snapshots.
+ */
+export async function getBenchmarksForRun(
+  sql: DbClient,
+  modelKey: string | string[],
+  githubRunId: string | number,
+): Promise<BenchmarkRow[]> {
+  const modelKeys = Array.isArray(modelKey) ? modelKey : [modelKey];
+  const rows = await queryRecursiveBenchmarks(sql, modelKeys, {
+    kind: 'run',
+    githubRunId: Number(githubRunId),
+  });
+  return withStoredPerPoolBasis(rows as unknown as BenchmarkRow[]);
+}
+
+/** Fetch every logical curve snapshot across time for historical views. */
+export async function getAllBenchmarksForHistory(
+  sql: DbClient,
+  modelKey: string | string[],
+  isl: number | null,
+  osl: number | null,
+  benchmarkType?: string,
+): Promise<BenchmarkRow[]> {
+  const modelKeys = Array.isArray(modelKey) ? modelKey : [modelKey];
+  const rows = await queryRecursiveBenchmarks(sql, modelKeys, {
+    kind: 'history',
+    isl,
+    osl,
+    benchmarkType,
+  });
+  return withStoredPerPoolBasis(rows as unknown as BenchmarkRow[]);
+}

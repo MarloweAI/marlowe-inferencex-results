@@ -1,0 +1,297 @@
+'use client';
+
+import Image from 'next/image';
+import { usePathname } from 'next/navigation';
+
+import { IntentPrefetchLink } from '@/components/ui/intent-prefetch-link';
+import { ShareTwitterButton, ShareLinkedInButton } from '@/components/ui/share-buttons';
+import { track } from '@/lib/analytics/analytics';
+import { analyticsPlacement } from '@/lib/analytics/placement';
+import { isEmbedPathname } from '@/lib/embed/embed-route';
+import { useLocale } from '@/lib/i18n/use-locale';
+
+import { StarButton } from './footer-star-cta';
+import { AGENTX_ROUTE, getDashboardRoute } from '@/lib/routing/dashboard-routes';
+
+const STRINGS = {
+  en: {
+    description:
+      'Continuous open-source AI accelerator system benchmarking. Real-world, reproducible, auditable performance data trusted by trillion dollar AI infrastructure operators like OpenAI, Meta, Oracle, Microsoft, etc.',
+    semianalysis: 'SemiAnalysis',
+    mainSite: 'Main site',
+    newsletter: 'Newsletter',
+    about: 'About',
+    landAcknowledgement: 'Land acknowledgement',
+    privacyPolicy: 'Privacy policy',
+    cookiePolicy: 'Cookie policy',
+    developers: 'Developers',
+    benchmarks: 'Benchmarks',
+    agentxHarness: 'AgentX harness',
+    visualization: 'Visualization',
+    tools: 'Tools',
+    data: 'Data',
+    learn: 'Learn',
+    supporters: 'Supporters',
+    agentx: 'AgentX',
+    telemetry: 'Telemetry',
+    comparisons: 'Comparisons',
+    articles: 'Articles',
+    hardwareResults: 'Hardware results',
+    whitepapers: 'Whitepapers',
+    apiReference: 'API reference',
+    historicalTrends: 'Historical trends',
+    tcoCalculator: 'TCO calculator',
+    fleetLifecycle: 'Fleet lifecycle',
+    firstTokenLimits: 'First-token limits',
+    cacheReuse: 'Prefix cache reuse',
+    gpuSpecsDashboard: 'Chip specs dashboard',
+    perfPerDollar: 'Performance per dollar',
+    modelArchitectures: 'Model architectures',
+    glossary: 'AI inference glossary',
+    chipSpecs: 'Chip specs & pricing',
+    rankings: 'GPU rankings',
+    runPages: 'Model on GPU results',
+    cta: 'If this data helps your work, consider starring us on GitHub or sharing with your network.',
+    rights: 'All rights reserved.',
+    logoAlt: 'SemiAnalysis logo',
+  },
+  zh: {
+    description:
+      'InferenceX 持续开展开源的 AI 加速器系统基准测试，发布来自真实环境、可复现、可审计的性能数据，并获得 OpenAI、Meta、Oracle、Microsoft 等万亿美元级 AI 基础设施运营方的信赖。',
+    semianalysis: 'SemiAnalysis',
+    mainSite: 'SemiAnalysis 官网',
+    newsletter: '订阅通讯',
+    about: '关于 SemiAnalysis',
+    landAcknowledgement: '原住民传统领地声明',
+    privacyPolicy: '隐私政策',
+    cookiePolicy: 'Cookie 政策',
+    developers: '开发者',
+    benchmarks: '基准测试仓库',
+    agentxHarness: 'AgentX 测试框架',
+    visualization: '可视化工具',
+    tools: '工具',
+    data: '数据',
+    learn: '学习资源',
+    supporters: '业界评价',
+    agentx: 'AgentX',
+    telemetry: '遥测数据',
+    comparisons: '性能对比',
+    articles: '技术文章',
+    hardwareResults: '硬件结果',
+    whitepapers: '白皮书',
+    historicalTrends: '历史趋势',
+    tcoCalculator: 'TCO 计算器',
+    fleetLifecycle: '集群生命周期',
+    firstTokenLimits: '首 token 延迟约束',
+    cacheReuse: '前缀缓存复用',
+    gpuSpecsDashboard: '芯片规格仪表板',
+    apiReference: 'API 文档',
+    perfPerDollar: '每美元性能',
+    modelArchitectures: '模型架构',
+    glossary: 'AI 推理术语表',
+    chipSpecs: '芯片规格与价格',
+    rankings: 'GPU 排行榜',
+    runPages: '模型在 GPU 上的实测结果',
+    cta: '如果这些数据对您的工作有帮助，欢迎在 GitHub 上点个 Star，或分享给同事。',
+    rights: '版权所有。',
+    logoAlt: 'SemiAnalysis 标志',
+  },
+} as const;
+
+const FOOTER_EVENT_PROPERTIES = { placement: 'footer' } as const;
+
+const LINK_CLASS =
+  'inline-flex min-h-11 items-center rounded-md py-1 text-sm leading-snug text-muted-foreground transition-colors hover:text-foreground hover:underline hover:underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:min-h-8';
+
+type FooterStringKey = keyof (typeof STRINGS)['en'];
+
+type FooterLink = readonly [id: string, href: string, label: FooterStringKey, event?: string];
+
+const LINK_GROUPS: readonly {
+  heading: FooterStringKey;
+  links: readonly FooterLink[];
+}[] = [
+  {
+    heading: 'tools',
+    links: [
+      [
+        'historical',
+        getDashboardRoute('historical').path,
+        'historicalTrends',
+        'footer_historical_clicked',
+      ],
+      [
+        'calculator',
+        getDashboardRoute('calculator').path,
+        'tcoCalculator',
+        'footer_calculator_clicked',
+      ],
+      ['fleet', getDashboardRoute('fleet').path, 'fleetLifecycle', 'footer_fleet_clicked'],
+      [
+        'first-token',
+        getDashboardRoute('first-token').path,
+        'firstTokenLimits',
+        'footer_first_token_clicked',
+      ],
+      [
+        'cache-reuse',
+        getDashboardRoute('cache-reuse').path,
+        'cacheReuse',
+        'footer_cache_reuse_clicked',
+      ],
+      ['gpu-specs', getDashboardRoute('gpu-specs').path, 'gpuSpecsDashboard'],
+    ],
+  },
+  {
+    heading: 'data',
+    links: [
+      ['compare', '/compare', 'comparisons', 'footer_compare_clicked'],
+      ['compare-per-dollar', '/compare-per-dollar', 'perfPerDollar'],
+      ['rankings', '/rankings', 'rankings'],
+      ['hardware', '/hardware', 'hardwareResults', 'footer_hardware_clicked'],
+      ['run', '/run', 'runPages'],
+      ['chips', '/chips', 'chipSpecs'],
+    ],
+  },
+  {
+    heading: 'learn',
+    links: [
+      ['agentx', AGENTX_ROUTE.path, 'agentx', 'footer_agentx_clicked'],
+      ['articles', '/blog', 'articles', 'footer_articles_clicked'],
+      ['whitepapers', '/whitepaper', 'whitepapers', 'footer_whitepapers_clicked'],
+      ['model-architectures', '/model', 'modelArchitectures'],
+      ['glossary', '/glossary', 'glossary'],
+    ],
+  },
+  {
+    heading: 'developers',
+    links: [
+      ['api', '/api', 'apiReference', 'footer_api_clicked'],
+      [
+        'telemetry',
+        `${getDashboardRoute('inference').path}/agentic`,
+        'telemetry',
+        'footer_telemetry_clicked',
+      ],
+      ['benchmarks', 'https://github.com/SemiAnalysisAI/InferenceX', 'benchmarks'],
+      ['agentx-harness', 'https://github.com/SemiAnalysisAI/agentx-harness', 'agentxHarness'],
+      ['visualization', 'https://github.com/SemiAnalysisAI/InferenceX-app', 'visualization'],
+    ],
+  },
+  {
+    heading: 'semianalysis',
+    links: [
+      ['main-site', 'https://semianalysis.com', 'mainSite'],
+      ['newsletter', 'https://newsletter.semianalysis.com', 'newsletter'],
+      ['about', 'https://semianalysis.com/about/', 'about'],
+      ['supporters', '/quotes', 'supporters', 'footer_supporters_clicked'],
+      ['land-acknowledgement', '/land-acknowledgement', 'landAcknowledgement'],
+      ['privacy', 'https://semianalysis.com/privacy-policy/', 'privacyPolicy'],
+      ['cookies', 'https://semianalysis.com/cookie-policy/', 'cookiePolicy'],
+    ],
+  },
+];
+
+export const Footer = () => {
+  const locale = useLocale();
+  const pathname = usePathname();
+  const t = STRINGS[locale];
+  const prefix = locale === 'zh' ? '/zh' : '';
+  if (isEmbedPathname(pathname)) return null;
+  return (
+    <footer
+      data-testid="footer"
+      {...analyticsPlacement('footer')}
+      className="relative mt-auto w-full overflow-visible pt-12 md:pt-16"
+    >
+      <div className="container mx-auto border-t border-border/30 px-4 py-10 lg:px-8">
+        <div className="mb-8 grid gap-8 lg:grid-cols-[14rem_minmax(0,1fr)] lg:gap-x-10">
+          <div data-testid="footer-brand" className="flex min-w-0 flex-col items-start gap-3">
+            <IntentPrefetchLink
+              data-testid="footer-brand-link"
+              target="_blank"
+              href="https://semianalysis.com/"
+              className="inline-block w-35 h-14.5"
+            >
+              <Image
+                width={140}
+                height={58}
+                src="/brand/logo-color.webp"
+                alt={t.logoAlt}
+                className="h-auto"
+              />
+            </IntentPrefetchLink>
+            <p
+              data-testid="footer-brand-description"
+              className="max-w-prose text-sm leading-relaxed text-muted-foreground lg:max-w-xs"
+            >
+              {t.description}
+            </p>
+          </div>
+
+          <div
+            data-testid="footer-links"
+            className="grid min-w-0 grid-cols-2 gap-x-6 gap-y-6 break-words sm:grid-cols-3 xl:grid-cols-5"
+          >
+            {LINK_GROUPS.map((group) => (
+              <div
+                key={group.heading}
+                data-testid={`footer-links-${group.heading}`}
+                className="flex min-w-0 flex-col gap-1"
+              >
+                <h2 className="mb-1 text-sm font-semibold text-foreground">{t[group.heading]}</h2>
+                {group.links.map(([id, href, label, event]) =>
+                  href.startsWith('https://') ? (
+                    <a
+                      key={id}
+                      data-testid={`footer-link-${id}`}
+                      href={href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className={LINK_CLASS}
+                    >
+                      {t[label]}
+                    </a>
+                  ) : (
+                    <IntentPrefetchLink
+                      key={id}
+                      data-testid={`footer-link-${id}`}
+                      href={`${prefix}${href}`}
+                      onClick={event ? () => track(event, FOOTER_EVENT_PROPERTIES) : undefined}
+                      className={LINK_CLASS}
+                    >
+                      {t[label]}
+                    </IntentPrefetchLink>
+                  ),
+                )}
+              </div>
+            ))}
+          </div>
+
+          <div
+            data-testid="footer-cta"
+            className="flex min-w-0 flex-col gap-4 pt-6 sm:flex-row sm:items-center sm:justify-between lg:col-span-2"
+          >
+            <div data-testid="footer-social-buttons" className="flex items-center gap-2">
+              <StarButton />
+              <ShareTwitterButton />
+              <ShareLinkedInButton />
+            </div>
+            <p className="max-w-xl text-sm leading-relaxed text-muted-foreground sm:text-right">
+              {t.cta}
+            </p>
+          </div>
+        </div>
+
+        <div
+          data-testid="footer-bottom-bar"
+          className="flex flex-col items-center justify-between gap-4 border-t border-border/30 pt-6 md:flex-row"
+        >
+          <p data-testid="footer-copyright" className="text-xs text-muted-foreground">
+            &copy; {new Date().getFullYear()} semianalysis.com. {t.rights}
+          </p>
+        </div>
+      </div>
+    </footer>
+  );
+};

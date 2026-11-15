@@ -1,0 +1,547 @@
+'use client';
+
+import { ArrowLeft, ArrowRight } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import Link from 'next/link';
+
+import { Button } from '@/components/ui/button';
+import { Card } from '@/components/ui/card';
+import { ExternalLinkIcon } from '@/components/ui/external-link-icon';
+import { Input } from '@/components/ui/input';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { Stat } from '@/components/ui/stat';
+import { DistributionCard } from '@/components/datasets/distribution-card';
+import {
+  useDataset,
+  useDatasetConversations,
+  type ConversationSort,
+  type DatasetDetail as DatasetDetailRecord,
+} from '@/hooks/api/use-datasets';
+import { track } from '@/lib/analytics/analytics';
+import { useSearchTracking } from '@/lib/analytics/use-search-tracking';
+import { useLocale } from '@/lib/i18n/use-locale';
+import { getDatasetDescription } from './dataset-description';
+import { compact, formatPct, formatShare, localeNumber, perConversation } from './format';
+import { AGENTX_ROUTE } from '@/lib/routing/dashboard-routes';
+
+const PAGE = 50;
+const SEARCH_DEBOUNCE_MS = 250;
+
+const STRINGS = {
+  en: {
+    loading: 'Loading dataset…',
+    loadError: 'Failed to load dataset',
+    notFound: 'Dataset not found',
+    retry: 'Retry',
+    backToDatasets: 'Back to AgentX',
+    breadcrumbDatasets: 'AgentX',
+    viewOnHf: 'View on HuggingFace',
+    conversations: 'Conversations',
+    medianReqConvo: 'Median requests / convo',
+    meanReqConvo: 'Mean requests / convo',
+    mainTurns: 'Main turns',
+    medianSubagents: 'Median subagents / trace',
+    meanSubagents: 'Mean subagents / trace',
+    cachedInput: 'Cached input',
+    totalTokens: 'Total tokens',
+    overviewGroup: 'Conversation overview',
+    agentMixGroup: 'Agent and token mix',
+    modelMix: 'Model mix (turns)',
+    distributions: 'Distributions',
+    inputTokensPerTurn: 'Input tokens per turn',
+    outputTokensPerTurn: 'Output tokens per turn',
+    uncachedInputPerReq: 'Uncached input tokens per request',
+    turnsPerConvo: 'Turns per conversation',
+    subagentIsl: 'Subagent request ISL',
+    subagentIslSub: 'Inner subagent requests only',
+    subagentOsl: 'Subagent request OSL',
+    subagentOslSub: 'Inner subagent requests only',
+    cachedFraction: 'Cached fraction per turn',
+    searchPlaceholder: 'Search by ID…',
+    searchAria: 'Search conversations',
+    sortAria: 'Sort conversations',
+    sortTokens: 'Total input ↓',
+    sortTurns: 'Turns ↓',
+    sortSubagents: 'Subagent groups ↓',
+    sortId: 'Conversation ID',
+    thConversation: 'Conversation',
+    thTurns: 'Turns',
+    thSubagents: 'Subagents',
+    thInput: 'Input',
+    thOutput: 'Output',
+    thCached: 'Cached',
+    modelSuffix: (n: number) => `${n} model${n === 1 ? '' : 's'}`,
+    noMatch: 'No conversations match',
+    loadingConversations: 'Loading conversations…',
+    conversationsError: 'Failed to load conversations',
+    prev: 'Prev',
+    next: 'Next',
+    pageOf: (p: number, total: number) => `Page ${p} of ${total}`,
+  },
+  zh: {
+    loading: '正在加载数据集…',
+    loadError: '数据集加载失败',
+    notFound: '未找到数据集',
+    retry: '重试',
+    backToDatasets: '返回 AgentX',
+    breadcrumbDatasets: 'AgentX',
+    viewOnHf: '在 HuggingFace 查看',
+    conversations: '对话数',
+    medianReqConvo: '每对话中位请求数',
+    meanReqConvo: '每对话平均请求数',
+    mainTurns: '主轮次',
+    medianSubagents: '每 trace 中位 subagent 数',
+    meanSubagents: '每 trace 平均 subagent 数',
+    cachedInput: '缓存输入',
+    totalTokens: '总 token 数',
+    overviewGroup: '对话概览',
+    agentMixGroup: 'Agent 与 token 组成',
+    modelMix: '模型组合（按轮次）',
+    distributions: '分布',
+    inputTokensPerTurn: '每轮输入 token 数',
+    outputTokensPerTurn: '每轮输出 token 数',
+    uncachedInputPerReq: '每请求未缓存输入 token 数',
+    turnsPerConvo: '每对话轮次数',
+    subagentIsl: 'Subagent 请求 ISL',
+    subagentIslSub: '仅内部 subagent 请求',
+    subagentOsl: 'Subagent 请求 OSL',
+    subagentOslSub: '仅内部 subagent 请求',
+    cachedFraction: '每轮缓存比例',
+    searchPlaceholder: '按 ID 搜索…',
+    searchAria: '搜索对话',
+    sortAria: '对话排序',
+    sortTokens: '总输入 ↓',
+    sortTurns: '轮次 ↓',
+    sortSubagents: 'Subagent 组 ↓',
+    sortId: '对话 ID',
+    thConversation: '对话',
+    thTurns: '轮次',
+    thSubagents: 'Subagent 数',
+    thInput: '输入',
+    thOutput: '输出',
+    thCached: '缓存',
+    modelSuffix: (n: number) => `${n} 个模型`,
+    noMatch: '没有匹配的对话',
+    loadingConversations: '正在加载对话…',
+    conversationsError: '对话加载失败',
+    prev: '上一页',
+    next: '下一页',
+    pageOf: (p: number, total: number) => `第 ${p} 页，共 ${total} 页`,
+  },
+} as const;
+
+export function DatasetDetail({
+  slug,
+  initialDataset,
+}: {
+  slug: string;
+  /** The record the server page already resolved, so the heading and summary render on the server. */
+  initialDataset?: DatasetDetailRecord;
+}) {
+  const { data: dataset, isLoading, isError, refetch } = useDataset(slug, initialDataset);
+  const [searchInput, setSearchInput] = useState('');
+  useSearchTracking('datasets_conversations_searched', searchInput, { slug });
+  const [{ search, sort, page }, setConversationQuery] = useState({
+    search: '',
+    sort: 'tokens' as ConversationSort,
+    page: 0,
+  });
+  const locale = useLocale();
+  const t = STRINGS[locale];
+  const prefix = locale === 'zh' ? '/zh' : '';
+
+  const sorts: { value: ConversationSort; label: string }[] = [
+    { value: 'tokens', label: t.sortTokens },
+    { value: 'turns', label: t.sortTurns },
+    { value: 'subagents', label: t.sortSubagents },
+    { value: 'id', label: t.sortId },
+  ];
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setConversationQuery((current) => {
+        if (current.search === searchInput && current.page === 0) return current;
+        return { ...current, search: searchInput, page: 0 };
+      });
+    }, SEARCH_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [searchInput]);
+
+  const {
+    data: convs,
+    isFetching,
+    isPlaceholderData,
+    isError: conversationsError,
+  } = useDatasetConversations({
+    slug,
+    search,
+    sort,
+    limit: PAGE,
+    offset: page * PAGE,
+  });
+  const paginationPending = searchInput !== search || isFetching || isPlaceholderData;
+
+  if (isLoading) {
+    return (
+      <div
+        className="min-h-svh py-12 text-center text-sm text-muted-foreground"
+        data-testid="dataset-detail-loading"
+      >
+        {t.loading}
+      </div>
+    );
+  }
+  if (isError) {
+    return (
+      <div
+        className="flex min-h-svh flex-wrap items-center justify-center gap-2 py-12 text-center text-sm text-destructive"
+        role="alert"
+        data-testid="dataset-detail-error"
+        data-locale={locale}
+      >
+        <span>{t.loadError}</span>
+        <button
+          type="button"
+          className="text-brand underline"
+          onClick={() => {
+            track('datasets_detail_retry_clicked', { slug });
+            void refetch();
+          }}
+        >
+          {t.retry}
+        </button>
+        <Link href={`${prefix}${AGENTX_ROUTE.path}`} className="text-brand underline">
+          {t.backToDatasets}
+        </Link>
+      </div>
+    );
+  }
+  if (!dataset) {
+    return (
+      <div
+        className="min-h-svh py-12 text-center text-sm text-destructive"
+        data-testid="dataset-detail-not-found"
+        data-locale={locale}
+      >
+        {t.notFound}{' '}
+        <Link href={`${prefix}${AGENTX_ROUTE.path}`} className="text-brand underline">
+          {t.backToDatasets}
+        </Link>
+      </div>
+    );
+  }
+
+  const s = dataset.summary ?? {};
+  const description = getDatasetDescription(dataset, locale);
+  const cd = dataset.chart_data ?? {};
+  const total = convs?.total ?? 0;
+  const pageCount = Math.ceil(total / PAGE);
+
+  return (
+    <div className="min-h-svh flex flex-col gap-6">
+      <div>
+        <Link
+          href={`${prefix}${AGENTX_ROUTE.path}`}
+          className="inline-flex min-h-8 items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <ArrowLeft aria-hidden="true" className="size-4" />
+          {t.breadcrumbDatasets}
+        </Link>
+        <div className="mt-2 flex flex-wrap items-baseline justify-between gap-2">
+          <h1 className="text-2xl font-semibold text-foreground">{dataset.label}</h1>
+          <div className="flex items-center gap-2 text-sm">
+            <span className="font-mono text-muted-foreground">{dataset.variant}</span>
+            {dataset.hf_url && (
+              <a
+                href={dataset.hf_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={() => track('datasets_hf_link_clicked', { slug })}
+                className="group text-brand hover:underline"
+              >
+                {t.viewOnHf}
+                <ExternalLinkIcon aria-hidden="true" />
+              </a>
+            )}
+          </div>
+        </div>
+        {description && (
+          <p
+            data-testid="dataset-description"
+            className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground"
+          >
+            {description}
+          </p>
+        )}
+      </div>
+
+      <Card className="p-4">
+        <div className="grid gap-4 lg:grid-cols-[1.1fr_1fr]">
+          <section className="min-w-0" aria-labelledby="dataset-overview-group">
+            <h2
+              id="dataset-overview-group"
+              className="mb-2 text-xs font-medium text-muted-foreground"
+            >
+              {t.overviewGroup}
+            </h2>
+            <dl className="grid grid-cols-2 gap-4 sm:grid-cols-4 lg:grid-cols-2">
+              <Stat
+                label={t.conversations}
+                value={localeNumber(dataset.conversation_count, locale)}
+              />
+              <Stat
+                label={t.medianReqConvo}
+                value={perConversation(s.medianRequestsPerConversation, locale)}
+              />
+              <Stat
+                label={t.meanReqConvo}
+                value={perConversation(s.meanRequestsPerConversation, locale)}
+              />
+              <Stat label={t.mainTurns} value={compact(s.mainTurns ?? 0)} />
+            </dl>
+          </section>
+          <section className="min-w-0" aria-labelledby="dataset-agent-mix-group">
+            <h2
+              id="dataset-agent-mix-group"
+              className="mb-2 text-xs font-medium text-muted-foreground"
+            >
+              {t.agentMixGroup}
+            </h2>
+            <dl className="grid grid-cols-2 gap-4 sm:grid-cols-4 lg:grid-cols-2">
+              <Stat
+                label={t.medianSubagents}
+                value={perConversation(s.medianSubagentsPerTrace, locale)}
+              />
+              <Stat
+                label={t.meanSubagents}
+                value={perConversation(s.meanSubagentsPerTrace, locale)}
+              />
+              <Stat label={t.cachedInput} value={formatPct(s.cachedPct)} />
+              <Stat label={t.totalTokens} value={compact((s.totalIn ?? 0) + (s.totalOut ?? 0))} />
+            </dl>
+          </section>
+        </div>
+        {s.modelMix && Object.keys(s.modelMix).length > 0 && (
+          <div className="mt-4 border-t border-border/20 pt-3">
+            <div className="mb-1.5 text-xs font-medium text-muted-foreground">{t.modelMix}</div>
+            <div className="flex flex-wrap gap-2">
+              {Object.entries(s.modelMix)
+                .toSorted((a, b) => b[1] - a[1])
+                .map(([model, count]) => (
+                  <span
+                    key={model}
+                    className="rounded-md border border-border/30 px-2 py-0.5 text-xs text-foreground"
+                  >
+                    {model} <span className="text-muted-foreground">{compact(count)}</span>
+                  </span>
+                ))}
+            </div>
+          </div>
+        )}
+      </Card>
+
+      <section className="flex flex-col gap-3">
+        <h2 className="text-lg font-semibold text-foreground">{t.distributions}</h2>
+        <div className="grid gap-4 lg:grid-cols-2">
+          <DistributionCard
+            title={t.inputTokensPerTurn}
+            unit="tokens"
+            scale="log"
+            distribution={cd.inputTokensPerTurn}
+          />
+          <DistributionCard
+            title={t.outputTokensPerTurn}
+            unit="tokens"
+            scale="log"
+            distribution={cd.outputTokensPerTurn}
+          />
+          <DistributionCard
+            title={t.uncachedInputPerReq}
+            unit="tokens"
+            scale="log"
+            distribution={cd.uncachedInputTokensPerTurn}
+          />
+          <DistributionCard
+            title={t.turnsPerConvo}
+            unit="turns"
+            distribution={cd.turnsPerConversation}
+          />
+          <DistributionCard
+            title={t.subagentIsl}
+            subtitle={t.subagentIslSub}
+            unit="tokens"
+            scale="log"
+            distribution={cd.subagentInputTokensPerRequest}
+          />
+          <DistributionCard
+            title={t.subagentOsl}
+            subtitle={t.subagentOslSub}
+            unit="tokens"
+            scale="log"
+            distribution={cd.subagentOutputTokensPerRequest}
+          />
+          <DistributionCard
+            title={t.cachedFraction}
+            unit=""
+            distribution={cd.cachedFractionPerTurn}
+            formatValue={formatPct}
+          />
+        </div>
+      </section>
+
+      <section className="flex flex-col gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h2 className="text-lg font-semibold text-foreground">
+            {t.conversations}{' '}
+            <span className="text-sm font-normal text-muted-foreground">({total})</span>
+          </h2>
+          <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:items-center">
+            <Input
+              type="text"
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
+              placeholder={t.searchPlaceholder}
+              aria-label={t.searchAria}
+              className="w-full px-2 sm:w-40"
+            />
+            <Select
+              value={sort}
+              onValueChange={(v) => {
+                setConversationQuery((current) => ({
+                  ...current,
+                  sort: v as ConversationSort,
+                  page: 0,
+                }));
+                track('datasets_conversations_sorted', { mode: v });
+              }}
+            >
+              <SelectTrigger className="w-full sm:w-[12rem]" aria-label={t.sortAria}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {sorts.map((o) => (
+                  <SelectItem key={o.value} value={o.value}>
+                    {o.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+
+        <Card className="overflow-hidden p-0 md:p-0">
+          <div className="overflow-x-auto" data-testid="dataset-conversations-table-scroll">
+            <table className="w-full min-w-[40rem] text-sm">
+              <thead className="border-b border-border/20 bg-muted/30 text-xs text-muted-foreground">
+                <tr>
+                  <th className="px-3 py-2 text-left font-medium">{t.thConversation}</th>
+                  <th className="px-3 py-2 text-right font-medium">{t.thTurns}</th>
+                  <th className="px-3 py-2 text-right font-medium">{t.thSubagents}</th>
+                  <th className="px-3 py-2 text-right font-medium">{t.thInput}</th>
+                  <th className="px-3 py-2 text-right font-medium">{t.thOutput}</th>
+                  <th className="px-3 py-2 text-right font-medium">{t.thCached}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(convs?.items ?? []).map((c) => {
+                  const cachedPct = formatShare(c.total_cached, c.total_in);
+                  return (
+                    <tr
+                      key={c.conv_id}
+                      className="border-b border-border/20 last:border-0 hover:bg-accent/40"
+                    >
+                      <td className="px-3 py-2">
+                        <Link
+                          href={`${prefix}${AGENTX_ROUTE.path}/${slug}/conversations/${encodeURIComponent(c.conv_id)}`}
+                          onClick={() => track('datasets_conversation_clicked', { slug })}
+                          className="font-mono text-xs text-brand hover:underline"
+                        >
+                          {c.conv_id.slice(0, 20)}…
+                        </Link>
+                        {c.models.length > 0 && (
+                          <span className="ml-2 text-2xs text-muted-foreground">
+                            {t.modelSuffix(c.models.length)}
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums">{c.num_turns}</td>
+                      <td className="px-3 py-2 text-right tabular-nums">{c.num_subagent_groups}</td>
+                      <td className="px-3 py-2 text-right tabular-nums">{compact(c.total_in)}</td>
+                      <td className="px-3 py-2 text-right tabular-nums">{compact(c.total_out)}</td>
+                      <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">
+                        {cachedPct}
+                      </td>
+                    </tr>
+                  );
+                })}
+                {isFetching && !convs && (
+                  <tr>
+                    <td colSpan={6} className="px-3 py-8 text-center text-xs text-muted-foreground">
+                      {t.loadingConversations}
+                    </td>
+                  </tr>
+                )}
+                {conversationsError && !convs && (
+                  <tr>
+                    <td colSpan={6} className="px-3 py-8 text-center text-xs text-destructive">
+                      {t.conversationsError}
+                    </td>
+                  </tr>
+                )}
+                {!isFetching && !conversationsError && (convs?.items.length ?? 0) === 0 && (
+                  <tr>
+                    <td colSpan={6} className="px-3 py-8 text-center text-xs text-muted-foreground">
+                      {t.noMatch}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+
+        {pageCount > 1 && (
+          <div className="flex items-center justify-center gap-3 text-sm">
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              disabled={paginationPending || page === 0}
+              onClick={() => {
+                const next = Math.max(0, page - 1);
+                track('datasets_conversations_page_changed', { direction: 'prev', page: next });
+                setConversationQuery((current) => ({ ...current, page: next }));
+              }}
+            >
+              <ArrowLeft aria-hidden="true" />
+              {t.prev}
+            </Button>
+            <span className="text-muted-foreground tabular-nums">
+              {t.pageOf(page + 1, pageCount)}
+            </span>
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              disabled={paginationPending || page >= pageCount - 1}
+              onClick={() => {
+                const next = Math.min(pageCount - 1, page + 1);
+                track('datasets_conversations_page_changed', { direction: 'next', page: next });
+                setConversationQuery((current) => ({ ...current, page: next }));
+              }}
+            >
+              {t.next}
+              <ArrowRight aria-hidden="true" />
+            </Button>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}

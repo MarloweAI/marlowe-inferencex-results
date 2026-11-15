@@ -1,0 +1,125 @@
+import { ScaleUpTopologyDiagram } from '@/components/gpu-specs/scale-up-topology-diagram';
+import { registerAnalyticsClient } from '@/lib/analytics/analytics';
+import type { GpuSpec } from '@/lib/catalog/gpu-specs';
+
+const H100_SXM: GpuSpec = {
+  name: 'H100 SXM',
+  vendor: 'nvidia',
+  memory: '80 GB',
+  memoryType: 'HBM3',
+  memoryBandwidth: '3.35 TB/s',
+  fp4: null,
+  fp8: 1979,
+  bf16: 989,
+  scaleUpTech: 'NVLink 4.0',
+  scaleUpBandwidth: '450 GB/s',
+  scaleUpWorldSize: 8,
+  scaleOutBandwidth: '400 Gbit/s',
+  scaleOutTech: 'RoCEv2 Ethernet',
+  nic: 'ConnectX-7 2x200GbE',
+  scaleOutSwitch: '25.6T Arista Tomahawk4 7060DX5-64S',
+  scaleOutTopology: '8-rail optimized',
+  scaleUpTopology: 'Switched 4-rail Optimized',
+  scaleUpSwitch: '7.2Tbit/s NVSwitch Gen 3.0',
+};
+
+const GB200_NVL72: GpuSpec = {
+  name: 'GB200 NVL72',
+  vendor: 'nvidia',
+  memory: '192 GB',
+  memoryType: 'HBM3e',
+  memoryBandwidth: '8 TB/s',
+  fp4: 10000,
+  fp8: 5000,
+  bf16: 2500,
+  scaleUpTech: 'NVLink 5.0',
+  scaleUpBandwidth: '900 GB/s',
+  scaleUpWorldSize: 72,
+  scaleOutBandwidth: null,
+  scaleOutTech: null,
+  nic: null,
+  scaleOutSwitch: null,
+  scaleOutTopology: null,
+  scaleUpTopology: 'Switched 18-rail Optimized',
+  scaleUpSwitch: '28.8Tbit/s NVSwitch Gen 4.0',
+};
+
+const MI300X: GpuSpec = {
+  name: 'MI300X',
+  vendor: 'amd',
+  memory: '192 GB',
+  memoryType: 'HBM3',
+  memoryBandwidth: '5.3 TB/s',
+  fp4: null,
+  fp8: 2615,
+  bf16: 1307,
+  scaleUpTech: 'Infinity Fabric',
+  scaleUpBandwidth: '448 GB/s',
+  scaleUpWorldSize: 8,
+  scaleOutBandwidth: '400 Gbit/s',
+  scaleOutTech: 'RoCEv2 Ethernet',
+  nic: 'Pollara 400GbE',
+  scaleOutSwitch: '51.2T Tomahawk5',
+  scaleOutTopology: '8-rail optimized',
+  scaleUpTopology: 'Full Mesh',
+  scaleUpSwitch: null,
+};
+
+const ALL_SPECS = [H100_SXM, GB200_NVL72, MI300X];
+
+describe('ScaleUpTopologyDiagram', () => {
+  it('click opens dialog with expanded view', () => {
+    cy.mount(<ScaleUpTopologyDiagram spec={H100_SXM} allSpecs={ALL_SPECS} />);
+    cy.get('button[aria-label="Expand H100 SXM scale-up topology diagram"]').click();
+    cy.contains('H100 SXM Scale-up topology').should('be.visible');
+    cy.get('[role="dialog"] svg[role="img"]').should('exist');
+  });
+
+  it('tracks the dialog closing with how long it was open', () => {
+    registerAnalyticsClient({ capture: cy.stub().as('capture') });
+    cy.mount(<ScaleUpTopologyDiagram spec={H100_SXM} allSpecs={ALL_SPECS} />);
+    cy.get('button[aria-label="Expand H100 SXM scale-up topology diagram"]').click();
+    cy.get('[role="dialog"]').should('be.visible');
+    cy.get('body').type('{esc}');
+    cy.get('[role="dialog"]').should('not.exist');
+    cy.get('@capture').should(
+      'have.been.calledWith',
+      'gpu_specs_scaleup_topology_closed',
+      Cypress.sinon.match({ gpu: 'H100 SXM', duration_ms: Cypress.sinon.match.number }),
+    );
+  });
+
+  it('tracks the closing with the GPU shown after Prev/Next, not the card that opened it', () => {
+    registerAnalyticsClient({ capture: cy.stub().as('capture') });
+    cy.mount(<ScaleUpTopologyDiagram spec={H100_SXM} allSpecs={ALL_SPECS} />);
+    cy.get('button[aria-label="Expand H100 SXM scale-up topology diagram"]').click();
+    cy.get('[data-testid="scaleup-topology-nav-next"]').click();
+    cy.contains('GB200 NVL72 Scale-up topology').should('be.visible');
+    cy.get('body').type('{esc}');
+    cy.get('[role="dialog"]').should('not.exist');
+    cy.get('@capture').should(
+      'have.been.calledWith',
+      'gpu_specs_scaleup_topology_closed',
+      Cypress.sinon.match({ gpu: 'GB200 NVL72' }),
+    );
+    cy.get('@capture').should(
+      'not.have.been.calledWith',
+      'gpu_specs_scaleup_topology_closed',
+      Cypress.sinon.match({ gpu: 'H100 SXM' }),
+    );
+  });
+
+  it('Prev/Next navigation works', () => {
+    cy.mount(<ScaleUpTopologyDiagram spec={H100_SXM} allSpecs={ALL_SPECS} />);
+    cy.get('button[aria-label="Expand H100 SXM scale-up topology diagram"]').click();
+    cy.contains('(1 / 3)').should('be.visible');
+    cy.get('[data-testid="scaleup-topology-nav-next"]').click();
+    cy.contains('GB200 NVL72 Scale-up topology').should('be.visible');
+    cy.contains('(2 / 3)').should('be.visible');
+    cy.get('[data-testid="scaleup-topology-nav-next"]').click();
+    cy.contains('MI300X Scale-up topology').should('be.visible');
+    cy.contains('(3 / 3)').should('be.visible');
+    cy.get('[data-testid="scaleup-topology-nav-prev"]').click();
+    cy.contains('GB200 NVL72 Scale-up topology').should('be.visible');
+  });
+});

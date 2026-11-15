@@ -1,0 +1,164 @@
+'use client';
+
+import { Check, Copy, Share2 } from 'lucide-react';
+import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+
+import {
+  ShareLinkedInButton,
+  ShareTwitterButton,
+  shareAnalyticsProperties,
+} from '@/components/ui/share-buttons';
+import { track } from '@/lib/analytics/analytics';
+import { useDialogCloseTracking } from '@/lib/analytics/use-dialog-close-tracking';
+import { buildShareUrl } from '@/lib/routing/url-state';
+import { useLocale } from '@/lib/i18n/use-locale';
+import { cn } from '@/lib/shared/utils';
+import { GlobalFilterSelectionContext } from '@/providers/GlobalFilterContext';
+
+import { Button } from './button';
+import { Popover, PopoverContent, PopoverTrigger } from './popover';
+
+export function ShareButton({ className }: { className?: string } = {}) {
+  const locale = useLocale();
+  const t = {
+    en: {
+      trigger: 'Share',
+      title: 'Share this view',
+      description: 'Anyone with this link will see your current selections and filters.',
+      inputLabel: 'Share link for the current view',
+      copied: 'Copied',
+      copy: 'Copy',
+      shareOn: 'Or share on',
+    },
+    zh: {
+      trigger: '分享',
+      title: '分享当前视图',
+      description: '任何获得此链接的人都能看到当前选择的配置和筛选条件。',
+      inputLabel: '当前视图的分享链接',
+      copied: '已复制',
+      copy: '复制链接',
+      shareOn: '分享到',
+    },
+  }[locale];
+  const [open, setOpen] = useState(false);
+  // Pages outside a GlobalFilterProvider have no model selection, so their share events send none.
+  const model = useContext(GlobalFilterSelectionContext)?.selectedModel;
+  const modelProperties = useMemo(() => (model ? { model } : undefined), [model]);
+  useDialogCloseTracking(open, 'share_popover_closed', {
+    ...shareAnalyticsProperties(),
+    ...modelProperties,
+  });
+  const [copied, setCopied] = useState(false);
+  const [url, setUrl] = useState('');
+  const inputRef = useRef<HTMLInputElement>(null);
+  const socialAnalyticsProperties = { ...modelProperties, placement: 'share_popover' };
+
+  useEffect(() => {
+    if (!open) return;
+    const next = buildShareUrl();
+    setUrl(next);
+    setCopied(false);
+    queueMicrotask(() => {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    });
+  }, [open]);
+
+  const handleCopy = useCallback(async () => {
+    const target = url || buildShareUrl();
+    track('share_link_copied', { ...shareAnalyticsProperties(), ...modelProperties });
+
+    try {
+      await navigator.clipboard.writeText(target);
+    } catch {
+      const textArea = document.createElement('textarea');
+      textArea.value = target;
+      document.body.append(textArea);
+      textArea.select();
+      document.execCommand('copy');
+      textArea.remove();
+    }
+
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+    window.dispatchEvent(new CustomEvent('inferencex:action'));
+  }, [url, modelProperties]);
+
+  return (
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        if (next)
+          track('share_popover_opened', { ...shareAnalyticsProperties(), ...modelProperties });
+        setOpen(next);
+      }}
+    >
+      <PopoverTrigger asChild>
+        <Button
+          data-testid="share-button"
+          size="xs"
+          variant="outline"
+          className={cn('max-sm:w-11', className)}
+          title={t.title}
+        >
+          <Share2 className="size-3.5" />
+          <span className="max-sm:sr-only">{t.trigger}</span>
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent
+        align="end"
+        className="w-80"
+        data-testid="share-popover"
+        onOpenAutoFocus={(event) => {
+          event.preventDefault();
+          inputRef.current?.focus();
+          inputRef.current?.select();
+        }}
+      >
+        <div className="space-y-3">
+          <div>
+            <h4 className="text-sm font-medium">{t.title}</h4>
+            <p className="text-muted-foreground text-xs mt-0.5">{t.description}</p>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <input
+              ref={inputRef}
+              data-testid="share-url-input"
+              readOnly
+              value={url}
+              aria-label={t.inputLabel}
+              onFocus={(event) => event.currentTarget.select()}
+              className="border-input bg-background h-11 flex-1 min-w-0 rounded-md border px-2 font-mono text-xs outline-none md:h-8"
+            />
+            <Button
+              data-testid="share-copy-button"
+              size="xs"
+              variant="outline"
+              className="shrink-0"
+              onClick={handleCopy}
+            >
+              {copied ? (
+                <>
+                  <Check className="size-3.5" />
+                  {t.copied}
+                </>
+              ) : (
+                <>
+                  <Copy className="size-3.5" />
+                  {t.copy}
+                </>
+              )}
+            </Button>
+          </div>
+          <div className="flex items-center justify-between border-t pt-3">
+            <span className="text-muted-foreground text-xs">{t.shareOn}</span>
+            <div className="flex items-center gap-1.5">
+              <ShareTwitterButton analyticsProperties={socialAnalyticsProperties} />
+              <ShareLinkedInButton analyticsProperties={socialAnalyticsProperties} />
+            </div>
+          </div>
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}

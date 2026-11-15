@@ -1,0 +1,507 @@
+import type {
+  AggDataEntry,
+  ChartDefinition,
+  HardwareConfig,
+  InferenceActionsContextType,
+  InferenceData,
+  InferenceDataContextType,
+  InferenceDisplayContextType,
+  InferenceFiltersContextType,
+} from '@/components/inference/types';
+import type {
+  EvaluationChartContextType,
+  EvaluationChartData,
+} from '@/components/evaluation/types';
+import type {
+  GlobalFilterActionsContextType,
+  GlobalFilterAvailabilityContextType,
+  GlobalFilterRunContextType,
+  GlobalFilterSelectionContextType,
+  GlobalFilterWorkflowContextType,
+} from '@/providers/GlobalFilterContext';
+import type { UnofficialRunContextType } from '@/providers/unofficial-run-provider';
+import { computeToggle } from '@/hooks/useTogglableSet';
+import { Model, Sequence, Precision } from '@/lib/catalog/data-mappings';
+import React from 'react';
+
+function namedStub(alias: string) {
+  return (cy.stub() as any).as(alias);
+}
+
+export function createMockHardwareConfig(): HardwareConfig {
+  return {
+    h100: {
+      name: 'h100',
+      label: 'H100',
+      suffix: '',
+      gpu: "NVIDIA 'Hopper' H100",
+    },
+    h200: {
+      name: 'h200',
+      label: 'H200',
+      suffix: '',
+      gpu: "NVIDIA 'Hopper' H200",
+    },
+    b200: {
+      name: 'b200',
+      label: 'B200',
+      suffix: '',
+      gpu: "NVIDIA 'Blackwell' B200",
+    },
+    b200_trt: {
+      name: 'b200-trt',
+      label: 'B200',
+      suffix: '(TRTLLM)',
+      gpu: "NVIDIA 'Blackwell' B200 TRTLLM",
+    },
+    mi300x: {
+      name: 'mi300x',
+      label: 'MI300X',
+      suffix: '',
+      gpu: 'AMD Instinct MI300X',
+    },
+    h100_vllm: {
+      name: 'h100-vllm',
+      label: 'H100',
+      suffix: '(vLLM)',
+      gpu: "NVIDIA 'Hopper' H100 vLLM",
+      framework: 'vllm',
+    },
+    b200_sglang: {
+      name: 'b200-sglang',
+      label: 'B200',
+      suffix: '(SGLang)',
+      gpu: "NVIDIA 'Blackwell' B200 SGLang",
+      framework: 'sglang',
+    },
+  };
+}
+
+export function createMockChartDefinition(overrides?: Partial<ChartDefinition>): ChartDefinition {
+  const chartType = overrides?.chartType ?? 'e2e';
+  const x = overrides?.x ?? (chartType === 'interactivity' ? 'median_intvty' : 'median_e2el');
+  return {
+    chartType,
+    heading: 'End-to-End Latency vs Throughput',
+    x,
+    x_label: chartType === 'interactivity' ? 'Interactivity' : 'End-to-end Latency (s)',
+    y: 'mean_e2el' as keyof AggDataEntry,
+    y_label: 'Mean E2E Latency (ms)',
+    y_tpPerGpu: 'tput_per_gpu',
+    y_tpPerGpu_label: 'Throughput / Chip (tok/s)',
+    y_tpPerGpu_title: 'Throughput per Chip',
+    y_tpPerGpu_roofline: 'upper_right',
+    ...overrides,
+    x_scale_field: overrides?.x_scale_field ?? String(x),
+    x_labelZh:
+      overrides?.x_labelZh ?? (chartType === 'interactivity' ? '交互性' : '端到端延迟（s）'),
+  };
+}
+
+export function createMockInferenceData(overrides?: Partial<InferenceData>): InferenceData {
+  return {
+    x: 100,
+    y: 45.2,
+    hwKey: 'b200_trt',
+    hw: "NVIDIA 'Blackwell' B200 TRTLLM",
+    model: Model.DeepSeek_R1,
+    framework: 'trt',
+    precision: Precision.FP4,
+    tp: 8,
+    conc: 64,
+    date: '2025-03-01',
+    tput_per_gpu: 320,
+    output_tput_per_gpu: 280,
+    input_tput_per_gpu: 40,
+    mean_ttft: 120,
+    median_ttft: 110,
+    std_ttft: 25,
+    p99_ttft: 250,
+    mean_tpot: 12,
+    mean_intvty: 14,
+    median_tpot: 11,
+    median_intvty: 13,
+    std_tpot: 3,
+    std_intvty: 4,
+    p99_tpot: 22,
+    p99_intvty: 28,
+    mean_itl: 11,
+    median_itl: 10,
+    std_itl: 2,
+    p99_itl: 20,
+    mean_e2el: 450,
+    median_e2el: 430,
+    std_e2el: 80,
+    p99_e2el: 680,
+    disagg: false,
+    spec_decoding: 'none',
+    tpPerGpu: { y: 320, roof: true },
+    outputTputPerGpu: { y: 280, roof: false },
+    inputTputPerGpu: { y: 40, roof: false },
+    tpPerMw: { y: 185, roof: false },
+    costh: { y: 0.52, roof: false },
+    costr: { y: 0.45, roof: false },
+    costhi: { y: 0.4, roof: false },
+    costri: { y: 0.35, roof: false },
+    ...overrides,
+  };
+}
+
+export type MockInferenceContextValues = InferenceDataContextType &
+  InferenceFiltersContextType &
+  InferenceDisplayContextType &
+  InferenceActionsContextType;
+
+export function createMockInferenceContextValues(
+  overrides?: Partial<MockInferenceContextValues>,
+): MockInferenceContextValues {
+  const hwConfig = createMockHardwareConfig();
+  return {
+    selectionPoints: [],
+    activeHwTypes: new Set(['h100', 'b200', 'b200_trt', 'mi300x', 'h200']),
+    hwTypesWithData: new Set(['h100', 'b200', 'b200_trt', 'mi300x', 'h200']),
+    toggleHwType: namedStub('toggleHwType'),
+    removeHwType: namedStub('removeHwType'),
+    selectAllHwTypes: namedStub('selectAllHwTypes'),
+    bestPerSku: true,
+    setBestPerSku: namedStub('setBestPerSku'),
+    resolveComparisonSelection: (proposed) => ({
+      result: proposed,
+      keptGroup: null,
+      droppedGroups: [],
+    }),
+    toggleComparisonSelection: (prev, item, allItems) => computeToggle(prev, item, allItems),
+    toggleActiveDate: namedStub('toggleActiveDate'),
+    removeActiveDate: namedStub('removeActiveDate'),
+    selectAllActiveDates: namedStub('selectAllActiveDates'),
+    activeDates: new Set(['2025-03-01']),
+    hardwareConfig: hwConfig,
+    graphs: [
+      {
+        model: Model.DeepSeek_R1,
+        sequence: Sequence.EightK_OneK,
+        chartDefinition: createMockChartDefinition(),
+        data: [createMockInferenceData()],
+      },
+    ],
+    selectedModel: Model.DeepSeek_R1,
+    setSelectedModel: namedStub('setSelectedModel'),
+    selectedSequence: Sequence.EightK_OneK,
+    setSelectedSequence: namedStub('setSelectedSequence'),
+    selectedPrecisions: [Precision.FP4],
+    setSelectedPrecisions: namedStub('setSelectedPrecisions'),
+    loading: false,
+    refreshing: false,
+    error: null,
+    selectedYAxisMetric: 'y_tpPerGpu',
+    setSelectedYAxisMetric: namedStub('setSelectedYAxisMetric'),
+    tokenRevenuePriceSource: 'normalized',
+    tokenRevenuePricing: {
+      source: 'normalized',
+      inputPerMillion: 1,
+      outputPerMillion: 1,
+    },
+    openRouterModelId: 'deepseek/deepseek-r1-0528',
+    openRouterPricingLoading: false,
+    openRouterPricingError: null,
+    setTokenRevenuePriceSource: namedStub('setTokenRevenuePriceSource'),
+    selectedPercentile: 'p90',
+    fixedSequenceStatistic: 'median',
+    setFixedSequenceStatistic: namedStub('setFixedSequenceStatistic'),
+    tokenBasis: 'total',
+    setTokenBasis: namedStub('setTokenBasis'),
+    selectedXAxisMetric: null,
+    setSelectedXAxisMetric: namedStub('setSelectedXAxisMetric'),
+    selectedE2eXAxisMetric: null,
+    selectedXAxisMode: 'interactivity' as const,
+    defaultXAxisMode: 'interactivity' as const,
+    setSelectedXAxisMode: namedStub('setSelectedXAxisMode'),
+    scaleType: 'auto',
+    setScaleType: namedStub('setScaleType'),
+    powerCompare: 'none' as const,
+    setPowerCompare: namedStub('setPowerCompare'),
+    quickFilters: { vendors: [], frameworks: [], deployment: [], spec: [], power: [] },
+    availableQuickFilters: { vendors: [], frameworks: [], deployment: [], spec: [], power: [] },
+    setQuickFilterVendors: namedStub('setQuickFilterVendors'),
+    setQuickFilterFrameworks: namedStub('setQuickFilterFrameworks'),
+    setQuickFilterDeployment: namedStub('setQuickFilterDeployment'),
+    setQuickFilterSpec: namedStub('setQuickFilterSpec'),
+    setQuickFilterPower: namedStub('setQuickFilterPower'),
+    setQuickFilterTopologies: namedStub('setQuickFilterTopologies'),
+    isLegendExpanded: true,
+    setIsLegendExpanded: namedStub('setIsLegendExpanded'),
+    hideNonOptimal: false,
+    setHideNonOptimal: namedStub('setHideNonOptimal'),
+    showPointLabels: false,
+    setShowPointLabels: namedStub('setShowPointLabels'),
+    highContrast: false,
+    setHighContrast: namedStub('setHighContrast'),
+    logScale: false,
+    setLogScale: namedStub('setLogScale'),
+    useAdvancedLabels: false,
+    setUseAdvancedLabels: namedStub('setUseAdvancedLabels'),
+    showConcurrencyLabels: false,
+    setShowConcurrencyLabels: namedStub('setShowConcurrencyLabels'),
+    showGradientLabels: false,
+    setShowGradientLabels: namedStub('setShowGradientLabels'),
+    showLineLabels: false,
+    showOffloadingLabel: true,
+    showFrameworkLabel: true,
+    setShowFrameworkLabel: namedStub('setShowFrameworkLabel'),
+    setShowOffloadingLabel: namedStub('setShowOffloadingLabel'),
+    setShowLineLabels: namedStub('setShowLineLabels'),
+    showParetoFrontier: false,
+    setShowParetoFrontier: namedStub('setShowParetoFrontier'),
+    paretoFrontierPlayful: false,
+    selectedGPUs: [],
+    setSelectedGPUs: namedStub('setSelectedGPUs'),
+    availableGPUs: [
+      { value: 'h100', label: 'H100' },
+      { value: 'b200', label: 'B200' },
+      { value: 'mi300x', label: 'MI300X' },
+      { value: 'h200', label: 'H200' },
+    ],
+    selectedDates: ['2025-03-01'],
+    setSelectedDates: namedStub('setSelectedDates'),
+    setSelectedDatesFromRunExpansion: namedStub('setSelectedDatesFromRunExpansion'),
+    selectedDateRange: { startDate: '2025-02-01', endDate: '2025-03-01' },
+    setSelectedDateRange: namedStub('setSelectedDateRange'),
+    userCosts: null,
+    setUserCosts: namedStub('setUserCosts'),
+    selectedRunDate: '2025-03-01',
+    setSelectedRunDate: namedStub('setSelectedRunDate'),
+    availableDates: ['2025-02-28', '2025-03-01'],
+    dateRangeAvailableDates: ['2025-02-28', '2025-03-01'],
+    isCheckingAvailableDates: false,
+    availableRuns: {},
+    selectedRunId: '12345678',
+    setSelectedRunId: namedStub('setSelectedRunId'),
+    availablePrecisions: [Precision.FP4, Precision.FP8],
+    availableSequences: [Sequence.EightK_OneK, Sequence.OneK_OneK],
+    availableModels: [Model.DeepSeek_R1],
+    userPowers: null,
+    setUserPowers: namedStub('setUserPowers'),
+    setHwFilter: namedStub('setHwFilter'),
+    activePresetId: null,
+    setActivePresetId: namedStub('setActivePresetId'),
+    presetGuardRef: { current: false } as React.RefObject<boolean>,
+    compareGpuPair: null,
+    lockedFrameworks: null,
+    minimalChrome: false,
+    blockedHwToggles: new Map(),
+    ...overrides,
+  };
+}
+
+export function createMockEvaluationChartData(
+  overrides?: Partial<EvaluationChartData>,
+): EvaluationChartData {
+  return {
+    evalResultId: 1,
+    configId: 1,
+    hwKey: 'b200_trt' as any,
+    hardware: 'b200',
+    hwLabel: 'B200',
+    engineLabel: 'TRTLLM',
+    configLabel: 'B200 (TRTLLM)',
+    score: 87.5,
+    scoreError: 1.2,
+    minScore: 85,
+    maxScore: 90,
+    errorMin: 86.3,
+    errorMax: 88.7,
+    model: Model.DeepSeek_R1,
+    benchmark: 'mmlu',
+    specDecode: 'none',
+    date: '2025-03-01',
+    datetime: '2025-03-01T00:00:00Z',
+    precision: Precision.FP4,
+    framework: 'trt',
+    tp: 8,
+    ep: 0,
+    dp_attention: false,
+    conc: 1,
+    disagg: false,
+    isMultinode: false,
+    prefillTp: 8,
+    prefillEp: 0,
+    prefillDpAttention: false,
+    prefillNumWorkers: 0,
+    decodeNumWorkers: 0,
+    numPrefillGpu: 8,
+    numDecodeGpu: 8,
+    ...overrides,
+  };
+}
+
+export function createMockEvaluationContext(
+  overrides?: Partial<EvaluationChartContextType>,
+): EvaluationChartContextType {
+  return {
+    loading: false,
+    isEvaluationDataSettled: true,
+    error: null,
+    isError: false,
+    isAvailabilityError: false,
+    isEvaluationDataError: false,
+    retry: namedStub('retryEvaluations'),
+    selectedBenchmark: 'mmlu',
+    setSelectedBenchmark: namedStub('setSelectedBenchmark'),
+    selectedModel: Model.DeepSeek_R1,
+    setSelectedModel: namedStub('setSelectedModel_eval'),
+    selectedRunDate: '2025-03-01',
+    setSelectedRunDate: namedStub('setSelectedRunDate_eval'),
+    availableBenchmarks: ['mmlu', 'humaneval', 'gsm8k'],
+    availableModels: [Model.DeepSeek_R1],
+    availableDates: ['2025-02-28', '2025-03-01'],
+    chartData: [createMockEvaluationChartData()],
+    unofficialChartData: [],
+    unfilteredChartData: [createMockEvaluationChartData()],
+    enabledHardware: new Set(['b200_trt', 'h100', 'mi300x']),
+    toggleHardware: namedStub('toggleHardware'),
+    removeHardware: namedStub('removeHardware'),
+    highContrast: false,
+    setHighContrast: namedStub('setHighContrast_eval'),
+    showLabels: true,
+    setShowLabels: namedStub('setShowLabels'),
+    isLegendExpanded: true,
+    setIsLegendExpanded: namedStub('setIsLegendExpanded_eval'),
+    hwTypesWithData: new Set(['b200_trt', 'h100', 'mi300x']),
+    selectAllHwTypes: namedStub('selectAllHwTypes_eval'),
+    highlightedConfigs: new Set<string>(),
+    changelogEntries: [],
+    modelHasEvalData: true,
+    selectedPrecisions: ['fp4'],
+    setSelectedPrecisions: namedStub('setSelectedPrecisions_eval'),
+    availablePrecisions: ['fp4', 'fp8', 'bf16'],
+    ...overrides,
+  };
+}
+
+export type GlobalFilterContextOverrides = Partial<
+  GlobalFilterSelectionContextType &
+    GlobalFilterActionsContextType &
+    GlobalFilterRunContextType &
+    GlobalFilterAvailabilityContextType &
+    GlobalFilterWorkflowContextType
+>;
+
+export interface MockGlobalFilterContexts {
+  selection: GlobalFilterSelectionContextType;
+  actions: GlobalFilterActionsContextType;
+  run: GlobalFilterRunContextType;
+  availability: GlobalFilterAvailabilityContextType;
+  workflow: GlobalFilterWorkflowContextType;
+}
+
+export function createMockGlobalFilterContexts(
+  overrides: GlobalFilterContextOverrides = {},
+): MockGlobalFilterContexts {
+  const values = {
+    selectedModel: Model.DeepSeek_R1,
+    setSelectedModel: namedStub('setSelectedModel_global'),
+    selectedSequence: Sequence.EightK_OneK,
+    setSelectedSequence: namedStub('setSelectedSequence_global'),
+    selectedPrecisions: [Precision.FP4],
+    setSelectedPrecisions: namedStub('setSelectedPrecisions_global'),
+    tcoBasis: 'internal' as const,
+    setTcoBasis: namedStub('setTcoBasis_global'),
+    chipBasis: 'pool' as 'pool' | 'total',
+    setChipBasis: namedStub('setChipBasis_global'),
+    effectiveSequence: Sequence.EightK_OneK,
+    sequenceResolved: true,
+    effectivePrecisions: [Precision.FP4],
+    selectedRunDate: '2025-03-01',
+    setSelectedRunDate: namedStub('setSelectedRunDate_global'),
+    selectedRunDateRev: 0,
+    selectedRunId: '12345678',
+    setSelectedRunId: namedStub('setSelectedRunId_global'),
+    availableModels: [Model.DeepSeek_R1],
+    availableSequences: [Sequence.EightK_OneK, Sequence.OneK_OneK],
+    availablePrecisions: [Precision.FP4, Precision.FP8],
+    availableDates: ['2025-02-28', '2025-03-01'],
+    effectiveRunDate: '2025-03-01',
+    availability: undefined,
+    availabilitySettled: true,
+    availabilityError: null,
+    availabilityIsError: false,
+    retryAvailability: namedStub('retryAvailability'),
+    availableRuns: {},
+    workflowLoading: false,
+    workflowError: null,
+    ...overrides,
+  };
+
+  return {
+    selection: {
+      tcoBasis: values.tcoBasis,
+      chipBasis: values.chipBasis,
+      selectedModel: values.selectedModel,
+      selectedSequence: values.selectedSequence,
+      selectedPrecisions: values.selectedPrecisions,
+      effectiveSequence: values.effectiveSequence,
+      sequenceResolved: values.sequenceResolved,
+      effectivePrecisions: values.effectivePrecisions,
+    },
+    actions: {
+      setTcoBasis: values.setTcoBasis,
+      setChipBasis: values.setChipBasis,
+      setSelectedModel: values.setSelectedModel,
+      setSelectedSequence: values.setSelectedSequence,
+      setSelectedPrecisions: values.setSelectedPrecisions,
+      setSelectedRunDate: values.setSelectedRunDate,
+      setSelectedRunId: values.setSelectedRunId,
+    },
+    run: {
+      selectedRunDate: values.selectedRunDate,
+      selectedRunDateRev: values.selectedRunDateRev,
+      selectedRunId: values.selectedRunId,
+      effectiveRunDate: values.effectiveRunDate,
+    },
+    availability: {
+      availableModels: values.availableModels,
+      availableSequences: values.availableSequences,
+      availablePrecisions: values.availablePrecisions,
+      availableDates: values.availableDates,
+      availability: values.availability,
+      availabilitySettled: values.availabilitySettled,
+      availabilityError: values.availabilityError,
+      availabilityIsError: values.availabilityIsError,
+      retryAvailability: values.retryAvailability,
+    },
+    workflow: {
+      availableRuns: values.availableRuns,
+      workflowLoading: values.workflowLoading,
+      workflowError: values.workflowError,
+    },
+  };
+}
+
+export function createMockUnofficialRunContext(
+  overrides?: Partial<UnofficialRunContextType>,
+): UnofficialRunContextType {
+  return {
+    isUnofficialRun: false,
+    unofficialRunInfo: null,
+    unofficialRunInfos: [],
+    runIndexByUrl: {},
+    unofficialChartData: null,
+    unofficialBenchmarkRows: null,
+    unofficialEvalRows: null,
+    loading: false,
+    error: null,
+    clearUnofficialRun: namedStub('clearUnofficialRun'),
+    dismissRun: namedStub('dismissRun'),
+    availableModelsAndSequences: [],
+    getOverlayData: cy
+      .stub()
+      .returns(null) as unknown as UnofficialRunContextType['getOverlayData'],
+    activeOverlayHwTypes: new Set<string>(),
+    allOverlayHwTypes: new Set<string>(),
+    localOfficialOverride: null,
+    reconcileOverlayScope: namedStub('reconcileOverlayScope'),
+    setUnifiedOverlaySelection: namedStub('setUnifiedOverlaySelection'),
+    resetOverlaySelection: namedStub('resetOverlaySelection'),
+    ...overrides,
+  };
+}

@@ -1,0 +1,111 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-10-17T05:15:55.279Z",
+  "fixtures": {
+    "agentic-catalog": {
+      "bytes": 10027,
+      "capturedAt": null,
+      "sha256": "b4d7da73dbb839a8c9444af4bf90cdcd2e25c53970214937ecc122c86c13ae58",
+      "source": null,
+      "topLevel": "array"
+    },
+    "availability": {
+      "bytes": 169803,
+      "capturedAt": null,
+      "sha256": "6709d1a7b6e8b1ad83980f8583c29c4b4f9d9af4567ca5340c1af9c440221987",
+      "source": null,
+      "topLevel": "array"
+    },
+    "benchmarks": {
+      "bytes": 775884,
+      "capturedAt": null,
+      "sha256": "f46823a76cb63248705329f327e1494df02b4dfa4df0898b7ee084c75c20bd52",
+      "source": null,
+      "topLevel": "array"
+    },
+    "benchmarks-history": {
+      "bytes": 1859995,
+      "capturedAt": null,
+      "sha256": "9e7efc17d018d25acd13095ac0c33ed3c20aaf0d86c225792c0a73bde8e12d15",
+      "source": null,
+      "topLevel": "array"
+    },
+    "collectivex-latest": {
+      "bytes": 63278,
+      "capturedAt": "2026-08-20T08:25:30.857Z",
+      "sha256": "66dd9287f7b5c1d33fa2dc76f69622b25dc42d89fcd62644b01c8edd7d6290b3",
+      "source": "synthetic://collectivex",
+      "topLevel": "object"
+    },
+    "collectivex-run-159": {
+      "bytes": 20374,
+      "capturedAt": "2026-08-20T08:25:30.857Z",
+      "sha256": "54e33df39b51158ed3fb0956dd70e10e2c3540845dd62ab7c64fabad175d2259",
+      "source": "synthetic://collectivex",
+      "topLevel": "object"
+    },
+    "collectivex-runs": {
+      "bytes": 687,
+      "capturedAt": "2026-08-20T08:25:30.857Z",
+      "sha256": "9f3d47af2543fc56b0afec7b0c577ba08fcfc2d6c91b07d98163e721e50146c8",
+      "source": "synthetic://collectivex",
+      "topLevel": "object"
+    },
+    "evaluations": {
+      "bytes": 474940,
+      "capturedAt": null,
+      "sha256": "edd2740ddbf1104c763114018fa081e96c39d5edfa3f2e2424a7ce4b724a06c9",
+      "source": null,
+      "topLevel": "array"
+    },
+    "muse-spark-unofficial-run": {
+      "bytes": 6124,
+      "capturedAt": "2026-10-16T02:59:38.939Z",
+      "sha256": "a7f566b66430c0bbb848e99df5a3f7fa76357fc6b6816fb01a96dc210175076d",
+      "source": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/38825822770",
+      "topLevel": "object"
+    },
+    "overview-history-rows": {
+      "bytes": 5002,
+      "capturedAt": null,
+      "sha256": "73caa715550d07044dcad6f14dd6661fb28a203883470ad47f272df1eb3c4c82",
+      "source": null,
+      "topLevel": "object"
+    },
+    "overview-rows": {
+      "bytes": 21611,
+      "capturedAt": null,
+      "sha256": "9c903a976f423d96847764e045d930790592d8c992215448e1f9ac603eb0ea30",
+      "source": null,
+      "topLevel": "object"
+    },
+    "reliability": {
+      "bytes": 530238,
+      "capturedAt": null,
+      "sha256": "cf36cdc2446c75bd191a22f027823bce6ec1380937b5387f274a773dbc19ee66",
+      "source": null,
+      "topLevel": "array"
+    },
+    "submissions": {
+      "bytes": 130122,
+      "capturedAt": null,
+      "sha256": "cd3d37a878b708eab504b0a6bca6d2af408101d88bee47503f0a656d6c60f1f9",
+      "source": null,
+      "topLevel": "object"
+    },
+    "workflow-info": {
+      "bytes": 4941,
+      "capturedAt": null,
+      "sha256": "f28d2220e5246ad70113e38e49394bc7a0bfe9afba8cedf08b90e39042e53357",
+      "source": null,
+      "topLevel": "object"
+    },
+    "video-history": {
+      "bytes": 108159,
+      "capturedAt": "2026-10-17T05:15:55.279Z",
+      "sha256": "79593e777e5935e6f5807a5f0a78291f8860434f056601a0eaa8f1f93a3f2d77",
+      "source": "Retained public H3 metadata replay; fixture-only synthetic approval flags exercise chart layout and do not record an actual publication. No new benchmark or production publication.",
+      "topLevel": "object"
+    }
+  }
+}

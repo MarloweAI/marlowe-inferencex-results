@@ -1,6 +1,6 @@
-# Once a day, snapshot InferenceX's published AgentX results for the charted models (tools/inferencex_snapshot.py)
-# to data/inferencex/<UTC date>.json on main. The public API needs no credential. A file is written only when the
-# published rows changed since the latest snapshot, and a day's file is never replaced. If InferenceX cannot be
+# Once a day, snapshot the InferenceX public API responses the chart reads (tools/inferencex_snapshot.py) to
+# data/inferencex/<UTC date>/ on main. The public API needs no credential. A directory is written only when the
+# published rows changed since the latest snapshot, and a day's directory is never replaced. If InferenceX cannot be
 # fetched, nothing is written and the run fails; the site keeps the last snapshot and shows its date. The Pages
 # workflow runs when this one completes.
 

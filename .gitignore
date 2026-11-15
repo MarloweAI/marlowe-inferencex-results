@@ -1,3 +1,10 @@
 _site/
 __pycache__/
 .DS_Store
+node_modules/
+app/packages/app/out/
+app/packages/app/.next/
+app/packages/app/public/data/api/
+app/packages/app/public/recipes/
+app/.env
+app/packages/app/next-env.d.ts

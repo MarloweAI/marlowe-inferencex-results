@@ -1,0 +1,516 @@
+'use client';
+
+import { useCallback, useState } from 'react';
+
+import { DB_MODEL_TO_DISPLAY } from '@semianalysisai/inferencex-constants';
+
+import {
+  validateSpec,
+  type AiChartBarPoint,
+  type AiChartSpec,
+  type AiProvider,
+} from '@/components/ai-chart/types';
+import { buildParsePrompt, buildSummaryPrompt } from '@/components/ai-chart/prompt-templates';
+import type { InferenceData } from '@/components/inference/types';
+import { callLlm } from '@/lib/ai-chart/ai-providers';
+import {
+  fetchBenchmarks,
+  fetchBenchmarkHistory,
+  fetchEvaluations,
+  fetchReliability,
+  type EvalRow,
+  type ReliabilityRow,
+} from '@/lib/api/api';
+import { transformBenchmarkRows } from '@/lib/benchmarks/benchmark-transform';
+import {
+  dedupeAgenticHistoryRuns,
+  dedupeRowsToLatestPerConfig,
+} from '@/lib/benchmarks/benchmark-run-selection';
+import { normalizeEvalHardwareKey } from '@/lib/charts/chart-utils';
+import { generateHighContrastColors } from '@/lib/charts/high-contrast-colors';
+import { getHardwareConfig, getModelSortIndex } from '@/lib/catalog/constants';
+import type { Locale } from '@/lib/i18n/i18n';
+
+import {
+  buildAiLineData,
+  getAiRadarMetricLabel,
+  normalizeAiRadarRows,
+  rankAiHardwareKeys,
+  readAiMetric,
+} from './ai-chart-data';
+
+import chartDefinitions from '@/components/inference/metric-registry';
+
+export interface AiRadarItem {
+  hwKey: string;
+  label: string;
+  color: string;
+  values: (number | null)[];
+  rawValues: (number | null)[];
+}
+
+export interface AiSingleChartResult {
+  spec: AiChartSpec;
+  barData: AiChartBarPoint[];
+  scatterData: InferenceData[];
+  lineData: Record<string, { x: number; y: number }[]>;
+  radarData: AiRadarItem[];
+  radarAxes: { label: string; unit?: string }[];
+  colorMap: Record<string, string>;
+}
+
+export interface AiChartResult {
+  charts: AiSingleChartResult[];
+  summary: string | null;
+}
+
+interface UseAiChartReturn {
+  result: AiChartResult | null;
+  isLoading: boolean;
+  error: string | null;
+  generate: (prompt: string, provider: AiProvider, apiKey: string) => Promise<void>;
+  reset: () => void;
+}
+
+function parseSpecsFromLlm(raw: string, locale: Locale): AiChartSpec[] {
+  const cleaned = raw
+    .replaceAll(/```json\s*/gu, '')
+    .replaceAll('```', '')
+    .trim();
+  const parsed = JSON.parse(cleaned);
+  const arr = Array.isArray(parsed) ? parsed : [parsed];
+  return arr.slice(0, 2).map((s: unknown) => validateSpec(s as Record<string, unknown>, locale));
+}
+
+function sortBars(bars: AiChartBarPoint[], order: AiChartSpec['sortOrder']): void {
+  if (order === 'asc') bars.sort((a, b) => a.value - b.value);
+  else if (order === 'desc') bars.sort((a, b) => b.value - a.value);
+  else bars.sort((a, b) => getModelSortIndex(a.hwKey) - getModelSortIndex(b.hwKey));
+}
+
+function buildBenchmarkBarData(
+  data: InferenceData[],
+  spec: AiChartSpec,
+  colorMap: Record<string, string>,
+): AiChartBarPoint[] {
+  const target = spec.targetInteractivity ?? 40;
+  const chartDef = (chartDefinitions as any[])[0];
+  const yFieldPath: string = chartDef[spec.yAxisMetric] ?? 'tpPerGpu.y';
+
+  const groups = new Map<string, InferenceData[]>();
+  for (const point of data) {
+    const key = point.hwKey ?? '';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(point);
+  }
+
+  const bars: AiChartBarPoint[] = [];
+  for (const [hwKey, points] of groups) {
+    let closest = points[0];
+    let closestDist = Math.abs(closest.x - target);
+    for (let i = 1; i < points.length; i++) {
+      const dist = Math.abs(points[i].x - target);
+      if (dist < closestDist) {
+        closest = points[i];
+        closestDist = dist;
+      }
+    }
+
+    const value = readAiMetric(closest, yFieldPath, spec.yAxisMetric);
+    if (value === null) continue;
+
+    const config = getHardwareConfig(hwKey, closest.model);
+    bars.push({
+      hwKey,
+      label: config ? `${config.label}${config.suffix ? ` ${config.suffix}` : ''}` : hwKey,
+      value,
+      color: colorMap[hwKey] ?? '#888',
+    });
+  }
+
+  sortBars(bars, spec.sortOrder);
+  return bars;
+}
+
+function parseSeqPart(s: string): number {
+  return s.includes('8k') ? 8192 : 1024;
+}
+
+function sequenceToIslOsl(seq: string): { isl: number; osl: number } {
+  const parts = seq.split('/');
+  return { isl: parseSeqPart(parts[0] ?? '1k'), osl: parseSeqPart(parts[1] ?? '1k') };
+}
+
+function buildEvalBarData(
+  rows: EvalRow[],
+  spec: AiChartSpec,
+  colorMap: Record<string, string>,
+): AiChartBarPoint[] {
+  let filtered = rows.filter((r) => r.model === spec.model || spec.model === '');
+  if (spec.hardwareKeys.length > 0) {
+    const allowed = new Set(spec.hardwareKeys);
+    filtered = filtered.filter((r) => {
+      const hw = r.hardware.toLowerCase();
+      return allowed.has(hw) || [...allowed].some((g) => hw.startsWith(g));
+    });
+  }
+  if (spec.precisions.length > 0) {
+    const allowed = new Set(spec.precisions.map((p) => p.toLowerCase()));
+    filtered = filtered.filter((r) => allowed.has(r.precision.toLowerCase()));
+  }
+
+  const groups = new Map<string, EvalRow>();
+  for (const row of filtered) {
+    const hwKey = normalizeEvalHardwareKey(row.hardware, row.framework, row.spec_method);
+    const existing = groups.get(hwKey);
+    if (!existing || row.date > existing.date) {
+      groups.set(hwKey, row);
+    }
+  }
+
+  const bars: AiChartBarPoint[] = [];
+  for (const [hwKey, row] of groups) {
+    const score = row.metrics.gsm8k ?? row.metrics.accuracy ?? Object.values(row.metrics)[0] ?? 0;
+    if (score <= 0) continue;
+
+    const config = getHardwareConfig(hwKey, DB_MODEL_TO_DISPLAY[row.model]);
+    bars.push({
+      hwKey,
+      label: config ? `${config.label}${config.suffix ? ` ${config.suffix}` : ''}` : hwKey,
+      value: score,
+      color: colorMap[hwKey] ?? '#888',
+    });
+  }
+
+  sortBars(bars, spec.sortOrder);
+  return bars;
+}
+
+function buildReliabilityBarData(
+  rows: ReliabilityRow[],
+  spec: AiChartSpec,
+  colorMap: Record<string, string>,
+): AiChartBarPoint[] {
+  let filtered = rows;
+  if (spec.hardwareKeys.length > 0) {
+    const allowed = new Set(spec.hardwareKeys);
+    filtered = filtered.filter((r) => {
+      const hw = r.hardware.toLowerCase();
+      return allowed.has(hw) || [...allowed].some((g) => hw.startsWith(g));
+    });
+  }
+
+  const agg = new Map<string, { success: number; total: number }>();
+  for (const row of filtered) {
+    const hw = row.hardware;
+    const existing = agg.get(hw) ?? { success: 0, total: 0 };
+    existing.success += row.n_success;
+    existing.total += row.total;
+    agg.set(hw, existing);
+  }
+
+  const bars: AiChartBarPoint[] = [];
+  for (const [hw, { success, total }] of agg) {
+    if (total === 0) continue;
+    const rate = (success / total) * 100;
+    const config = getHardwareConfig(hw, DB_MODEL_TO_DISPLAY[spec.model]);
+    bars.push({
+      hwKey: hw,
+      label: config ? `${config.label}${config.suffix ? ` ${config.suffix}` : ''}` : hw,
+      value: Math.round(rate * 100) / 100,
+      color: colorMap[hw] ?? '#888',
+    });
+  }
+
+  sortBars(bars, spec.sortOrder);
+  return bars;
+}
+
+const EMPTY_RESULT: Pick<AiSingleChartResult, 'lineData' | 'radarData' | 'radarAxes'> = {
+  lineData: {},
+  radarData: [],
+  radarAxes: [],
+};
+
+function buildLineData(
+  points: InferenceData[],
+  spec: AiChartSpec,
+  colorMap: Record<string, string>,
+): Record<string, { x: number; y: number }[]> {
+  const chartDef = (chartDefinitions as any[])[0];
+  const yFieldPath: string = chartDef[spec.yAxisMetric] ?? 'tpPerGpu.y';
+  return buildAiLineData(points, spec.yAxisMetric, yFieldPath, new Set(Object.keys(colorMap)));
+}
+
+function buildRadarData(
+  points: InferenceData[],
+  spec: AiChartSpec,
+  colorMap: Record<string, string>,
+  locale: Locale,
+): { items: AiRadarItem[]; axes: { label: string; unit?: string }[] } {
+  const metrics = spec.radarMetrics ?? ['y_tpPerGpu', 'y_outputTputPerGpu', 'y_costh', 'y_jTotal'];
+  const chartDef = (chartDefinitions as any[])[0];
+  const target = spec.targetInteractivity ?? 40;
+
+  const groups = new Map<string, InferenceData>();
+  for (const p of points) {
+    const hwKey = p.hwKey ?? '';
+    if (!hwKey) continue;
+    const existing = groups.get(hwKey);
+    if (!existing || Math.abs(p.x - target) < Math.abs(existing.x - target)) {
+      groups.set(hwKey, p);
+    }
+  }
+
+  const rawMatrix = new Map<string, (number | null)[]>();
+  for (const [hwKey, point] of groups) {
+    const vals = metrics.map((m) => {
+      const path: string = chartDef[m] ?? m;
+      return readAiMetric(point, path, m);
+    });
+    rawMatrix.set(hwKey, vals);
+  }
+  const normalizedMatrix = normalizeAiRadarRows(rawMatrix, metrics, chartDef);
+
+  const items: AiRadarItem[] = [];
+  for (const [hwKey, rawVals] of rawMatrix) {
+    const config = getHardwareConfig(hwKey, groups.get(hwKey)?.model);
+    items.push({
+      hwKey,
+      label: config ? `${config.label}${config.suffix ? ` ${config.suffix}` : ''}` : hwKey,
+      color: colorMap[hwKey] ?? '#888',
+      values: normalizedMatrix.get(hwKey) ?? metrics.map(() => null),
+      rawValues: rawVals,
+    });
+  }
+
+  const axes = metrics.map((metric) => ({
+    label: getAiRadarMetricLabel(metric, chartDef, locale),
+  }));
+  return { items, axes };
+}
+
+async function resolveSpec(spec: AiChartSpec, locale: Locale): Promise<AiSingleChartResult> {
+  if (spec.dataSource === 'evaluations') {
+    const rows = await fetchEvaluations();
+    const hwKeys = [
+      ...new Set(rows.map((r) => normalizeEvalHardwareKey(r.hardware, r.framework, r.spec_method))),
+    ];
+    const colorMap = generateHighContrastColors(hwKeys, 'dark');
+    const barData = buildEvalBarData(rows, spec, colorMap);
+    const finalKeys = barData.map((b) => b.hwKey);
+    const finalColors = generateHighContrastColors(finalKeys, 'dark');
+    return {
+      spec,
+      barData: barData.map((b) => ({ ...b, color: finalColors[b.hwKey] ?? b.color })),
+      scatterData: [],
+      ...EMPTY_RESULT,
+      colorMap: finalColors,
+    };
+  }
+
+  if (spec.dataSource === 'reliability') {
+    const rows = await fetchReliability();
+    const hwKeys = [...new Set(rows.map((r) => r.hardware))];
+    const colorMap = generateHighContrastColors(hwKeys, 'dark');
+    const barData = buildReliabilityBarData(rows, spec, colorMap);
+    const finalKeys = barData.map((b) => b.hwKey);
+    const finalColors = generateHighContrastColors(finalKeys, 'dark');
+    return {
+      spec,
+      barData: barData.map((b) => ({ ...b, color: finalColors[b.hwKey] ?? b.color })),
+      scatterData: [],
+      ...EMPTY_RESULT,
+      colorMap: finalColors,
+    };
+  }
+
+  const isAgentic = spec.sequence === 'agentic-traces';
+  const { isl, osl } = isAgentic ? { isl: 0, osl: 0 } : sequenceToIslOsl(spec.sequence);
+  const fetchedRows =
+    spec.dataSource === 'history'
+      ? await fetchBenchmarkHistory(
+          spec.model,
+          isl,
+          osl,
+          undefined,
+          isAgentic ? 'agentic_traces' : undefined,
+        )
+      : await fetchBenchmarks(spec.model);
+  const rows =
+    spec.dataSource === 'history' && isAgentic
+      ? dedupeAgenticHistoryRuns(fetchedRows)
+      : isAgentic
+        ? dedupeRowsToLatestPerConfig(fetchedRows)
+        : fetchedRows;
+
+  const { chartData } = transformBenchmarkRows(rows);
+  let points = chartData[0] ?? [];
+
+  if (spec.hardwareKeys.length > 0) {
+    const allowedGpus = new Set(spec.hardwareKeys);
+    points = points.filter((p) => {
+      const hwKey = p.hwKey ?? '';
+      return allowedGpus.has(hwKey) || [...allowedGpus].some((g) => hwKey.startsWith(g));
+    });
+  }
+  if (spec.precisions.length > 0) {
+    const allowedPrec = new Set(spec.precisions.map((p) => p.toLowerCase()));
+    points = points.filter((p) => p.precision && allowedPrec.has(p.precision.toLowerCase()));
+  }
+  if (spec.frameworks.length > 0) {
+    const allowedFw = new Set(spec.frameworks.map((f) => f.toLowerCase()));
+    points = points.filter((p) => {
+      const hwKey = p.hwKey ?? '';
+      const parts = hwKey.split('_').slice(1);
+      return parts.some((part) => allowedFw.has(part));
+    });
+  }
+  if (spec.disagg !== null) {
+    points = points.filter((p) => {
+      const hwKey = p.hwKey ?? '';
+      const isDisagg = hwKey.includes('-disagg');
+      return spec.disagg ? isDisagg : !isDisagg;
+    });
+  }
+
+  if (spec.dataSource !== 'history') {
+    points = points.filter((p) => {
+      const entry = p as any;
+      if (
+        entry.isl !== undefined &&
+        entry.isl !== null &&
+        entry.osl !== undefined &&
+        entry.osl !== null
+      ) {
+        return entry.isl === isl && entry.osl === osl;
+      }
+      return true;
+    });
+  }
+
+  if (spec.topN) {
+    const chartDef = (chartDefinitions as any[])[0];
+    const yFieldPath: string = chartDef[spec.yAxisMetric] ?? 'tpPerGpu.y';
+    const topHwKeys = new Set(
+      rankAiHardwareKeys(points, {
+        metric: spec.yAxisMetric,
+        metricPath: yFieldPath,
+        chartDefinition: chartDef,
+        topN: spec.topN,
+        distinctGpus: spec.topNDistinctGpus !== false,
+      }),
+    );
+    points = points.filter((p) => topHwKeys.has(p.hwKey ?? ''));
+  }
+
+  const hwKeys = [...new Set(points.map((p) => p.hwKey ?? '').filter(Boolean))];
+  const colorMap = generateHighContrastColors(hwKeys, 'dark');
+
+  const lineData = spec.chartType === 'line' ? buildLineData(points, spec, colorMap) : {};
+  const { items: radarData, axes: radarAxes } =
+    spec.chartType === 'radar'
+      ? buildRadarData(points, spec, colorMap, locale)
+      : { items: [], axes: [] };
+
+  return {
+    spec,
+    barData: spec.chartType === 'bar' ? buildBenchmarkBarData(points, spec, colorMap) : [],
+    scatterData: spec.chartType === 'scatter' ? points : [],
+    lineData,
+    radarData,
+    radarAxes,
+    colorMap,
+  };
+}
+
+const ERROR_STRINGS = {
+  en: {
+    parse: 'Could not parse your request. Try rephrasing.',
+    noData: (models: string) =>
+      `No data found for ${models}. Try a different model or configuration.`,
+    providerFailed: 'The chart request failed. Check the API key and provider, then try again.',
+  },
+  zh: {
+    parse: '无法理解这条请求，请换一种说法。',
+    noData: (models: string) => `没有找到 ${models} 的数据，请尝试其他模型或配置。`,
+    providerFailed: '图表请求失败。请检查 API 密钥和服务商设置后重试。',
+  },
+} as const;
+
+export function useAiChart(locale: Locale = 'en'): UseAiChartReturn {
+  const [result, setResult] = useState<AiChartResult | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const generate = useCallback(
+    async (prompt: string, provider: AiProvider, apiKey: string) => {
+      setIsLoading(true);
+      setError(null);
+      setResult(null);
+
+      try {
+        const rawResponse = await callLlm(provider, apiKey, buildParsePrompt(locale), prompt);
+        const specs = parseSpecsFromLlm(rawResponse, locale);
+
+        if (specs.length === 0) {
+          setError(ERROR_STRINGS[locale].parse);
+          setIsLoading(false);
+          return;
+        }
+
+        const charts = await Promise.all(specs.map((spec) => resolveSpec(spec, locale)));
+
+        const hasData = charts.some(
+          (c) =>
+            c.barData.length > 0 ||
+            c.scatterData.length > 0 ||
+            Object.keys(c.lineData).length > 0 ||
+            c.radarData.length > 0,
+        );
+        if (!hasData) {
+          const models = [...new Set(specs.map((s) => s.model))].join(', ');
+          setError(ERROR_STRINGS[locale].noData(models));
+          setIsLoading(false);
+          return;
+        }
+
+        let summary: string | null = null;
+        try {
+          const allBars = charts.flatMap((c) => c.barData);
+          const allScatter = charts.flatMap((c) => c.scatterData);
+          const hwKeys = [
+            ...new Set([...allBars.map((b) => b.hwKey), ...allScatter.map((p) => p.hwKey ?? '')]),
+          ].filter(Boolean);
+
+          const dataDesc =
+            allBars.length > 0
+              ? allBars.map((b) => `${b.label}: ${b.value.toFixed(2)}`).join('\n')
+              : `${allScatter.length} data points across ${hwKeys.length} hardware configs`;
+
+          const summaryRaw = await callLlm(
+            provider,
+            apiKey,
+            buildSummaryPrompt(specs, dataDesc, locale),
+            locale === 'zh' ? '请给出总结。' : 'Provide the summary.',
+          );
+          summary = summaryRaw.trim();
+        } catch {}
+
+        setResult({ charts, summary });
+      } catch {
+        setError(ERROR_STRINGS[locale].providerFailed);
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [locale],
+  );
+
+  const reset = useCallback(() => {
+    setResult(null);
+    setError(null);
+  }, []);
+
+  return { result, isLoading, error, generate, reset };
+}

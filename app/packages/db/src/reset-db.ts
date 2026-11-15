@@ -1,0 +1,59 @@
+import { TABLE_NAMES } from '@semianalysisai/inferencex-constants';
+
+import { confirm, hasNoSslFlag, hasYesFlag } from './cli-utils';
+import { createAdminSql } from './etl/db-utils';
+
+const sql = createAdminSql({
+  noSsl: hasNoSslFlag(),
+  max: 1,
+  onnotice: () => {},
+});
+
+async function reset(): Promise<void> {
+  console.log('=== db:reset ===');
+  console.log(
+    'This will DROP all tables (configs, workflow_runs, agentic_trace_replay,\n' +
+      'benchmark_results, server_logs, run_stats, eval_results, changelog_entries,\n' +
+      'availability, datasets, dataset_conversations, run_datasets, schema_migrations).\n' +
+      'You must run db:migrate after this before ingesting data.\n',
+  );
+
+  if (!hasYesFlag()) {
+    const ok = await confirm('Continue? (y/N) ');
+    if (!ok) {
+      console.log('Aborted.');
+      return;
+    }
+  }
+
+  console.log('Dropping all tables...\n');
+
+  await sql`DROP VIEW IF EXISTS latest_workflow_runs`;
+  await sql`DROP TABLE IF EXISTS
+    ${sql(TABLE_NAMES.runDatasets)},
+    ${sql(TABLE_NAMES.datasetConversations)},
+    ${sql(TABLE_NAMES.datasets)},
+    ${sql(TABLE_NAMES.changelogEntries)},
+    ${sql(TABLE_NAMES.evalResults)},
+    ${sql(TABLE_NAMES.benchmarkResults)},
+    ${sql(TABLE_NAMES.agenticTraceReplay)},
+    ${sql(TABLE_NAMES.serverLogs)},
+    ${sql(TABLE_NAMES.runStats)},
+    ${sql(TABLE_NAMES.availability)},
+    ${sql(TABLE_NAMES.workflowRuns)},
+    ${sql(TABLE_NAMES.configs)},
+    ${sql(TABLE_NAMES.schemaMigrations)}
+  CASCADE`;
+
+  console.log('  All tables dropped.');
+
+  console.log('\n=== db:reset complete ===');
+  console.log('  Invalidate API cache: bun run admin:cache:invalidate');
+}
+
+reset()
+  .catch((error) => {
+    console.error('db:reset failed:', error);
+    process.exitCode = 1;
+  })
+  .finally(() => sql.end());

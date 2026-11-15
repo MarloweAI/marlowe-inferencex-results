@@ -1,0 +1,626 @@
+import { describe, it, expect } from 'vitest';
+
+import type { ChartDefinition, InferenceData } from '@/components/inference/types';
+import {
+  filterDataByCostLimit,
+  partitionChartDataByLimits,
+  processOverlayChartData,
+  processOverlayChartDataWithClipping,
+} from '@/components/inference/utils';
+
+describe('All in Measured table coverage', () => {
+  it('retains GPU-valid overlay rows with missing all-in power without plotting a fallback', () => {
+    const result = processOverlayChartDataWithClipping(
+      [
+        pt({
+          id: 1,
+          measuredAvgPower: { y: 450, roof: false },
+          utilityModeledWatts: { y: 700, roof: false },
+        }),
+        pt({
+          id: 2,
+          measuredAvgPower: { y: 500, roof: false },
+          modeledSystemPower: {
+            status: 'unsupported',
+            reason: 'model-domain',
+            modelRevision: 'test',
+          },
+        }),
+        pt({ id: 3 }),
+      ],
+      'interactivity',
+      'y_utilityModeledWatts',
+      null,
+    );
+    expect(result.data.map((point) => [point.id, point.y])).toEqual([[1, 700]]);
+    expect(result.tableData?.map((point) => [point.id, point.y])).toEqual([
+      [1, 700],
+      [2, NaN],
+    ]);
+  });
+});
+
+describe('unofficial overlays in E2E Normalized Interactivity mode', () => {
+  const rows = [
+    pt({ conc: 4, p90_e2el: 10, p75_e2e_norm_intvty: 40, p90_e2e_norm_intvty: 30 }),
+    pt({ conc: 8, p90_e2el: 20 }),
+  ];
+  const run = (
+    selectedXAxisMode: 'e2e' | 'e2e-normalized-interactivity',
+    selectedPercentile = 'p90',
+  ) =>
+    processOverlayChartDataWithClipping(rows, 'e2e', 'y_tpPerGpu', null, {
+      isAgentic: true,
+      selectedPercentile,
+      selectedXAxisMode,
+    });
+
+  it('plots the selected run-reported percentile and drops rows without one', () => {
+    expect(run('e2e-normalized-interactivity').data.map((p) => [p.conc, p.x])).toEqual([[4, 30]]);
+    expect(run('e2e-normalized-interactivity', 'p75').data.map((p) => [p.conc, p.x])).toEqual([
+      [4, 40],
+    ]);
+  });
+
+  it('keeps latency x values outside the normalized mode', () => {
+    expect(run('e2e').data.map((p) => [p.conc, p.x])).toEqual([
+      [4, 10],
+      [8, 20],
+    ]);
+  });
+});
+function pt(overrides: Partial<InferenceData> = {}): InferenceData {
+  return {
+    date: '2024-01-01',
+    x: 1,
+    y: 1,
+    tp: 1,
+    conc: 1,
+    hwKey: 'h100' as any,
+    precision: 'fp16',
+    tpPerGpu: { y: 1000, roof: false },
+    tpPerMw: { y: 50, roof: false },
+    costh: { y: 2, roof: false },
+    costr: { y: 1, roof: false },
+    costhi: { y: 5, roof: false },
+    costri: { y: 1.5, roof: false },
+    ...overrides,
+  };
+}
+
+function chartDef(overrides: Partial<ChartDefinition> = {}): ChartDefinition {
+  return {
+    chartType: 'e2e',
+    heading: 'Test Chart',
+    x: 'median_e2el',
+    x_label: 'Latency',
+    y: 'tput_per_gpu',
+    ...overrides,
+    x_scale_field: overrides.x_scale_field ?? String(overrides.x ?? 'median_e2el'),
+    x_labelZh: overrides.x_labelZh ?? '延迟',
+  };
+}
+
+describe('filterDataByCostLimit', () => {
+  it('returns data unchanged when selectedYAxisMetric does not include "cost"', () => {
+    const data = [pt(), pt({ x: 2 })];
+    const result = filterDataByCostLimit(data, chartDef({ y_cost_limit: 1 }), 'y_tpPerGpu');
+    expect(result).toHaveLength(2);
+  });
+
+  it('returns data unchanged when cost metric is selected but y_cost_limit is absent', () => {
+    const data = [pt({ costh: { y: 999, roof: false } }), pt()];
+    const result = filterDataByCostLimit(data, chartDef(), 'y_costh');
+    expect(result).toHaveLength(2);
+  });
+
+  it('filters by costh.y <= y_cost_limit', () => {
+    const data = [
+      pt({ costh: { y: 1, roof: false } }),
+      pt({ costh: { y: 2.5, roof: false } }),
+      pt({ costh: { y: 2, roof: false } }),
+    ];
+    const result = filterDataByCostLimit(data, chartDef({ y_cost_limit: 2 }), 'y_costh');
+    expect(result).toHaveLength(2);
+    expect(result.every((p) => p.costh.y <= 2)).toBe(true);
+  });
+
+  it('filters by costr.y <= y_cost_limit', () => {
+    const data = [pt({ costr: { y: 0.5, roof: false } }), pt({ costr: { y: 1.5, roof: false } })];
+    const result = filterDataByCostLimit(data, chartDef({ y_cost_limit: 1 }), 'y_costr');
+    expect(result).toHaveLength(1);
+  });
+
+  it('filters by costhOutput.y when metric is y_costhOutput', () => {
+    const data = [
+      pt({ costhOutput: { y: 1, roof: false } }),
+      pt({ costhOutput: { y: 5, roof: false } }),
+    ];
+    const result = filterDataByCostLimit(data, chartDef({ y_cost_limit: 2 }), 'y_costhOutput');
+    expect(result).toHaveLength(1);
+  });
+
+  it('filters by costhi.y when metric is y_costhi', () => {
+    const data = [pt({ costhi: { y: 2, roof: false } }), pt({ costhi: { y: 10, roof: false } })];
+    const result = filterDataByCostLimit(data, chartDef({ y_cost_limit: 3 }), 'y_costhi');
+    expect(result).toHaveLength(1);
+  });
+
+  it('does NOT filter y_costUser by cost limit (custom user metric bypasses the limit)', () => {
+    const data = [
+      pt({ costUser: { y: 1, roof: false } }),
+      pt({ costUser: { y: 999, roof: false } }),
+    ];
+    const result = filterDataByCostLimit(data, chartDef({ y_cost_limit: 2 }), 'y_costUser');
+    expect(result).toHaveLength(2);
+  });
+
+  it('includes points where the cost field is undefined (missing data passes through)', () => {
+    const data = [pt()];
+    const result = filterDataByCostLimit(data, chartDef({ y_cost_limit: 0.1 }), 'y_costhOutput');
+    expect(result).toHaveLength(1);
+  });
+
+  it('returns data unchanged for an unknown metric key even if it includes "cost"', () => {
+    const data = [pt(), pt()];
+    const result = filterDataByCostLimit(data, chartDef({ y_cost_limit: 1 }), 'y_unknownCost');
+    expect(result).toHaveLength(2);
+  });
+
+  it('returns empty array when all points exceed the limit', () => {
+    const data = [pt({ costh: { y: 5, roof: false } }), pt({ costh: { y: 10, roof: false } })];
+    const result = filterDataByCostLimit(data, chartDef({ y_cost_limit: 1 }), 'y_costh');
+    expect(result).toHaveLength(0);
+  });
+
+  it('returns all points when all are within the limit', () => {
+    const data = [pt({ costh: { y: 0.5, roof: false } }), pt({ costh: { y: 0.9, roof: false } })];
+    const result = filterDataByCostLimit(data, chartDef({ y_cost_limit: 1 }), 'y_costh');
+    expect(result).toHaveLength(2);
+  });
+});
+
+describe('partitionChartDataByLimits', () => {
+  it('retains cost and TTFT outliers with explicit reasons while preserving boundary points', () => {
+    const costOutlier = pt({ x: 10, y: 6 });
+    const ttftOutlier = pt({ x: 61, y: 1 });
+    const both = pt({ x: 70, y: 7 });
+    const boundary = pt({ x: 60, y: 5 });
+
+    const result = partitionChartDataByLimits(
+      [costOutlier, ttftOutlier, both, boundary],
+      chartDef({ y_cost_limit: 5, y_latency_limit: 60 }),
+      'y_costh',
+      { isTtftX: true, isAgentic: false },
+    );
+
+    expect(result.data).toEqual([boundary]);
+    expect(result.clippedData).toEqual([
+      { point: costOutlier, reasons: ['cost'] },
+      { point: ttftOutlier, reasons: ['latency'] },
+      { point: both, reasons: ['cost', 'latency'] },
+    ]);
+  });
+
+  it('does not apply fixed-sequence TTFT clipping to agentic points', () => {
+    const point = pt({ x: 500, y: 1 });
+    const result = partitionChartDataByLimits(
+      [point],
+      chartDef({ y_latency_limit: 60 }),
+      'y_tpPerGpu',
+      { isTtftX: true, isAgentic: true },
+    );
+
+    expect(result.data).toEqual([point]);
+    expect(result.clippedData).toEqual([]);
+  });
+});
+
+const prefillEnergyPoint = (interactivity: number, medianTtft?: number) =>
+  pt({
+    date: '2026-09-01',
+    hw: 'b200',
+    hwKey: 'b200_dynamo-sglang',
+    framework: 'dynamo-sglang',
+    precision: 'fp4',
+    disagg: true,
+    power_valid: 1,
+    x: 0,
+    p90_ttft: 0,
+    median_ttft: medianTtft ?? 0,
+    median_intvty: interactivity,
+    median_e2el: 12,
+    rawMetricKeys: [
+      'median_intvty',
+      'median_e2el',
+      'prefill_joules_per_input_token',
+      ...(medianTtft === undefined ? [] : ['median_ttft']),
+    ],
+    measuredPrefillJPerInputToken: { y: 0.2, roof: false },
+  });
+
+describe('processOverlayChartData', () => {
+  it('keeps prefill-energy overlays on Interactivity despite a stale legacy P90 override', () => {
+    const result = processOverlayChartDataWithClipping(
+      [prefillEnergyPoint(68, 1.5), prefillEnergyPoint(55, 2)],
+      'interactivity',
+      'y_measuredPrefillJPerInputToken',
+      'p90_ttft',
+      { isAgentic: false, selectedPercentile: 'p90', selectedXAxisMode: 'interactivity' },
+    );
+
+    expect(result.data.map((point) => [point.x, point.y])).toEqual([
+      [68, 0.2],
+      [55, 0.2],
+    ]);
+    expect(result.clippedData).toEqual([]);
+  });
+
+  it('uses median TTFT for fixed-sequence overlays in TTFT mode and omits missing measurements', () => {
+    const result = processOverlayChartDataWithClipping(
+      [prefillEnergyPoint(68, 1.5), prefillEnergyPoint(55)],
+      'e2e',
+      'y_measuredPrefillJPerInputToken',
+      'p90_ttft',
+      { isAgentic: false, selectedPercentile: 'p90', selectedXAxisMode: 'ttft' },
+    );
+
+    expect(result.data.map((point) => [point.x, point.y])).toEqual([[1.5, 0.2]]);
+    expect(result.clippedData).toEqual([]);
+  });
+
+  it('uses natural E2E latency for overlays when E2E mode supersedes the legacy P90 override', () => {
+    const result = processOverlayChartDataWithClipping(
+      [prefillEnergyPoint(68, 1.5), prefillEnergyPoint(55)],
+      'e2e',
+      'y_measuredPrefillJPerInputToken',
+      'p90_ttft',
+      { isAgentic: false, selectedPercentile: 'p90', selectedXAxisMode: 'e2e' },
+    );
+
+    expect(result.data.map((point) => [point.x, point.y])).toEqual([
+      [12, 0.2],
+      [12, 0.2],
+    ]);
+    expect(result.clippedData).toEqual([]);
+  });
+
+  it('remaps y to the selected metric value', () => {
+    const data = [pt({ y: 999, tpPerGpu: { y: 42, roof: false }, median_intvty: 10 } as any)];
+    const result = processOverlayChartData(data, 'interactivity', 'y_tpPerGpu', null);
+    expect(result).toHaveLength(1);
+    expect(result[0].y).toBe(42);
+  });
+
+  it('filters out points missing the selected metric', () => {
+    const withMetric = pt({ inputTputPerGpu: { y: 5, roof: false }, p90_ttft: 0.25 });
+    const withoutMetric = pt({ p90_ttft: 0.25 });
+    const result = processOverlayChartData(
+      [withMetric, withoutMetric],
+      'interactivity',
+      'y_inputTputPerGpu',
+      null,
+    );
+    expect(result).toHaveLength(1);
+    expect(result[0].y).toBe(5);
+  });
+
+  it('remaps x to config override for input metrics on interactivity chart', () => {
+    const data = [
+      pt({
+        x: 100,
+        inputTputPerGpu: { y: 5, roof: false },
+        p90_ttft: 0.25,
+        median_intvty: 50,
+      } as any),
+    ];
+    const result = processOverlayChartData(data, 'interactivity', 'y_inputTputPerGpu', null);
+    expect(result).toHaveLength(1);
+    expect(result[0].x).toBe(0.25);
+  });
+
+  it('uses user-selected x-axis metric when provided for interactivity input metrics', () => {
+    const data = [
+      pt({
+        x: 100,
+        inputTputPerGpu: { y: 5, roof: false },
+        p90_ttft: 0.1,
+        median_intvty: 50,
+      } as any),
+    ];
+    const result = processOverlayChartData(data, 'interactivity', 'y_inputTputPerGpu', 'p90_ttft');
+    expect(result).toHaveLength(1);
+    expect(result[0].x).toBe(0.1);
+  });
+
+  it('does not remap x for e2e chart even with input metrics', () => {
+    const data = [
+      pt({
+        x: 100,
+        inputTputPerGpu: { y: 5, roof: false },
+        p90_ttft: 0.25,
+        median_e2el: 2.5,
+      } as any),
+    ];
+    const result = processOverlayChartData(data, 'e2e', 'y_inputTputPerGpu', null);
+    expect(result).toHaveLength(1);
+    expect(result[0].x).toBe(2.5);
+  });
+
+  it('remaps x to TTFT for e2e chart when selectedXAxisMetric is p90_ttft', () => {
+    const data = [
+      pt({
+        x: 100,
+        tpPerGpu: { y: 42, roof: false },
+        p90_ttft: 0.12,
+        median_e2el: 2.5,
+      } as any),
+    ];
+    const result = processOverlayChartData(data, 'e2e', 'y_tpPerGpu', 'p90_ttft');
+    expect(result).toHaveLength(1);
+    expect(result[0].x).toBe(0.12);
+  });
+
+  it('filters e2e TTFT outliers exceeding y_latency_limit', () => {
+    const data = [
+      pt({ tpPerGpu: { y: 10, roof: false }, p90_ttft: 0.5, median_e2el: 1 } as any),
+      pt({ tpPerGpu: { y: 5, roof: false }, p90_ttft: 999, median_e2el: 2 } as any),
+    ];
+    const result = processOverlayChartData(data, 'e2e', 'y_tpPerGpu', 'p90_ttft');
+    expect(result).toHaveLength(1);
+    expect(result[0].x).toBe(0.5);
+  });
+
+  it('does not filter interactivity points by latency limit when x-axis is default', () => {
+    const data = [
+      pt({ tpPerGpu: { y: 42, roof: false }, median_intvty: 200 } as any),
+      pt({ tpPerGpu: { y: 10, roof: false }, median_intvty: 30 } as any),
+    ];
+    const result = processOverlayChartData(data, 'interactivity', 'y_tpPerGpu', 'p90_ttft');
+    expect(result).toHaveLength(2);
+  });
+
+  it('applies latency limit on interactivity only when x-axis is actually overridden', () => {
+    const data = [
+      pt({ inputTputPerGpu: { y: 5, roof: false }, p90_ttft: 0.5, median_intvty: 10 } as any),
+      pt({ inputTputPerGpu: { y: 3, roof: false }, p90_ttft: 999, median_intvty: 20 } as any),
+    ];
+    const result = processOverlayChartData(data, 'interactivity', 'y_inputTputPerGpu', 'p90_ttft');
+    expect(result).toHaveLength(1);
+    expect(result[0].x).toBe(0.5);
+  });
+
+  it('keeps all unofficial-run tokens-per-dollar points without the former cost clamp', () => {
+    const data = [
+      pt({ tokensPerDollarH: { y: 500_000, roof: false }, median_intvty: 10 } as any),
+      pt({ tokensPerDollarH: { y: 2_000_000, roof: false }, median_intvty: 20 } as any),
+    ];
+    const result = processOverlayChartData(data, 'interactivity', 'y_tokensPerDollarH', null);
+    expect(result.map((point) => point.y)).toEqual([500_000, 2_000_000]);
+  });
+
+  it('keeps the existing unofficial-run cost-per-million metric independent', () => {
+    const data = [pt({ costh: { y: 0.5, roof: false }, median_intvty: 20 } as any)];
+    const result = processOverlayChartData(data, 'interactivity', 'y_costh', null);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].y).toBe(0.5);
+    expect(result[0].costh.y).toBe(0.5);
+  });
+
+  it('does not classify unofficial-run purchasing-power points as cost overflows', () => {
+    const visible = pt({
+      tokensPerDollarH: { y: 500_000, roof: false },
+      median_intvty: 10,
+      run_url: 'https://github.com/SemiAnalysisAI/InferenceX/actions/runs/123',
+    } as any);
+    const highValue = pt({
+      tokensPerDollarH: { y: 2_000_000, roof: false },
+      median_intvty: 20,
+      run_url: 'https://github.com/SemiAnalysisAI/InferenceX/actions/runs/123',
+    } as any);
+
+    const result = processOverlayChartDataWithClipping(
+      [visible, highValue],
+      'interactivity',
+      'y_tokensPerDollarH',
+      null,
+    );
+
+    expect(result.data).toEqual([
+      expect.objectContaining({ x: 10, y: 500_000, run_url: visible.run_url }),
+      expect.objectContaining({ x: 20, y: 2_000_000, run_url: highValue.run_url }),
+    ]);
+    expect(result.clippedData).toEqual([]);
+  });
+
+  it('applies the selected percentile to the natural interactivity x-axis for agentic overlays', () => {
+    const data = [
+      pt({ tpPerGpu: { y: 42, roof: false }, median_intvty: 200, p90_intvty: 130 } as any),
+    ];
+    const result = processOverlayChartData(data, 'interactivity', 'y_tpPerGpu', null, {
+      isAgentic: true,
+      selectedPercentile: 'p90',
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0].x).toBe(130);
+  });
+
+  it('applies the selected percentile to the natural e2e x-axis for agentic overlays', () => {
+    const data = [pt({ tpPerGpu: { y: 42, roof: false }, median_e2el: 2.5, p99_e2el: 9 } as any)];
+    const result = processOverlayChartData(data, 'e2e', 'y_tpPerGpu', null, {
+      isAgentic: true,
+      selectedPercentile: 'p99',
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0].x).toBe(9);
+  });
+
+  it('keeps the natural median x-axis for non-agentic overlays regardless of percentile', () => {
+    const data = [
+      pt({ tpPerGpu: { y: 42, roof: false }, median_intvty: 200, p90_intvty: 130 } as any),
+    ];
+    const result = processOverlayChartData(data, 'interactivity', 'y_tpPerGpu', null, {
+      isAgentic: false,
+      selectedPercentile: 'p90',
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0].x).toBe(200);
+  });
+
+  it('marks agentic overlay points non-canonical when normalized traces are unavailable', () => {
+    const A = pt({
+      tpPerGpu: { y: 100, roof: false },
+      p90_intvty: 130,
+    } as any);
+    const B = pt({
+      tpPerGpu: { y: 200, roof: false },
+      p90_intvty: 90,
+    } as any);
+    const C = pt({
+      tpPerGpu: { y: 150, roof: false },
+      p90_intvty: 200,
+    } as any);
+    const result = processOverlayChartData([A, B, C], 'interactivity', 'y_tpPerGpu', null, {
+      isAgentic: true,
+      selectedPercentile: 'p90',
+      restrictToNormalizedFrontier: true,
+    });
+    expect(result.map((p) => p.isOnNormalizedInteractivityFrontier)).toEqual([false, false, false]);
+  });
+
+  it('does not stamp the normalized frontier for non-agentic overlays', () => {
+    const data = [pt({ tpPerGpu: { y: 100, roof: false }, median_intvty: 50, p90_e2el: 1 } as any)];
+    const result = processOverlayChartData(data, 'interactivity', 'y_tpPerGpu', null, {
+      isAgentic: false,
+      selectedPercentile: 'median',
+      restrictToNormalizedFrontier: false,
+    });
+    expect(result[0].isOnNormalizedInteractivityFrontier).toBeUndefined();
+  });
+
+  it('does not stamp a canonical frontier when the caller disables the rule', () => {
+    const data = [pt({ tpPerGpu: { y: 100, roof: false }, median_e2el: 1, p90_e2el: 1 } as any)];
+    const result = processOverlayChartData(data, 'e2e', 'y_tpPerGpu', null, {
+      isAgentic: true,
+      selectedPercentile: 'p90',
+      restrictToNormalizedFrontier: false,
+    });
+    expect(result[0].isOnNormalizedInteractivityFrontier).toBeUndefined();
+  });
+
+  it('also rejects a local TTFT frontier for agentic overlays', () => {
+    const A = pt({
+      tpPerGpu: { y: 100, roof: false },
+      p90_e2el: 1,
+      p90_ttft: 0.2,
+    } as any);
+    const B = pt({
+      tpPerGpu: { y: 150, roof: false },
+      p90_e2el: 3,
+      p90_ttft: 0.4,
+    } as any);
+    const C = pt({
+      tpPerGpu: { y: 90, roof: false },
+      p90_e2el: 5,
+      p90_ttft: 0.1,
+    } as any);
+    const result = processOverlayChartData([A, B, C], 'e2e', 'y_tpPerGpu', 'p90_ttft', {
+      isAgentic: true,
+      selectedPercentile: 'p90',
+      restrictToNormalizedFrontier: true,
+    });
+    expect(result.map((p) => p.isOnNormalizedInteractivityFrontier)).toEqual([false, false, false]);
+  });
+
+  it('does not let separate unofficial runs create normalized-frontier winners', () => {
+    const r1 = pt({
+      tpPerGpu: { y: 500, roof: false },
+      p90_e2el: 1,
+      p90_intvty: 100,
+      run_url: 'https://gh/runs/1',
+    } as any);
+    const r2 = pt({
+      tpPerGpu: { y: 100, roof: false },
+      p90_e2el: 5,
+      p90_intvty: 40,
+      run_url: 'https://gh/runs/2',
+    } as any);
+    const result = processOverlayChartData([r1, r2], 'interactivity', 'y_tpPerGpu', null, {
+      isAgentic: true,
+      selectedPercentile: 'p90',
+      restrictToNormalizedFrontier: true,
+    });
+    const byUrl = Object.fromEntries(
+      result.map((p) => [p.run_url, p.isOnNormalizedInteractivityFrontier]),
+    );
+    expect(byUrl['https://gh/runs/1']).toBe(false);
+    expect(byUrl['https://gh/runs/2']).toBe(false);
+  });
+
+  it('leaves the canonical flag unset for metrics with no roofline direction', () => {
+    const data = [
+      pt({
+        noRooflineDirection: { y: 700, roof: false },
+        p90_intvty: 100,
+        p90_e2el: 10,
+      } as any),
+    ];
+    const result = processOverlayChartData(data, 'interactivity', 'y_noRooflineDirection', null, {
+      isAgentic: true,
+      selectedPercentile: 'p90',
+      restrictToNormalizedFrontier: true,
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0].isOnNormalizedInteractivityFrontier).toBeUndefined();
+  });
+
+  it('applies the selected percentile to an agentic input-metric x override', () => {
+    const data = [
+      pt({
+        inputTputPerGpu: { y: 5, roof: false },
+        median_ttft: 0.1,
+        p90_ttft: 0.4,
+      } as any),
+    ];
+    const result = processOverlayChartData(data, 'interactivity', 'y_inputTputPerGpu', null, {
+      isAgentic: true,
+      selectedPercentile: 'p90',
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0].x).toBe(0.4);
+  });
+});
+
+describe('TPUv7 overlay TCO basis', () => {
+  it('reprices costs and purchasing power without mutating the source or other hardware', () => {
+    const tpu = pt({
+      hwKey: 'tpuv7_vllm',
+      costh: { y: 1.21, roof: false },
+      costhi: { y: 2.42, roof: false },
+      costhOutput: { y: 3.63, roof: false },
+      tokensPerDollarH: { y: 100, roof: false },
+      outputTokensPerDollarH: { y: 40, roof: false },
+    });
+    const nvidia = pt({ ...tpu, hwKey: 'h200_vllm' });
+    const points = processOverlayChartData(
+      [tpu, nvidia],
+      'interactivity',
+      'y_tokensPerDollarH',
+      null,
+      { tcoBasis: 'internal' },
+    );
+    const repriced = points.find((p) => p.hwKey === 'tpuv7_vllm')!;
+    expect(repriced.costh!.y).toBeCloseTo(1.03);
+    expect(repriced.costhi!.y).toBeCloseTo(2.06);
+    expect(repriced.costhOutput!.y).toBeCloseTo(3.09);
+    expect(repriced.y).toBeCloseTo((100 * 1.21) / 1.03);
+    expect(repriced.outputTokensPerDollarH!.y).toBeCloseTo((40 * 1.21) / 1.03);
+    expect(points.find((p) => p.hwKey === 'h200_vllm')!.costh).toEqual(nvidia.costh);
+    expect(tpu.costh!.y).toBe(1.21);
+    expect(
+      processOverlayChartData([tpu], 'interactivity', 'y_costh', null, { tcoBasis: 'external' })[0]
+        .y,
+    ).toBe(1.21);
+  });
+});

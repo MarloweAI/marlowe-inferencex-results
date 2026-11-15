@@ -1,0 +1,50 @@
+{
+  "name": "@semianalysisai/inferencex-skills",
+  "version": "1.2.0",
+  "description": "InferenceX benchmark data for coding agents and the command line.",
+  "keywords": [
+    "agent-skills",
+    "agentx",
+    "api",
+    "benchmarks",
+    "claude",
+    "codex",
+    "collectivex",
+    "inferencex",
+    "powerx",
+    "tco"
+  ],
+  "homepage": "https://inferencex.semianalysis.com/api",
+  "license": "GPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SemiAnalysisAI/InferenceX-app",
+    "directory": "packages/skills"
+  },
+  "bin": {
+    "inferencex": "skills/inferencex-api/scripts/inferencex.mjs",
+    "inferencex-skills": "bin/install.mjs"
+  },
+  "files": [
+    "bin/install.mjs",
+    "skills/inferencex-api",
+    "skills/inferencex",
+    "skills/inferencex-to-chart",
+    "skills/inferencex-to-table",
+    "skills/inferencex-pr-improvements",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "scripts": {
+    "prepack": "node scripts/update-integrity.mjs",
+    "list": "node bin/install.mjs list",
+    "test:unit": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "ajv": "8.20.0"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

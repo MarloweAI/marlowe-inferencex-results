@@ -1,0 +1,219 @@
+import { describe, expect, it } from 'vitest';
+
+import { configSegmentLabel, parallelismLabel } from './parallelism-label';
+
+describe('configSegmentLabel', () => {
+  it('labels weight-data parallelism separately from tensor and expert parallelism', () => {
+    expect(configSegmentLabel(1, 1, false, 1, 1, 1, undefined, 8)).toBe('DWDP8');
+    expect(configSegmentLabel(1, 1, false, 1, 1, 1, undefined, 1)).toBe('TP1');
+  });
+  it('collapses symmetric tp===ep to TEP / DEP by dp-attention', () => {
+    expect(configSegmentLabel(8, 8, false)).toBe('TEP8');
+    expect(configSegmentLabel(8, 8, true)).toBe('DEP8');
+  });
+
+  it('uses EP / DPAEP when ep>1 and tp!==ep', () => {
+    expect(configSegmentLabel(4, 16, false)).toBe('EP16');
+    expect(configSegmentLabel(4, 16, true)).toBe('DPAEP16');
+  });
+
+  it('uses TP / DPATP when ep<=1 or absent', () => {
+    expect(configSegmentLabel(8, 1, false)).toBe('TP8');
+    expect(configSegmentLabel(8, undefined, false)).toBe('TP8');
+    expect(configSegmentLabel(8, 1, true)).toBe('DPATP8');
+  });
+
+  it('appends PP suffix only when pp > 1', () => {
+    expect(configSegmentLabel(8, 1, false, 2)).toBe('TP8PP2');
+    expect(configSegmentLabel(8, 8, false, 2)).toBe('TEP8PP2');
+    expect(configSegmentLabel(8, 8, true, 4)).toBe('DEP8PP4');
+    expect(configSegmentLabel(4, 16, true, 2)).toBe('DPAEP16PP2');
+  });
+
+  it('renders no PP part when pp is 1, 0, or absent', () => {
+    expect(configSegmentLabel(8, 1, false, 1)).toBe('TP8');
+    expect(configSegmentLabel(8, 1, false, 0)).toBe('TP8');
+    expect(configSegmentLabel(8, 1, false, undefined)).toBe('TP8');
+  });
+
+  it('appends non-default DCP and PCP as slash-delimited segments', () => {
+    expect(configSegmentLabel(8, 1, false, 1, 8, 1)).toBe('TP8/DCP8');
+    expect(configSegmentLabel(8, 1, false, 1, 8, 4)).toBe('TP8/DCP8/PCP4');
+    expect(configSegmentLabel(8, 8, false, 2, 8, 4)).toBe('TEP8PP2/DCP8/PCP4');
+  });
+
+  it('omits default DCP and PCP widths', () => {
+    expect(configSegmentLabel(8, 1, false, undefined, 1, 1)).toBe('TP8');
+    expect(configSegmentLabel(8, 1, false, undefined, 0, undefined)).toBe('TP8');
+  });
+});
+
+describe('parallelismLabel', () => {
+  it('labels each DWDP group once and preserves the decode topology', () => {
+    expect(
+      parallelismLabel({
+        tp: 24,
+        disagg: true,
+        isMultinode: true,
+        prefillTp: 1,
+        prefillEp: 1,
+        prefillDwdp: 8,
+        prefillNumWorkers: 2,
+        decodeTp: 8,
+        decodeEp: 8,
+        decodeDpAttention: true,
+        decodeNumWorkers: 1,
+      }),
+    ).toBe('2xDWDP8+1xDEP8');
+  });
+  it('falls back to bare tp when no ep data', () => {
+    expect(parallelismLabel({ tp: 8 })).toBe('8');
+  });
+
+  it('labels a single-segment config', () => {
+    expect(parallelismLabel({ tp: 8, ep: 8, dpAttention: true })).toBe('DEP8');
+    expect(parallelismLabel({ tp: 4, ep: 8, dpAttention: false })).toBe('EP8');
+  });
+
+  it('builds multinode-disagg per-role worker segments', () => {
+    expect(
+      parallelismLabel({
+        tp: 8,
+        ep: 4,
+        disagg: true,
+        isMultinode: true,
+        prefillTp: 4,
+        prefillEp: 4,
+        prefillDpAttention: false,
+        prefillNumWorkers: 2,
+        decodeTp: 8,
+        decodeEp: 8,
+        decodeDpAttention: true,
+        decodeNumWorkers: 1,
+      }),
+    ).toBe('2xTEP4+1xDEP8');
+  });
+
+  it('single-node disagg uses the single (decode) segment, not worker syntax', () => {
+    expect(
+      parallelismLabel({ tp: 8, ep: 8, dpAttention: false, disagg: true, isMultinode: false }),
+    ).toBe('TEP8');
+  });
+
+  it('includes PP in a single-segment config only when > 1', () => {
+    expect(parallelismLabel({ tp: 8, ep: 1, pp: 2 })).toBe('TP8PP2');
+    expect(parallelismLabel({ tp: 8, ep: 1, pp: 1 })).toBe('TP8');
+    expect(parallelismLabel({ tp: 8, ep: 1, pp: 0 })).toBe('TP8');
+  });
+
+  it('applies per-role PP to multinode-disagg segments', () => {
+    expect(
+      parallelismLabel({
+        tp: 8,
+        ep: 1,
+        disagg: true,
+        isMultinode: true,
+        prefillTp: 8,
+        prefillEp: 1,
+        prefillPp: 2,
+        prefillNumWorkers: 2,
+        decodeTp: 8,
+        decodeEp: 1,
+        decodePp: 1,
+        decodeNumWorkers: 1,
+      }),
+    ).toBe('2xTP8PP2+1xTP8');
+  });
+
+  it('applies per-role DCP and PCP to multinode-disagg segments', () => {
+    expect(
+      parallelismLabel({
+        tp: 8,
+        ep: 1,
+        disagg: true,
+        isMultinode: true,
+        prefillTp: 8,
+        prefillEp: 1,
+        prefillDcp: 2,
+        prefillPcp: 4,
+        prefillNumWorkers: 1,
+        decodeTp: 8,
+        decodeEp: 1,
+        decodeDcp: 8,
+        decodePcp: 1,
+        decodeNumWorkers: 1,
+      }),
+    ).toBe('1xTP8/DCP2/PCP4+1xTP8/DCP8');
+  });
+
+  it('drops the decode segment when the decode pool is absent (0 workers, tp 0)', () => {
+    expect(
+      parallelismLabel({
+        tp: 0,
+        ep: 0,
+        disagg: true,
+        isMultinode: true,
+        prefillTp: 8,
+        prefillEp: 1,
+        prefillPp: 2,
+        prefillNumWorkers: 1,
+        decodeTp: 0,
+        decodeEp: 0,
+        decodePp: 1,
+        decodeNumWorkers: 0,
+      }),
+    ).toBe('TP8PP2');
+  });
+
+  it('keeps the Nx multiplier on a lone segment with multiple workers', () => {
+    expect(
+      parallelismLabel({
+        tp: 0,
+        ep: 0,
+        disagg: true,
+        isMultinode: true,
+        prefillTp: 8,
+        prefillEp: 1,
+        prefillPp: 2,
+        prefillNumWorkers: 2,
+        decodeTp: 0,
+        decodeEp: 0,
+        decodeNumWorkers: 0,
+      }),
+    ).toBe('2xTP8PP2');
+  });
+
+  it('drops the prefill segment when the prefill pool is absent', () => {
+    expect(
+      parallelismLabel({
+        tp: 8,
+        ep: 8,
+        disagg: true,
+        isMultinode: true,
+        prefillTp: 0,
+        prefillEp: 0,
+        prefillNumWorkers: 0,
+        decodeTp: 8,
+        decodeEp: 8,
+        decodeNumWorkers: 1,
+      }),
+    ).toBe('TEP8');
+  });
+
+  it('keeps zero-worker segments whose tp is set (pool exists, worker count unknown)', () => {
+    expect(
+      parallelismLabel({
+        tp: 8,
+        ep: 4,
+        disagg: true,
+        isMultinode: true,
+        prefillTp: 4,
+        prefillEp: 4,
+        prefillNumWorkers: 0,
+        decodeTp: 8,
+        decodeEp: 8,
+        decodeNumWorkers: 1,
+      }),
+    ).toBe('0xTEP4+1xTEP8');
+  });
+});

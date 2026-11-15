@@ -1,0 +1,155 @@
+import { useQuery, keepPreviousData } from '@tanstack/react-query';
+
+import { ApiRequestError } from '@/lib/api/api-request-error';
+
+import type {
+  ConversationDetail,
+  ConversationList,
+  ConversationListItem,
+  ConversationStructure,
+  DatasetDetail as RawDatasetDetail,
+  DatasetRecord,
+  DatasetSummary,
+  ListConversationsOpts,
+  StructureNode,
+} from '@semianalysisai/inferencex-db/queries/datasets';
+
+export type {
+  ConversationDetail,
+  ConversationList,
+  ConversationListItem,
+  ConversationStructure,
+  DatasetRecord,
+  DatasetSummary,
+  StructureNode,
+};
+
+export interface HistogramBin {
+  x0: number;
+  x1: number;
+  count: number;
+}
+
+export interface DistributionStats {
+  count: number;
+  min: number;
+  max: number;
+  mean: number;
+  median: number;
+  p75?: number;
+  p90: number;
+  p95?: number;
+}
+
+export interface Distribution {
+  bins: HistogramBin[];
+  stats: DistributionStats;
+}
+
+export interface DatasetChartData {
+  version?: number;
+  inputTokensPerTurn?: Distribution;
+  uncachedInputTokensPerTurn?: Distribution;
+  outputTokensPerTurn?: Distribution;
+  subagentInputTokensPerRequest?: Distribution;
+  subagentOutputTokensPerRequest?: Distribution;
+  turnsPerConversation?: Distribution;
+  subagentGroupsPerConversation?: Distribution;
+  cachedFractionPerTurn?: Distribution;
+  [k: string]: unknown;
+}
+
+export type DatasetDetail = RawDatasetDetail & {
+  chart_data: DatasetChartData;
+};
+
+export type ConversationSort = NonNullable<ListConversationsOpts['sort']>;
+
+const DAY = 24 * 60 * 60 * 1000;
+const CONVERSATION_QUERY_GC_TIME = 5 * 60 * 1000;
+
+async function fetchJsonOr404<T>(
+  url: string,
+  label: string,
+  signal: AbortSignal,
+): Promise<T | null> {
+  const res = await fetch(url, { signal });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new ApiRequestError(`${label} ${res.status}`, res.status, url);
+  return (await res.json()) as T;
+}
+
+export function useDatasets() {
+  return useQuery({
+    queryKey: ['datasets'] as const,
+    queryFn: async ({ signal }) => {
+      const url = '/api/v1/datasets';
+      const res = await fetch(url, { signal });
+      if (!res.ok) throw new ApiRequestError(`datasets ${res.status}`, res.status, url);
+      return (await res.json()) as DatasetRecord[];
+    },
+    staleTime: DAY,
+  });
+}
+
+export function useDataset(slug: string | null, initialData?: DatasetDetail) {
+  return useQuery({
+    queryKey: ['dataset', slug] as const,
+    queryFn: ({ signal }) =>
+      fetchJsonOr404<DatasetDetail>(`/api/v1/datasets/${slug}`, 'dataset', signal),
+    enabled: Boolean(slug),
+    staleTime: DAY,
+    initialData,
+  });
+}
+
+export interface UseConversationsArgs {
+  slug: string | null;
+  search?: string;
+  limit?: number;
+  offset?: number;
+  sort?: ConversationSort;
+}
+
+export function useDatasetConversations({
+  slug,
+  search = '',
+  limit = 50,
+  offset = 0,
+  sort = 'tokens',
+}: UseConversationsArgs) {
+  return useQuery({
+    queryKey: ['dataset-conversations', slug, search, limit, offset, sort] as const,
+    queryFn: ({ signal }) => {
+      const qs = new URLSearchParams({
+        limit: String(limit),
+        offset: String(offset),
+        sort,
+      });
+      if (search) qs.set('search', search);
+      return fetchJsonOr404<ConversationList>(
+        `/api/v1/datasets/${slug}/conversations?${qs.toString()}`,
+        'dataset-conversations',
+        signal,
+      );
+    },
+    enabled: Boolean(slug),
+    placeholderData: keepPreviousData,
+    staleTime: DAY,
+    gcTime: CONVERSATION_QUERY_GC_TIME,
+  });
+}
+
+export function useDatasetConversation(slug: string | null, convId: string | null) {
+  return useQuery({
+    queryKey: ['dataset-conversation', slug, convId] as const,
+    queryFn: ({ signal }) =>
+      fetchJsonOr404<ConversationDetail>(
+        `/api/v1/datasets/${slug}/conversations/${encodeURIComponent(convId ?? '')}`,
+        'dataset-conversation',
+        signal,
+      ),
+    enabled: Boolean(slug) && Boolean(convId),
+    staleTime: DAY,
+  });
+}

@@ -1,0 +1,38 @@
+import { describe, expect, it } from 'vitest';
+
+import {
+  getAdjacentRunId,
+  getLatestRunId,
+  workflowRunCountShortLabel,
+} from './WorkflowInfoDisplay';
+
+describe('workflow run count label', () => {
+  it('uses a compact label for the selected run so it fits the phone stepper', () => {
+    expect(workflowRunCountShortLabel(2, 5, 'en')).toBe('Run 2/5');
+    expect(workflowRunCountShortLabel(2, 5, 'zh')).toBe('第 2/5 次运行');
+  });
+});
+
+describe('run navigation helpers', () => {
+  const runIds = ['100', '200', '300'];
+
+  it('steps to the adjacent run in each direction', () => {
+    expect(getAdjacentRunId(runIds, '200', 'previous')).toBe('100');
+    expect(getAdjacentRunId(runIds, '200', 'next')).toBe('300');
+  });
+
+  it('returns undefined at the ends of the run list', () => {
+    expect(getAdjacentRunId(runIds, '100', 'previous')).toBeUndefined();
+    expect(getAdjacentRunId(runIds, '300', 'next')).toBeUndefined();
+  });
+
+  it('returns undefined when the selected run is unknown or the list is empty', () => {
+    expect(getAdjacentRunId(runIds, '999', 'next')).toBeUndefined();
+    expect(getAdjacentRunId([], '100', 'previous')).toBeUndefined();
+  });
+
+  it('treats the last run id as the latest run', () => {
+    expect(getLatestRunId(runIds)).toBe('300');
+    expect(getLatestRunId([])).toBeUndefined();
+  });
+});

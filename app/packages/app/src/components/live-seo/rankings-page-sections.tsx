@@ -1,0 +1,225 @@
+import { ArrowLeft } from 'lucide-react';
+import Link from 'next/link';
+
+import { fmtCostPerMtok, fmtThroughput, pctCheaper, pctFaster } from '@/components/live-seo/format';
+import { EmptyState } from '@/components/ui/empty-state';
+import type { RankingPageData } from '@/lib/live-seo/run-rankings-data.server';
+import type { RankingPageEntry, RankingRow } from '@/lib/live-seo/rankings';
+import { getRunPageEntry } from '@/lib/live-seo/run-pages';
+
+export interface RankingsStrings {
+  backLabel: string;
+  heading: string;
+  scenarioNote: string;
+  tableCaption: string;
+  colRank: string;
+  colGpu: string;
+  colThroughput: string;
+  colCost: string;
+  colPrecision: string;
+  colEngine: string;
+  emptyState: string;
+  unrankedNote: string | null;
+  siblingLead: string;
+  siblingLabel: string;
+  methodologyHeading: string;
+  methodologyBody: string[];
+  faqHeading: string;
+  faq: { question: string; answer: string }[];
+  exploreHeading: string;
+  exploreLinks: { href: string; label: string }[];
+}
+
+function leadSentence(rows: RankingRow[], entry: RankingPageEntry, zh: boolean): string {
+  if (rows.length < 2) return '';
+  const [first, second] = rows;
+  if (entry.kind === 'fastest-gpu' && first.throughputPerGpu && second.throughputPerGpu) {
+    const pct = pctFaster(first.throughputPerGpu, second.throughputPerGpu);
+    const lead = `${first.hardwareLabel} leads at ${fmtThroughput(first.throughputPerGpu)} tokens/s per GPU, ${pct}% ahead of ${second.hardwareLabel}.`;
+    const leadZh = `${first.hardwareLabel} 以单 GPU 每秒 ${fmtThroughput(first.throughputPerGpu)} token 领先，比第二名 ${second.hardwareLabel} 高 ${pct}%。`;
+    return zh ? leadZh : lead;
+  }
+  if (entry.kind === 'cheapest-gpu' && first.costPerMtok && second.costPerMtok) {
+    const pct = pctCheaper(first.costPerMtok, second.costPerMtok);
+    const lead = `${first.hardwareLabel} is the cheapest at ${fmtCostPerMtok(first.costPerMtok)} per million tokens, ${pct}% below ${second.hardwareLabel}.`;
+    const leadZh = `${first.hardwareLabel} 成本最低，每百万 token 仅 ${fmtCostPerMtok(first.costPerMtok)}，比第二名 ${second.hardwareLabel} 低 ${pct}%。`;
+    return zh ? leadZh : lead;
+  }
+  return '';
+}
+
+export function rankingsLeadSentence(
+  rows: RankingRow[],
+  entry: RankingPageEntry,
+  locale: 'en' | 'zh',
+): string {
+  return leadSentence(rows, entry, locale === 'zh');
+}
+
+export function RankingsDetailContent({
+  entry,
+  data,
+  t,
+  locale,
+}: {
+  entry: RankingPageEntry;
+  data: RankingPageData;
+  t: RankingsStrings;
+  locale: 'en' | 'zh';
+}) {
+  const prefix = locale === 'zh' ? '/zh' : '';
+  const lead = rankingsLeadSentence(data.rows, entry, locale);
+
+  return (
+    <main className="relative">
+      <div className="container mx-auto px-4 lg:px-8">
+        <article className="mx-auto max-w-5xl">
+          <header className="pt-8 md:pt-12">
+            <Link
+              href={`${prefix}/rankings`}
+              className="inline-flex items-center gap-2 text-sm text-muted-foreground transition-colors hover:text-foreground"
+            >
+              <ArrowLeft aria-hidden="true" className="size-4" />
+              {t.backLabel}
+            </Link>
+            <p className="mt-6 text-xs font-medium text-muted-foreground">{entry.model.label}</p>
+            <h1 className="mt-3 max-w-4xl text-3xl font-semibold text-balance md:text-5xl md:tracking-heading">
+              {t.heading}
+            </h1>
+            {lead && <p className="mt-4 max-w-3xl text-lg leading-relaxed">{lead}</p>}
+            <p className="mt-3 max-w-3xl text-sm text-muted-foreground">{t.scenarioNote}</p>
+          </header>
+
+          <section className="mt-10">
+            {data.rows.length === 0 ? (
+              <EmptyState>{t.emptyState}</EmptyState>
+            ) : (
+              <div className="overflow-x-auto rounded-xl border border-border/30">
+                <table className="w-full min-w-[40rem] text-sm">
+                  <caption className="sr-only">{t.tableCaption}</caption>
+                  <thead>
+                    <tr className="border-b border-border/30 text-left text-xs font-medium text-muted-foreground">
+                      <th scope="col" className="px-4 py-3 text-right">
+                        {t.colRank}
+                      </th>
+                      <th scope="col" className="px-4 py-3">
+                        {t.colGpu}
+                      </th>
+                      <th scope="col" className="px-4 py-3 text-right">
+                        {t.colThroughput}
+                      </th>
+                      <th scope="col" className="px-4 py-3 text-right">
+                        {t.colCost}
+                      </th>
+                      <th scope="col" className="px-4 py-3">
+                        {t.colPrecision}
+                      </th>
+                      <th scope="col" className="px-4 py-3">
+                        {t.colEngine}
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.rows.map((row) => {
+                      const runEntry = row.chip
+                        ? getRunPageEntry(`${entry.model.slug}-on-${row.chip.slug}`)
+                        : undefined;
+                      return (
+                        <tr
+                          key={row.hardware}
+                          className="border-b border-border/20 last:border-b-0"
+                        >
+                          <td className="w-16 px-4 py-3 text-right tabular-nums">{row.rank}</td>
+                          <td className="px-4 py-3 font-medium">
+                            {runEntry ? (
+                              <Link
+                                href={`${prefix}/run/${runEntry.slug}`}
+                                className="text-brand hover:underline"
+                              >
+                                {row.hardwareLabel}
+                              </Link>
+                            ) : (
+                              row.hardwareLabel
+                            )}
+                          </td>
+                          <td className="px-4 py-3 text-right whitespace-nowrap tabular-nums">
+                            {row.throughputPerGpu === null
+                              ? '-'
+                              : fmtThroughput(row.throughputPerGpu)}
+                          </td>
+                          <td className="px-4 py-3 text-right whitespace-nowrap tabular-nums">
+                            {row.costPerMtok === null ? '-' : fmtCostPerMtok(row.costPerMtok)}
+                          </td>
+                          <td className="px-4 py-3 uppercase">{row.precision ?? '-'}</td>
+                          <td className="px-4 py-3">{row.framework ?? '-'}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {data.rows.length > 0 && t.unrankedNote && (
+              <p className="mt-3 text-xs text-muted-foreground">{t.unrankedNote}</p>
+            )}
+            <p className="mt-4 text-sm text-muted-foreground">
+              {t.siblingLead}{' '}
+              <Link
+                href={`${prefix}/rankings/${entry.kind === 'fastest-gpu' ? 'cheapest-gpu' : 'fastest-gpu'}-for-${entry.model.slug}`}
+                className="font-medium text-brand hover:underline"
+              >
+                {t.siblingLabel}
+              </Link>
+            </p>
+          </section>
+
+          <section
+            aria-labelledby="ranking-methodology"
+            className="mt-10 border-t border-border/30 pt-10"
+          >
+            <h2 id="ranking-methodology" className="text-xl font-semibold">
+              {t.methodologyHeading}
+            </h2>
+            {t.methodologyBody.map((paragraph) => (
+              <p key={paragraph.slice(0, 32)} className="mt-3 leading-7 text-muted-foreground">
+                {paragraph}
+              </p>
+            ))}
+          </section>
+
+          <section aria-labelledby="ranking-faq" className="mt-10 border-t border-border/30 pt-10">
+            <h2 id="ranking-faq" className="text-xl font-semibold">
+              {t.faqHeading}
+            </h2>
+            <dl className="mt-4 space-y-6">
+              {t.faq.map((item) => (
+                <div key={item.question}>
+                  <dt className="font-medium">{item.question}</dt>
+                  <dd className="mt-2 leading-7 text-muted-foreground">{item.answer}</dd>
+                </div>
+              ))}
+            </dl>
+          </section>
+
+          <section
+            aria-labelledby="ranking-explore"
+            className="mt-10 mb-16 border-t border-border/30 pt-10"
+          >
+            <h2 id="ranking-explore" className="text-xl font-semibold">
+              {t.exploreHeading}
+            </h2>
+            <ul className="mt-3 space-y-2">
+              {t.exploreLinks.map((link) => (
+                <li key={link.href}>
+                  <Link href={link.href} className="text-sm font-medium text-brand hover:underline">
+                    {link.label}
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </section>
+        </article>
+      </div>
+    </main>
+  );
+}

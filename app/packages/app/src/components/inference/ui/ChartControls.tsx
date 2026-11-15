@@ -1,0 +1,821 @@
+'use client';
+
+import { ControlPanel } from '@/components/ui/control-panel';
+import { type ReactNode, useEffect, useMemo, useState } from 'react';
+
+import { track } from '@/lib/analytics/analytics';
+import { replaceRouterPathname } from '@/lib/routing/client-navigation';
+import { AGENTX_NEW_MODEL_DISPLAY_NAMES } from '@/lib/compare/compare-agentx';
+import { inferenceModelRouteForSelection } from '@/lib/routing/inference-model-slug';
+import { useFeatureGate } from '@/lib/runtime/use-feature-gate';
+
+import {
+  useInferenceActions,
+  useInferenceAnalyticsContext,
+  useInferenceData,
+  useInferenceDisplay,
+  useInferenceFilters,
+} from '@/components/inference/InferenceContext';
+import {
+  ModelSelector,
+  ScenarioSelector,
+  PrecisionSelector,
+} from '@/components/ui/chart-selectors';
+import { DateRangePicker } from '@/components/ui/date-range-picker';
+import { LabelWithTooltip } from '@/components/ui/label-with-tooltip';
+import { MultiSelect } from '@/components/ui/multi-select';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { SearchableSelect } from '@/components/ui/searchable-select';
+import { TooltipProvider } from '@/components/ui/tooltip';
+import { MobileControlSection } from '@/components/ui/mobile-control-section';
+import {
+  METRIC_CONTROL_GROUPS,
+  METRIC_REGISTRY,
+  costMetricFamily,
+  isMetricKey,
+  metricChartTitle,
+  metricCostTier,
+  metricForCostTier,
+  metricOptionTitle,
+  type CostMetricFamilyId,
+  type CostTier,
+  type MetricKey,
+  countsInputTokens,
+  isInputMetric,
+} from '@/components/inference/metric-registry';
+import {
+  cachedInputPricePerMillion,
+  formatTokenPriceLabel,
+  usesTokenSalePricing,
+} from '@/components/inference/token-revenue';
+import { useOpenDropdown } from '@/hooks/useOpenDropdown';
+import { useIsMobileViewport } from '@/hooks/useMediaQuery';
+import { ModelArchitectureInfoLink } from './ModelArchitectureInfoLink';
+import { MetricExplanation } from './MetricExplanation';
+import { MeasuredMetricControls } from './MeasuredMetricControls';
+import { usePowerXSurface } from './powerx-surface';
+import { powerXChangedCount } from '../powerx/powerx-views';
+import type { PowerXChartConfigSlots } from '../powerx/PowerXLayout';
+import {
+  changeMeasuredMetricConfig,
+  getMeasuredMetricConfig,
+  MEASURED_METRIC_DEFAULTS,
+  type MeasuredMetricFamily,
+} from '../measured-metric-config';
+import { XAxisModeSelector } from './XAxisModeSelector';
+import { TokenBasisToggle } from './TokenBasisToggle';
+import {
+  Sequence,
+  type Model,
+  MODEL_OPTIONS,
+  isModelVisible,
+  isRegisteredModel,
+  modelRequiresObservations,
+} from '@/lib/catalog/data-mappings';
+import { useLocale } from '@/lib/i18n/use-locale';
+import { DEFAULT_Y_AXIS_METRIC } from '@/lib/routing/url-state';
+
+const STRINGS = {
+  en: {
+    measuredPower: 'Measured power',
+    measuredEnergy: 'Measured energy',
+    measuredGroup: 'Measured',
+    benchmarkControls: 'Benchmark config',
+    chartControls: 'Chart config',
+    compareHistory: 'Compare history',
+    yAxisMetric: 'Y-axis metric',
+    yAxisMetricTooltip:
+      "The performance metric displayed on the chart's Y-axis. Options include throughput, token revenue per GPU hour, cost per million tokens, tokens per $1 TCO, and custom user-defined values.",
+    xAxisMetric: 'X-axis metric',
+    xAxisMetricTooltip:
+      "The latency metric displayed on the chart's X-axis: P90 Time To First Token.",
+    xAxisScale: 'X-axis scale',
+    xAxisScaleTooltip:
+      'The scale type for the X-axis. Auto automatically chooses between linear and logarithmic based on the data range. Linear uses a linear scale. Logarithmic uses a log scale for better visualization of wide-ranging values.',
+    scaleAuto: 'Auto',
+    scaleLinear: 'Linear',
+    scaleLog: 'Logarithmic',
+    gpuConfig: 'Chip config',
+    gpuConfigTooltip:
+      'Select up to 4 chip configurations to compare their historical performance over time. This allows for tracking how software updates may affect specific hardware.',
+    gpuConfigPlaceholder: 'Select chip config',
+    comparisonDateRange: 'Comparison date range',
+    comparisonDateRangeTooltip:
+      'Select the start and end dates for the historical comparison. The chart will show performance data for the selected chip configs across this time range.',
+    dateRangePlaceholder: 'Select date range',
+    revenuePriceSource: 'Token price source',
+    revenuePriceSourceTooltip:
+      'Choose the token sale prices used for revenue. For Agentic traces, measured cache hits use a separate cached-input price. Normalized pricing uses $1/M uncached input and output plus $0.10/M cached input. OpenRouter uses the selected model’s current public prices, falling back to 10% of its input price when no cache-read price is published.',
+    normalizedPrice: 'Normalized ($1/M uncached + output, $0.10/M cached)',
+    openRouterPrice: 'OpenRouter current pricing',
+    openRouterLoading: 'Loading OpenRouter pricing…',
+    openRouterUnavailable: 'OpenRouter pricing is unavailable for this model',
+    openRouterSummary: (input: string, cached: string | null, output: string) =>
+      cached === null
+        ? `Input $${input}/M tok · Output $${output}/M tok`
+        : `Uncached input $${input}/M tok · Cached input $${cached}/M tok · Output $${output}/M tok`,
+    viewOpenRouter: 'View OpenRouter pricing',
+    secondaryControls: 'More chart controls',
+    changed: 'changed',
+  },
+  zh: {
+    measuredPower: '实测功率',
+    measuredEnergy: '实测能耗',
+    measuredGroup: '实测',
+    benchmarkControls: '基准测试配置',
+    chartControls: '图表配置',
+    compareHistory: '对比历史趋势',
+    yAxisMetric: 'Y 轴指标',
+    yAxisMetricTooltip:
+      '图表 Y 轴显示的性能指标，包括吞吐量、每 GPU 小时 token 收入、每百万 token 成本、每 1 美元 TCO 对应的 token 数以及自定义值。',
+    xAxisMetric: 'X 轴指标',
+    xAxisMetricTooltip: '图表 X 轴显示的延迟指标：P90 Time To First Token。',
+    xAxisScale: 'X 轴刻度',
+    xAxisScaleTooltip:
+      'X 轴的刻度类型。自动模式根据数据范围自动选择线性或对数刻度。线性使用线性刻度。对数使用对数刻度，更适合展示范围较大的数据。',
+    scaleAuto: '自动',
+    scaleLinear: '线性',
+    scaleLog: '对数',
+    gpuConfig: '芯片配置',
+    gpuConfigTooltip:
+      '最多选择 4 个芯片配置以对比其历史性能趋势。可用于追踪软件更新对特定硬件的影响。',
+    gpuConfigPlaceholder: '选择芯片配置',
+    comparisonDateRange: '对比日期范围',
+    comparisonDateRangeTooltip:
+      '选择历史对比的起止日期。图表将展示所选芯片配置在此时间范围内的性能数据。',
+    dateRangePlaceholder: '选择日期范围',
+    revenuePriceSource: 'token 计价来源',
+    revenuePriceSourceTooltip:
+      '选择计算 token 收入所用的售价。Agentic trace 按实测缓存命中率采用单独的缓存输入价格。标准化模式下，未缓存输入和输出均为 $1/百万，缓存输入为 $0.10/百万。OpenRouter 模式采用所选模型当前公开的价格；未提供缓存读取价格时，按输入价格的 10% 计算。',
+    normalizedPrice: '标准化（未缓存输入和输出 $1/百万，缓存输入 $0.10/百万）',
+    openRouterPrice: 'OpenRouter 当前价格',
+    openRouterLoading: '正在加载 OpenRouter 价格…',
+    openRouterUnavailable: 'OpenRouter 暂无该模型的价格',
+    openRouterSummary: (input: string, cached: string | null, output: string) =>
+      cached === null
+        ? `输入 $${input}/百万 token · 输出 $${output}/百万 token`
+        : `未缓存输入 $${input}/百万 token · 缓存输入 $${cached}/百万 token · 输出 $${output}/百万 token`,
+    viewOpenRouter: '查看 OpenRouter 定价',
+    secondaryControls: '更多图表设置',
+    changed: '项已更改',
+  },
+} as const;
+
+const METRIC_GROUPS = METRIC_CONTROL_GROUPS;
+
+const METRIC_TITLE_MAP = new Map(
+  (Object.keys(METRIC_REGISTRY) as MetricKey[]).map((key) => [
+    `y_${key}`,
+    metricOptionTitle(key, 'en'),
+  ]),
+);
+
+const METRIC_TITLE_ZH_MAP = new Map(
+  (Object.keys(METRIC_REGISTRY) as MetricKey[]).map((key) => [
+    `y_${key}`,
+    metricOptionTitle(key, 'zh'),
+  ]),
+);
+
+interface ChartControlsProps {
+  scenarioInFooter?: boolean;
+  hideGpuComparison?: boolean;
+  tcoSource?: 'inference' | 'historical';
+  showXAxisMode?: boolean;
+  runContext?: ReactNode;
+  trailingPanel?: ReactNode;
+  /** PowerX: the Count / Per / Show as controls that stand in for the Y-axis metric pick. */
+  /** PowerX's Chart Config cells; receives the X-Axis Metric cell so it can place it. */
+  powerXControls?: (slots: PowerXChartConfigSlots) => ReactNode;
+  /** Extra details on each model's row in the model dropdown, e.g. its benchmark history. */
+  modelDetails?: ReadonlyMap<string, ReactNode>;
+}
+
+export default function ChartControls({
+  scenarioInFooter = false,
+  hideGpuComparison = false,
+  tcoSource = 'inference',
+  showXAxisMode = false,
+  runContext,
+  trailingPanel,
+  powerXControls,
+  modelDetails,
+}: ChartControlsProps) {
+  const locale = useLocale();
+  const t = STRINGS[locale];
+  const isMobile = useIsMobileViewport();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
+  const { openDropdown, handleDropdownOpenChange } = useOpenDropdown<string>();
+  const { selectedModel, selectedSequence, selectedPrecisions, selectedGPUs, selectedDateRange } =
+    useInferenceFilters();
+  const {
+    graphs,
+    availableGPUs,
+    dateRangeAvailableDates,
+    isCheckingAvailableDates,
+    availablePrecisions,
+    availableSequences,
+    availableModels,
+  } = useInferenceData();
+  const {
+    selectedYAxisMetric,
+    tokenRevenuePriceSource,
+    tokenRevenuePricing,
+    openRouterModelId,
+    openRouterPricingLoading,
+    openRouterPricingError,
+    selectedXAxisMetric,
+    selectedXAxisMode,
+    defaultXAxisMode,
+    scaleType,
+    powerCompare,
+  } = useInferenceDisplay();
+  const {
+    setSelectedModel,
+    setSelectedSequence,
+    setSelectedPrecisions,
+    setSelectedYAxisMetric,
+    setTokenRevenuePriceSource,
+    setSelectedGPUs,
+    setSelectedDateRange,
+    setSelectedXAxisMetric,
+    setScaleType,
+    setPowerCompare,
+  } = useInferenceActions();
+  const powerXSurface = usePowerXSurface();
+  const featureGateUnlocked = useFeatureGate();
+  // Pending registrations are discoverable on inference without making them
+  // measured choices in shared calculator/TCO, PowerX, or historical selectors.
+  const selectableModels = useMemo(
+    () =>
+      tcoSource === 'inference' && !powerXSurface
+        ? [
+            ...MODEL_OPTIONS.filter(
+              (model) =>
+                isModelVisible(model, featureGateUnlocked) &&
+                (availableModels.includes(model) || modelRequiresObservations(model)),
+            ),
+            ...availableModels.filter((model) => !isRegisteredModel(model)),
+          ]
+        : availableModels,
+    [availableModels, powerXSurface, tcoSource, featureGateUnlocked],
+  );
+  const analyticsContext = useInferenceAnalyticsContext();
+
+  const visibleGroups = useMemo(
+    () =>
+      METRIC_GROUPS.filter(
+        (g) =>
+          !g.gated ||
+          featureGateUnlocked ||
+          (g.metrics as readonly string[]).includes(selectedYAxisMetric),
+      ),
+    [featureGateUnlocked, selectedYAxisMetric],
+  );
+  const metricGroupMap = useMemo(
+    () =>
+      new Map<string, string>(
+        visibleGroups.flatMap((g) => g.metrics.map((m) => [m, g.label] as const)),
+      ),
+    [visibleGroups],
+  );
+  const selectedMetricKey = selectedYAxisMetric.replace(/^y_/u, '');
+  const selectedTier: CostTier | undefined = isMetricKey(selectedMetricKey)
+    ? metricCostTier(selectedMetricKey)
+    : undefined;
+  const carriedTier: CostTier = selectedTier ?? 'hyperscaler';
+
+  const searchableYAxisOptions = useMemo(() => {
+    const seenFamilies = new Set<CostMetricFamilyId>();
+    return visibleGroups
+      .map((group) => {
+        const options = group.metrics.flatMap((m) => {
+          if (!METRIC_TITLE_MAP.has(m)) return [];
+          const key = m.replace(/^y_/u, '') as MetricKey;
+          const family = costMetricFamily(key);
+          if (family) {
+            if (seenFamilies.has(family)) return [];
+            seenFamilies.add(family);
+            const tieredKey = metricForCostTier(family, carriedTier) ?? key;
+            return [
+              {
+                value: `y_${tieredKey}`,
+                help: <MetricExplanation metricKey={tieredKey} />,
+                label: metricChartTitle(key, locale),
+              },
+            ];
+          }
+          return [
+            {
+              value: m,
+              help: <MetricExplanation metricKey={key} />,
+              label:
+                (locale === 'zh' ? METRIC_TITLE_ZH_MAP.get(m) : undefined) ??
+                METRIC_TITLE_MAP.get(m)!,
+            },
+          ];
+        });
+        return {
+          groupLabel: locale === 'zh' ? group.labelZh : group.label,
+          options,
+        };
+      })
+      .filter((g) => g.options.length > 0);
+  }, [visibleGroups, locale, carriedTier]);
+
+  // Measured power and energy live on PowerX; only Historical Trends keeps them here.
+  const showsMeasuredMetrics = tcoSource === 'historical';
+  const pickerYAxisOptions = useMemo(
+    () =>
+      showsMeasuredMetrics
+        ? searchableYAxisOptions
+        : searchableYAxisOptions
+            .map((group) => ({
+              ...group,
+              options: group.options.filter((option) => !getMeasuredMetricConfig(option.value)),
+            }))
+            .filter((group) => group.options.length > 0),
+    [searchableYAxisOptions, showsMeasuredMetrics],
+  );
+
+  const groupedYAxisOptions = useMemo(() => {
+    const selectedConfig = getMeasuredMetricConfig(selectedYAxisMetric);
+    const seen = new Set<MeasuredMetricFamily>();
+    return pickerYAxisOptions.map((group) => ({
+      ...group,
+      groupLabel: group.options.some((option) => getMeasuredMetricConfig(option.value))
+        ? t.measuredGroup
+        : group.groupLabel,
+      options: group.options.flatMap((option) => {
+        const config = getMeasuredMetricConfig(option.value);
+        if (!config) return [option];
+        if (seen.has(config.family)) return [];
+        seen.add(config.family);
+        const value =
+          selectedConfig?.family === config.family
+            ? selectedYAxisMetric
+            : selectedConfig
+              ? changeMeasuredMetricConfig(selectedYAxisMetric, {
+                  family: config.family,
+                })
+              : MEASURED_METRIC_DEFAULTS[config.family];
+        return [
+          {
+            value,
+            label: config.family === 'power' ? t.measuredPower : t.measuredEnergy,
+            help: <MetricExplanation metricKey={value.replace(/^y_/u, '') as MetricKey} />,
+          },
+        ];
+      }),
+    }));
+  }, [pickerYAxisOptions, selectedYAxisMetric, t]);
+
+  const trackCombinedFilters = () => {
+    if (selectedModel && selectedSequence && selectedPrecisions.length > 0 && selectedYAxisMetric) {
+      track('inference_filters_changed', {
+        model: selectedModel,
+        sequence: selectedSequence,
+        precision: selectedPrecisions.join(','),
+        metric: selectedYAxisMetric,
+        metric_label: METRIC_TITLE_MAP.get(selectedYAxisMetric) ?? selectedYAxisMetric,
+        metric_group: metricGroupMap.get(selectedYAxisMetric) ?? 'Unknown',
+      });
+    }
+  };
+
+  const handleModelChange = (value: Model) => {
+    setSelectedModel(value);
+    const target = inferenceModelRouteForSelection(window.location.pathname, value);
+    // Re-picking the shown model only canonicalizes a bare /infx/inference path. That is not a new page.
+    if (target !== null) {
+      replaceRouterPathname(target, ['g_model'], {
+        pageview: value !== selectedModel,
+      });
+    }
+    track('inference_model_selected', {
+      ...analyticsContext,
+      model: value,
+    });
+    setTimeout(trackCombinedFilters, 0);
+  };
+
+  const handleSequenceChange = (value: Sequence) => {
+    setSelectedSequence(value);
+    track('inference_sequence_selected', {
+      ...analyticsContext,
+      sequence: value,
+    });
+    setTimeout(trackCombinedFilters, 0);
+  };
+
+  const handlePrecisionChange = (value: string[]) => {
+    setSelectedPrecisions(value);
+    track('inference_precision_selected', {
+      ...analyticsContext,
+      precision: value.join(','),
+    });
+    setTimeout(trackCombinedFilters, 0);
+  };
+
+  const handleYAxisMetricChange = (value: string) => {
+    setSelectedYAxisMetric(value);
+    track('inference_y_axis_metric_selected', {
+      ...analyticsContext,
+      metric: value,
+      metric_label: METRIC_TITLE_MAP.get(value) ?? value,
+      metric_group: metricGroupMap.get(value) ?? 'Unknown',
+    });
+    setTimeout(trackCombinedFilters, 0);
+  };
+
+  const handleGPUChange = (value: string[]) => {
+    setSelectedGPUs(value);
+    track('inference_gpu_selected', {
+      ...analyticsContext,
+      gpus: value.join(','),
+    });
+    setTimeout(trackCombinedFilters, 0);
+  };
+
+  const handleXAxisMetricChange = (value: string) => {
+    setSelectedXAxisMetric(value);
+    track('inference_x_axis_metric_selected', {
+      ...analyticsContext,
+      metric: value,
+    });
+  };
+
+  const handleScaleTypeChange = (value: 'auto' | 'linear' | 'log') => {
+    setScaleType(value);
+    track('inference_scale_type_selected', {
+      ...analyticsContext,
+      scale_type: value,
+    });
+  };
+
+  const selectedIsInputMetric = isInputMetric(selectedYAxisMetric);
+
+  const handleDateRangeChange = (range: { startDate: string; endDate: string }) => {
+    setSelectedDateRange(range);
+    track('inference_date_range_changed', {
+      start_date: range.startDate,
+      end_date: range.endDate,
+    });
+  };
+
+  const secondaryCount =
+    // PowerX picks the metric through its tabs; its Count, Per, Show as, Scope,
+    // Power statistic and Rated boundaries controls count instead.
+    (powerXSurface
+      ? powerXChangedCount({
+          metric: selectedYAxisMetric,
+          compare: powerCompare,
+        })
+      : selectedYAxisMetric === DEFAULT_Y_AXIS_METRIC
+        ? 0
+        : 1) +
+    (showXAxisMode && selectedXAxisMode !== defaultXAxisMode ? 1 : 0) +
+    (selectedXAxisMetric === undefined || selectedXAxisMetric === 'p90_ttft' ? 0 : 1) +
+    (scaleType === 'auto' ? 0 : 1) +
+    (selectedGPUs.length > 0 ? 1 : 0) +
+    (selectedDateRange.startDate && selectedDateRange.endDate ? 1 : 0);
+  const tokenBasisVisible =
+    mounted &&
+    featureGateUnlocked &&
+    tcoSource === 'inference' &&
+    selectedSequence === Sequence.AgenticTraces &&
+    countsInputTokens(selectedYAxisMetric);
+  // Chart Config columns: PowerX keeps an X-Axis Metric column of 11rem, or 18rem on agentic
+  // traces where its options are longer, and splits the rest in two, so its Count toggle (two
+  // cells) and then Per or Show as, Scope, Power statistic and Rated boundaries (one cell
+  // each) flow left to right in rows of three. Elsewhere the X and Y pickers share the row
+  // evenly. Below sm every cell is a row.
+  const xAxisWide = selectedSequence === Sequence.AgenticTraces;
+  const chartConfigGridClass = powerXSurface
+    ? xAxisWide
+      ? 'sm:grid-cols-[minmax(0,18rem)_minmax(0,1fr)_minmax(0,1fr)]'
+      : 'sm:grid-cols-[11rem_minmax(0,1fr)_minmax(0,1fr)]'
+    : 'sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]';
+
+  const scenarioSelector = !scenarioInFooter && (
+    <div className="min-w-0">
+      <ScenarioSelector
+        value={selectedSequence}
+        onChange={handleSequenceChange}
+        open={openDropdown === 'sequence'}
+        onOpenChange={handleDropdownOpenChange('sequence')}
+        availableSequences={availableSequences}
+        model={selectedModel}
+        data-testid="scenario-selector"
+      />
+    </div>
+  );
+
+  // Benchmark config takes its own row. Chart config shares the next row with compare history
+  // (or takes it alone when that is hidden), and run context closes out the panel. PowerX keeps
+  // chart config on its own row because it holds up to six cells.
+  const spans = powerXSurface
+    ? {
+        benchmark: 'lg:col-span-12',
+        chart: 'lg:col-span-12',
+        run: 'lg:col-span-8',
+        history: 'lg:col-span-4',
+      }
+    : {
+        benchmark: 'lg:col-span-12',
+        chart: trailingPanel
+          ? 'lg:col-span-5'
+          : hideGpuComparison
+            ? 'lg:col-span-12'
+            : 'lg:col-span-8',
+        run: 'lg:order-last lg:col-span-12',
+        history: 'lg:col-span-4',
+      };
+
+  return (
+    <TooltipProvider delayDuration={0}>
+      <div className="grid min-w-0 items-start gap-x-6 gap-y-4 lg:grid-cols-12">
+        <ControlPanel legend={t.benchmarkControls} className={spans.benchmark}>
+          <div
+            className={`grid min-w-0 grid-cols-2 items-start gap-3 ${scenarioInFooter ? 'md:grid-cols-3' : 'md:grid-cols-4'}`}
+          >
+            <div className="min-w-0 col-span-2">
+              <ModelSelector
+                value={selectedModel}
+                onChange={handleModelChange}
+                open={openDropdown === 'model'}
+                onOpenChange={handleDropdownOpenChange('model')}
+                availableModels={selectableModels}
+                data-testid="model-selector"
+                trailing={<ModelArchitectureInfoLink model={selectedModel} locale={locale} />}
+                newModels={AGENTX_NEW_MODEL_DISPLAY_NAMES}
+                modelDetails={modelDetails}
+              />
+            </div>
+            {!isMobile && <div className="hidden md:contents">{scenarioSelector}</div>}
+            <div className="min-w-0 col-span-2 md:col-span-1">
+              <PrecisionSelector
+                value={selectedPrecisions}
+                onChange={handlePrecisionChange}
+                open={openDropdown === 'precision'}
+                onOpenChange={handleDropdownOpenChange('precision')}
+                availablePrecisions={availablePrecisions}
+                data-testid="precision-multiselect"
+              />
+            </div>
+          </div>
+        </ControlPanel>
+
+        <MobileControlSection
+          label={t.secondaryControls}
+          count={secondaryCount}
+          countLabel={t.changed}
+          testId="inference-secondary-controls"
+        >
+          {isMobile && scenarioSelector && (
+            <div className="grid min-w-0 grid-cols-2 items-start gap-3 md:hidden">
+              {scenarioSelector}
+            </div>
+          )}
+          <ControlPanel
+            legend={t.chartControls}
+            data-testid="inference-chart-configuration"
+            className={spans.chart}
+          >
+            <div className={`grid min-w-0 items-start gap-3 ${chartConfigGridClass}`}>
+              {powerXSurface && powerXControls
+                ? powerXControls({
+                    xAxisSelector: showXAxisMode ? <XAxisModeSelector /> : null,
+                    xAxisChanged: showXAxisMode && selectedXAxisMode !== defaultXAxisMode,
+                  })
+                : showXAxisMode && <XAxisModeSelector />}
+              <div
+                className={`flex min-w-0 flex-col space-y-1.5 ${showXAxisMode ? '' : 'sm:col-span-2'}`}
+                hidden={powerXSurface}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <LabelWithTooltip
+                    htmlFor="y-axis-select"
+                    label={t.yAxisMetric}
+                    tooltip={t.yAxisMetricTooltip}
+                  />
+                  {tokenBasisVisible && <TokenBasisToggle />}
+                </div>
+                <SearchableSelect
+                  triggerId="y-axis-select"
+                  triggerTestId="yaxis-metric-selector"
+                  value={selectedYAxisMetric}
+                  onValueChange={handleYAxisMetricChange}
+                  placeholder={t.yAxisMetric}
+                  trackPrefix="yaxis_metric"
+                  groups={groupedYAxisOptions.map((g) => ({
+                    label: g.groupLabel,
+                    options: g.options,
+                  }))}
+                  searchGroups={groupedYAxisOptions.map((g, index) => ({
+                    label: g.groupLabel,
+                    options: [
+                      ...g.options.filter((option) => getMeasuredMetricConfig(option.value)),
+                      ...pickerYAxisOptions[index].options,
+                    ],
+                  }))}
+                  searchPlaceholder={locale === 'zh' ? '搜索…' : undefined}
+                  searchAriaLabel={locale === 'zh' ? '搜索指标选项' : undefined}
+                  noResultsLabel={locale === 'zh' ? '无结果' : undefined}
+                  clearSearchLabel={locale === 'zh' ? '清除搜索' : undefined}
+                />
+              </div>
+
+              {mounted && showsMeasuredMetrics && getMeasuredMetricConfig(selectedYAxisMetric) && (
+                <MeasuredMetricControls
+                  metric={selectedYAxisMetric}
+                  onChange={handleYAxisMetricChange}
+                  compare={powerCompare}
+                  onCompareChange={setPowerCompare}
+                />
+              )}
+
+              {mounted && usesTokenSalePricing(selectedYAxisMetric) && (
+                <div className="flex min-w-0 flex-col space-y-1.5 sm:col-span-2">
+                  <LabelWithTooltip
+                    htmlFor="token-revenue-price-source"
+                    label={t.revenuePriceSource}
+                    tooltip={t.revenuePriceSourceTooltip}
+                  />
+                  <Select
+                    value={tokenRevenuePriceSource}
+                    onValueChange={(value) => {
+                      setTokenRevenuePriceSource(value as 'normalized' | 'openrouter');
+                      track('inference_token_revenue_price_source_selected', {
+                        ...analyticsContext,
+                        source: value,
+                      });
+                    }}
+                  >
+                    <SelectTrigger
+                      id="token-revenue-price-source"
+                      data-testid="token-revenue-price-source"
+                      className="w-full"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent portalled={false}>
+                      <SelectItem value="normalized">{t.normalizedPrice}</SelectItem>
+                      <SelectItem value="openrouter">{t.openRouterPrice}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  {tokenRevenuePriceSource === 'openrouter' && (
+                    <p
+                      data-testid="openrouter-price-summary"
+                      className="text-xs text-muted-foreground"
+                    >
+                      {openRouterPricingLoading
+                        ? t.openRouterLoading
+                        : openRouterPricingError || !tokenRevenuePricing
+                          ? t.openRouterUnavailable
+                          : t.openRouterSummary(
+                              formatTokenPriceLabel(tokenRevenuePricing.inputPerMillion),
+                              selectedSequence === Sequence.AgenticTraces
+                                ? formatTokenPriceLabel(
+                                    cachedInputPricePerMillion(tokenRevenuePricing),
+                                  )
+                                : null,
+                              formatTokenPriceLabel(tokenRevenuePricing.outputPerMillion),
+                            )}{' '}
+                      {openRouterModelId && (
+                        <a
+                          href={`https://openrouter.ai/${openRouterModelId}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="underline underline-offset-2"
+                          data-testid="openrouter-pricing-link"
+                          onClick={() => {
+                            track('inference_openrouter_pricing_opened', {
+                              model: selectedModel,
+                              openrouter_model_id: openRouterModelId,
+                            });
+                          }}
+                        >
+                          {t.viewOpenRouter}
+                        </a>
+                      )}
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {!showXAxisMode &&
+                graphs.some((g) => g.chartDefinition?.chartType === 'interactivity') &&
+                selectedIsInputMetric &&
+                selectedSequence !== Sequence.AgenticTraces && (
+                  <div className="flex flex-col space-y-1.5 lg:col-span-1">
+                    <LabelWithTooltip
+                      htmlFor="x-axis-select"
+                      label={t.xAxisMetric}
+                      tooltip={t.xAxisMetricTooltip}
+                    />
+                    <Select
+                      onValueChange={handleXAxisMetricChange}
+                      value={selectedXAxisMetric ?? 'p90_ttft'}
+                    >
+                      <SelectTrigger
+                        id="x-axis-select"
+                        data-testid="xaxis-metric-selector"
+                        className="w-full"
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent portalled={false}>
+                        <SelectItem value="p90_ttft">P90 TTFT</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                )}
+
+              {graphs.some((g) => g.chartDefinition?.chartType === 'interactivity') &&
+                selectedIsInputMetric && (
+                  <div className="flex flex-col space-y-1.5 lg:col-span-1">
+                    <LabelWithTooltip
+                      htmlFor="scale-type-select"
+                      label={t.xAxisScale}
+                      tooltip={t.xAxisScaleTooltip}
+                    />
+                    <Select onValueChange={handleScaleTypeChange} value={scaleType}>
+                      <SelectTrigger
+                        id="scale-type-select"
+                        data-testid="scale-type-selector"
+                        className="w-full"
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent portalled={false}>
+                        <SelectItem value="auto">{t.scaleAuto}</SelectItem>
+                        <SelectItem value="linear">{t.scaleLinear}</SelectItem>
+                        <SelectItem value="log">{t.scaleLog}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                )}
+            </div>
+          </ControlPanel>
+
+          {runContext && <div className={`min-w-0 ${spans.run}`}>{runContext}</div>}
+          {!hideGpuComparison && (
+            <ControlPanel legend={t.compareHistory} className={spans.history}>
+              <div className="grid min-w-0 gap-3">
+                <div className="flex min-w-0 flex-col space-y-1.5">
+                  <LabelWithTooltip
+                    htmlFor="gpu-config-select"
+                    label={t.gpuConfig}
+                    tooltip={t.gpuConfigTooltip}
+                  />
+                  <div data-testid="gpu-multiselect" className="min-w-0">
+                    <MultiSelect
+                      options={availableGPUs}
+                      value={selectedGPUs}
+                      onChange={handleGPUChange}
+                      open={openDropdown === 'gpu'}
+                      onOpenChange={handleDropdownOpenChange('gpu')}
+                      placeholder={t.gpuConfigPlaceholder}
+                      maxSelections={4}
+                      searchPlaceholder={locale === 'zh' ? '搜索…' : undefined}
+                      noResultsLabel={locale === 'zh' ? '无结果' : undefined}
+                      clearSearchLabel={locale === 'zh' ? '清除搜索' : undefined}
+                      selectedSuffix={locale === 'zh' ? ' 已选' : undefined}
+                    />
+                  </div>
+                </div>
+
+                {selectedGPUs.length > 0 && (
+                  <div className="flex min-w-0 flex-col space-y-1.5">
+                    <LabelWithTooltip
+                      htmlFor="date-picker"
+                      label={t.comparisonDateRange}
+                      tooltip={t.comparisonDateRangeTooltip}
+                    />
+                    <DateRangePicker
+                      dateRange={selectedDateRange}
+                      onChange={handleDateRangeChange}
+                      placeholder={t.dateRangePlaceholder}
+                      availableDates={dateRangeAvailableDates}
+                      isCheckingAvailableDates={isCheckingAvailableDates}
+                    />
+                  </div>
+                )}
+              </div>
+            </ControlPanel>
+          )}
+        </MobileControlSection>
+        {trailingPanel && <div className="min-w-0 lg:col-span-7">{trailingPanel}</div>}
+      </div>
+    </TooltipProvider>
+  );
+}

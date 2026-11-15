@@ -1,0 +1,28 @@
+'use client';
+
+import { useLocale } from '@/lib/i18n/use-locale';
+import { cn } from '@/lib/shared/utils';
+
+export const ATOM_FOOTNOTE_MARKER = '¹';
+
+const STRINGS = {
+  en: {
+    atomFootnote:
+      'The ATOM engine is promising, however it has yet to serve production tokens. It is still in its infant stage.',
+  },
+  zh: {
+    atomFootnote: 'ATOM 引擎前景可期，但尚未用于生产环境 token 服务，仍处于早期阶段。',
+  },
+} as const;
+
+export function AtomEngineFootnote({ className }: { className?: string }) {
+  const locale = useLocale();
+  return (
+    <p
+      data-testid="atom-engine-footnote"
+      className={cn('text-xs leading-5 text-muted-foreground', className)}
+    >
+      <sup>1</sup> {STRINGS[locale].atomFootnote}
+    </p>
+  );
+}

@@ -1,0 +1,157 @@
+import { describe, expect, it } from 'vitest';
+
+import { normalizeGpuData } from '@/components/gpu-specs/gpu-specs-radar-chart';
+import {
+  formatScaleOutTopology,
+  formatScaleUpTopology,
+  GPU_CHART_METRICS,
+  GPU_SPECS,
+} from '@/lib/catalog/gpu-specs';
+
+const RADAR_METRICS = GPU_CHART_METRICS.filter(
+  (m) => m.key !== 'scaleUpWorldSize' && m.key !== 'scaleOutBandwidth',
+);
+
+describe('normalizeGpuData', () => {
+  it('defines Chinese display labels and localized non-unit values for every metric', () => {
+    for (const metric of GPU_CHART_METRICS) {
+      const localized = metric as typeof metric & { labelZh?: string; unitZh?: string };
+      expect(localized.labelZh, metric.key).toBeTruthy();
+      expect(localized.unitZh, metric.key).toBeTruthy();
+    }
+    expect(
+      (
+        GPU_CHART_METRICS.find((metric) => metric.key === 'scaleUpWorldSize') as {
+          unitZh?: string;
+        }
+      ).unitZh,
+    ).toBe('芯片');
+  });
+
+  it('localizes topology display values without changing English or protected rail counts', () => {
+    expect(formatScaleOutTopology('8-rail optimized', 'en')).toBe('8-rail optimized');
+    expect(formatScaleOutTopology('8-rail optimized', 'zh')).toBe('8-rail 优化拓扑');
+    expect(formatScaleUpTopology('Switched 4-rail Optimized', 'zh')).toBe('4-rail 优化交换拓扑');
+    expect(formatScaleUpTopology('Full Mesh', 'zh')).toBe('全互连');
+  });
+
+  it('returns normalized data for all GPUs', () => {
+    const result = normalizeGpuData(GPU_SPECS, RADAR_METRICS);
+    expect(result).toHaveLength(9);
+  });
+
+  it('each GPU entry has values array matching metrics count', () => {
+    const result = normalizeGpuData(GPU_SPECS, RADAR_METRICS);
+    for (const entry of result) {
+      expect(entry.values).toHaveLength(RADAR_METRICS.length);
+    }
+  });
+
+  it('normalized values are between 0 and 1 (inclusive) for non-null values', () => {
+    const result = normalizeGpuData(GPU_SPECS, RADAR_METRICS);
+    for (const entry of result) {
+      for (const val of entry.values) {
+        if (val !== null) {
+          expect(val).toBeGreaterThanOrEqual(0);
+          expect(val).toBeLessThanOrEqual(1);
+        }
+      }
+    }
+  });
+
+  it('the GPU with the highest value in a metric gets 1.0', () => {
+    const result = normalizeGpuData(GPU_SPECS, RADAR_METRICS);
+
+    for (let i = 0; i < RADAR_METRICS.length; i++) {
+      const nonNullValues = result.map((r) => r.values[i]).filter((v): v is number => v !== null);
+      if (nonNullValues.length > 0) {
+        expect(Math.max(...nonNullValues)).toBeCloseTo(1, 5);
+      }
+    }
+  });
+
+  it('FP4 returns null for GPUs without FP4 support', () => {
+    const fp4Idx = RADAR_METRICS.findIndex((m) => m.key === 'fp4');
+    expect(fp4Idx).toBeGreaterThanOrEqual(0);
+
+    const result = normalizeGpuData(GPU_SPECS, RADAR_METRICS);
+    const h100 = result.find((r) => r.gpu.name === 'H100 SXM');
+    expect(h100).toBeDefined();
+    expect(h100!.values[fp4Idx]).toBeNull();
+
+    const h200 = result.find((r) => r.gpu.name === 'H200 SXM');
+    expect(h200).toBeDefined();
+    expect(h200!.values[fp4Idx]).toBeNull();
+  });
+
+  it('GB300 NVL72 has the highest FP4 value (normalized to 1.0)', () => {
+    const fp4Idx = RADAR_METRICS.findIndex((m) => m.key === 'fp4');
+    const result = normalizeGpuData(GPU_SPECS, RADAR_METRICS);
+    const gb300 = result.find((r) => r.gpu.name === 'GB300 NVL72');
+    expect(gb300).toBeDefined();
+    expect(gb300!.values[fp4Idx]).toBeCloseTo(1, 5);
+  });
+
+  it('preserves correct GPU references', () => {
+    const result = normalizeGpuData(GPU_SPECS, RADAR_METRICS);
+    const names = result.map((r) => r.gpu.name);
+    expect(names).toContain('H100 SXM');
+    expect(names).toContain('MI355X');
+    expect(names).toContain('GB200 NVL72');
+  });
+
+  it('handles single GPU input correctly', () => {
+    const singleGpu = [GPU_SPECS[0]];
+    const result = normalizeGpuData(singleGpu, RADAR_METRICS);
+    expect(result).toHaveLength(1);
+    for (const val of result[0].values) {
+      if (val !== null) {
+        expect(val).toBeGreaterThan(0);
+        expect(val).toBeLessThanOrEqual(1);
+      }
+    }
+    const fp8Idx = RADAR_METRICS.findIndex((m) => m.key === 'fp8');
+    expect(result[0].values[fp8Idx]).toBeCloseTo(1, 5);
+  });
+
+  it('handles empty GPU array', () => {
+    const result = normalizeGpuData([], RADAR_METRICS);
+    expect(result).toHaveLength(0);
+  });
+
+  it('memory metric is correctly normalized', () => {
+    const memIdx = RADAR_METRICS.findIndex((m) => m.key === 'memory');
+    expect(memIdx).toBeGreaterThanOrEqual(0);
+
+    const result = normalizeGpuData(GPU_SPECS, RADAR_METRICS);
+
+    const h100 = result.find((r) => r.gpu.name === 'H100 SXM');
+    expect(h100).toBeDefined();
+    expect(h100!.values[memIdx]).toBeGreaterThan(0);
+    expect(h100!.values[memIdx]).toBeLessThan(1);
+
+    const mi355x = result.find((r) => r.gpu.name === 'MI355X');
+    expect(mi355x).toBeDefined();
+    expect(mi355x!.values[memIdx]).toBeCloseTo(1, 5);
+
+    const gb300 = result.find((r) => r.gpu.name === 'GB300 NVL72');
+    expect(gb300).toBeDefined();
+    expect(gb300!.values[memIdx]).toBeCloseTo(278 / 288, 5);
+  });
+
+  it('computes correct relative values for FP8', () => {
+    const fp8Idx = RADAR_METRICS.findIndex((m) => m.key === 'fp8');
+    expect(fp8Idx).toBeGreaterThanOrEqual(0);
+
+    const result = normalizeGpuData(GPU_SPECS, RADAR_METRICS);
+
+    const mi355x = result.find((r) => r.gpu.name === 'MI355X');
+    const h100 = result.find((r) => r.gpu.name === 'H100 SXM');
+    expect(mi355x).toBeDefined();
+    expect(h100).toBeDefined();
+
+    expect(mi355x!.values[fp8Idx]).toBeCloseTo(1, 5);
+    expect(h100!.values[fp8Idx]!).toBeLessThan(0.5);
+    expect(h100!.values[fp8Idx]!).toBeGreaterThan(0.3);
+  });
+});

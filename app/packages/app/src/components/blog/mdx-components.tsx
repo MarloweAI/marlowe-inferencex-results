@@ -1,0 +1,252 @@
+import type { ReactNode } from 'react';
+import Image, { getImageProps } from 'next/image';
+import Link from 'next/link';
+import { slugify } from '@/lib/blog/blog';
+import figureDimensions from '@/lib/blog/figure-dimensions.json';
+import type { Locale } from '@/lib/i18n/i18n';
+import { HardwareChart } from '@/components/blog/blog-hardware-chart-lazy';
+import { HeadingLink } from '@/components/blog/heading-link';
+import { ThemedFigureImage } from '@/components/blog/themed-figure-image';
+import { JsonLd } from '@/components/seo/json-ld';
+import { buttonVariants } from '@/components/ui/button';
+import { cn } from '@/lib/shared/utils';
+
+const FIGURE_DIMENSIONS: Record<string, readonly number[] | undefined> = figureDimensions;
+// Rendered width of the blog article column at each layout breakpoint (see blog-post-content).
+const FIGURE_SIZES = '(min-width: 1280px) 720px, (min-width: 1024px) 752px, calc(100vw - 2.5rem)';
+const FIGURE_CLASS = 'h-auto w-full rounded-xl';
+
+/** next/image props for a figure source, or null when the manifest has no size for it. */
+function optimizedFigure(src: string | undefined, alt: string, isFirst: boolean) {
+  const size = src ? FIGURE_DIMENSIONS[src] : undefined;
+  if (!src || !size) return null;
+  return getImageProps({
+    src,
+    alt,
+    width: size[0],
+    height: size[1],
+    sizes: FIGURE_SIZES,
+    loading: isFirst ? 'eager' : 'lazy',
+    fetchPriority: isFirst ? 'high' : undefined,
+    className: FIGURE_CLASS,
+  }).props;
+}
+
+function childrenToText(children: ReactNode): string {
+  if (typeof children === 'string') return children;
+  if (typeof children === 'number') return String(children);
+  if (Array.isArray(children)) return children.map(childrenToText).join('');
+  if (children && typeof children === 'object' && 'props' in children) {
+    return childrenToText((children as { props: { children?: ReactNode } }).props.children);
+  }
+  return '';
+}
+
+function CustomLink(props: React.AnchorHTMLAttributes<HTMLAnchorElement>) {
+  const { href, children, ...rest } = props;
+  if (href?.startsWith('/')) {
+    return (
+      <Link href={href} {...rest}>
+        {children}
+      </Link>
+    );
+  }
+  return (
+    <a href={href} target="_blank" rel="noopener noreferrer" {...rest}>
+      {children}
+    </a>
+  );
+}
+
+function CustomImage(props: React.ImgHTMLAttributes<HTMLImageElement>) {
+  const { src, alt, width, height } = props;
+  if (!src || typeof src !== 'string') return null;
+  return (
+    <Image
+      src={src}
+      alt={alt ?? ''}
+      width={Number(width) || 800}
+      height={Number(height) || 450}
+      className="rounded-lg"
+    />
+  );
+}
+
+function Blur(props: { children?: ReactNode }) {
+  return <div className="blur-sm select-none pointer-events-none">{props.children}</div>;
+}
+
+const CAPTION_LINK = /\[(?<label>[^\]]+)\]\((?<href>https?:\/\/[^\s)]+)\)/gu;
+
+export function renderCaption(caption: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  let cursor = 0;
+  for (const match of caption.matchAll(CAPTION_LINK)) {
+    const full = match[0];
+    const { label, href } = match.groups as { label: string; href: string };
+    if (match.index > cursor) nodes.push(caption.slice(cursor, match.index));
+    nodes.push(
+      <a
+        key={`${href}-${match.index}`}
+        href={href}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="underline underline-offset-2"
+      >
+        {label}
+      </a>,
+    );
+    cursor = match.index + full.length;
+  }
+  if (cursor < caption.length) nodes.push(caption.slice(cursor));
+  return nodes;
+}
+
+export function createMdxComponents(
+  locale: Locale = 'en',
+): Record<string, React.ComponentType<any>> {
+  const seen = new Set<string>();
+  const parents: string[] = [];
+  let figureCount = 0;
+
+  function uniqueId(text: string, level: number): string {
+    const base = slugify(text);
+    parents[level] = base;
+    let id = base;
+    if (seen.has(id)) {
+      const parent = parents.slice(1, level).findLast(Boolean);
+      id = parent ? `${parent}-${base}` : `${base}-${level}`;
+    }
+    seen.add(id);
+    return id;
+  }
+
+  return {
+    h1: (props: React.HTMLAttributes<HTMLHeadingElement>) => {
+      const id = uniqueId(childrenToText(props.children), 1);
+      return (
+        <h2 id={id} className="group" {...props}>
+          {props.children}
+          <HeadingLink id={id} locale={locale} />
+        </h2>
+      );
+    },
+    h2: (props: React.HTMLAttributes<HTMLHeadingElement>) => {
+      const id = uniqueId(childrenToText(props.children), 2);
+      return (
+        <h2 id={id} className="group" {...props}>
+          {props.children}
+          <HeadingLink id={id} locale={locale} />
+        </h2>
+      );
+    },
+    h3: (props: React.HTMLAttributes<HTMLHeadingElement>) => {
+      const id = uniqueId(childrenToText(props.children), 3);
+      return (
+        <h3 id={id} className="group" {...props}>
+          {props.children}
+          <HeadingLink id={id} locale={locale} />
+        </h3>
+      );
+    },
+    a: CustomLink,
+    img: CustomImage,
+    Figure: (props: {
+      src?: string;
+      srcLight?: string;
+      srcDark?: string;
+      alt?: string;
+      caption?: string;
+    }) => {
+      const isFirst = figureCount === 0;
+      figureCount++;
+      const loading = isFirst ? 'eager' : 'lazy';
+      const alt = props.alt ?? '';
+      const lightSrc = props.srcLight ?? props.src;
+      const darkSrc = props.srcDark ?? props.src;
+      const hasThemedVariants = Boolean(props.srcLight || props.srcDark) && lightSrc !== darkSrc;
+      const light = optimizedFigure(lightSrc, alt, isFirst);
+      const dark = optimizedFigure(darkSrc, alt, isFirst);
+      const plainSrc = lightSrc ?? darkSrc;
+      const plain = hasThemedVariants ? null : (light ?? dark);
+      // One box for both themes: reserve the light variant's aspect so layout never waits on the theme.
+      const themedBox = light ?? dark;
+      return (
+        <figure className="my-8 flex flex-col items-start gap-3">
+          {hasThemedVariants ? (
+            <ThemedFigureImage
+              srcLight={light?.src ?? lightSrc}
+              srcDark={dark?.src ?? darkSrc}
+              srcSetLight={light?.srcSet}
+              srcSetDark={dark?.srcSet}
+              sizes={light && dark ? FIGURE_SIZES : undefined}
+              width={themedBox?.width}
+              height={themedBox?.height}
+              alt={alt}
+              loading={loading}
+              fetchPriority={isFirst ? 'high' : undefined}
+              className={FIGURE_CLASS}
+            />
+          ) : plain ? (
+            <img {...plain} alt={alt} />
+          ) : (
+            plainSrc && (
+              <img
+                src={plainSrc}
+                alt={alt}
+                loading={loading}
+                decoding="async"
+                className="w-full rounded-xl"
+              />
+            )
+          )}
+          {props.caption && (
+            <figcaption className="text-sm text-muted-foreground">
+              {renderCaption(props.caption)}
+            </figcaption>
+          )}
+        </figure>
+      );
+    },
+    table: (props: React.TableHTMLAttributes<HTMLTableElement>) => (
+      <div className="table-scroll">
+        <table {...props} />
+      </div>
+    ),
+    Blur,
+    HardwareChart,
+    DashboardCTA: (props: { href?: string; children?: ReactNode }) => {
+      const defaultHref =
+        locale === 'zh'
+          ? 'https://inferencex.semianalysis.com/zh'
+          : 'https://inferencex.semianalysis.com';
+      const defaultLabel =
+        locale === 'zh' ? '查看完整 InferenceX 仪表板' : 'See full InferenceX dashboard';
+      const href = props.href ?? defaultHref;
+      return (
+        <div className="not-prose my-8 flex justify-center">
+          <a
+            href={href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={cn(buttonVariants({ variant: 'brand' }), '[&_p]:m-0')}
+          >
+            {props.children ?? defaultLabel}
+          </a>
+        </div>
+      );
+    },
+    JsonLd: (props: { children?: ReactNode }) => {
+      const raw = childrenToText(props.children).trim();
+      if (!raw) return null;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        return null;
+      }
+      if (!parsed || typeof parsed !== 'object') return null;
+      return <JsonLd data={parsed} />;
+    },
+  };
+}

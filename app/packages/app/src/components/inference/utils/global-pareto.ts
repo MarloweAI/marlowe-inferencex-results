@@ -1,0 +1,35 @@
+import type { ParetoCoordinate } from '@/lib/charts/pareto-frontier';
+
+export { globalParetoFrontier, type ParetoCoordinate } from '@/lib/charts/pareto-frontier';
+
+const coordinates = (point: ParetoCoordinate) => `${point.x},${point.y}`;
+
+export function paretoHighlightArea(
+  points: readonly ParetoCoordinate[],
+  cornerX: number,
+  cornerY: number,
+): string | null {
+  if (points.length === 0) return null;
+  const first = points[0];
+  const last = points.at(-1)!;
+  const polygon =
+    cornerX === 0
+      ? [{ x: cornerX, y: first.y }, ...points, { x: last.x, y: cornerY }]
+      : [{ x: first.x, y: cornerY }, ...points, { x: cornerX, y: last.y }];
+  polygon.push({ x: cornerX, y: cornerY });
+  return `M${polygon.map(coordinates).join('L')}Z`;
+}
+
+export function paretoHighlightGeometry(
+  frontier: readonly ParetoCoordinate[],
+  xScale: (value: number) => number,
+  yScale: (value: number) => number,
+): { line: string | null; points: ParetoCoordinate[] } {
+  const points = frontier
+    .map((point) => ({ x: xScale(point.x), y: yScale(point.y) }))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y))
+    .toSorted((a, b) => a.x - b.x);
+  if (points.length === 0) return { line: null, points };
+  const line = `M${points.map(coordinates).join('L')}`;
+  return { line, points };
+}

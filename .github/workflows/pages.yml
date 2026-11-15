@@ -1,5 +1,6 @@
-# The results site: tools/build_site.py folds data/marlowe/, recipes/ and the latest data/inferencex/ snapshot into
-# _site/ and publishes it to this repository's GitHub Pages site. It runs on changes to main, after each daily
+# The results site: tools/build_site.py writes the recipe pages and the static API files (latest data/inferencex/
+# snapshot plus data/marlowe/ points) into the app's public folder, then the Next.js app in app/ exports the site,
+# which is published to this repository's GitHub Pages site. It runs on changes to main, after each daily
 # InferenceX snapshot (a push made with the workflow token does not trigger other workflows, so the snapshot's
 # completion does), and on demand. A pull request builds the site without deploying; the build fails if a Marlowe
 # point lacks its recipe or a published file carries a local path, node name or private IP address.
@@ -9,9 +10,9 @@ name: Pages
 on:
   push:
     branches: [main]
-    paths: ["data/**", "recipes/**", "site/**", "tools/**", ".github/workflows/pages.yml"]
+    paths: ["app/**", "data/**", "recipes/**", "tools/**", ".github/workflows/pages.yml"]
   pull_request:
-    paths: ["data/**", "recipes/**", "site/**", "tools/**", ".github/workflows/pages.yml"]
+    paths: ["app/**", "data/**", "recipes/**", "tools/**", ".github/workflows/pages.yml"]
   workflow_run:
     workflows: ["InferenceX snapshot"]
     types: [completed]
@@ -27,7 +28,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -35,11 +36,20 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Build
-        run: python3 tools/build_site.py --out _site
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+      - name: Recipes and data
+        run: python3 tools/build_site.py
+      - name: Install
+        working-directory: app
+        run: bun install --frozen-lockfile
+      - name: Export
+        working-directory: app/packages/app
+        run: bunx --bun next build
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: _site
+          path: app/packages/app/out
 
   deploy:
     if: github.event_name != 'pull_request'

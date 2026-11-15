@@ -1,0 +1,142 @@
+import { describe, it, expect } from 'vitest';
+import {
+  DB_MODEL_TO_DISPLAY,
+  DISPLAY_MODEL_TO_DB,
+  MODEL_RELEASE_DATES,
+  getModelReleaseDate,
+  sequenceToIslOsl,
+  islOslToSequence,
+} from './models';
+
+describe('DB_MODEL_TO_DISPLAY / DISPLAY_MODEL_TO_DB consistency', () => {
+  it('preserves the legacy database and display identities', () => {
+    expect(DB_MODEL_TO_DISPLAY).toMatchObject({
+      dsr1: 'DeepSeek-R1-0528',
+      gptoss120b: 'gpt-oss-120b',
+      llama70b: 'Llama-3.3-70B-Instruct-FP8',
+      'qwen3.5': 'Qwen-3.5-397B-A17B',
+      'kimik2.5': 'Kimi-K2.5',
+      'minimaxm2.5': 'MiniMax-M2.5',
+    });
+    expect(DISPLAY_MODEL_TO_DB['DeepSeek-R1-0528']).toEqual(['dsr1']);
+    expect(DISPLAY_MODEL_TO_DB['gpt-oss-120b']).toEqual(['gptoss120b']);
+  });
+
+  it('DISPLAY_MODEL_TO_DB is the complete inverse of DB_MODEL_TO_DISPLAY (many-to-one)', () => {
+    for (const [dbKey, displayName] of Object.entries(DB_MODEL_TO_DISPLAY)) {
+      expect(DISPLAY_MODEL_TO_DB[displayName]).toContain(dbKey);
+    }
+    const totalDbKeys = Object.values(DISPLAY_MODEL_TO_DB).flat().length;
+    expect(totalDbKeys).toBe(Object.keys(DB_MODEL_TO_DISPLAY).length);
+  });
+
+  it('keeps GLM-5.2 separate from the GLM-5/5.1 display bucket', () => {
+    expect(DISPLAY_MODEL_TO_DB['GLM-5']).toEqual(['glm5', 'glm5.1']);
+    expect(DISPLAY_MODEL_TO_DB['GLM-5.2']).toEqual(['glm5.2', 'glm5.3']);
+    expect(DISPLAY_MODEL_TO_DB['Kimi-K2.5']).toEqual(
+      expect.arrayContaining(['kimik2.5', 'kimik2.6', 'kimik2.7-code']),
+    );
+    expect(DISPLAY_MODEL_TO_DB['MiniMax-M2.5']).toEqual(
+      expect.arrayContaining(['minimaxm2.5', 'minimaxm2.7']),
+    );
+  });
+
+  it('maps minimaxm3 to its own MiniMax-M3 display name', () => {
+    expect(DISPLAY_MODEL_TO_DB['MiniMax-M3']).toEqual(['minimaxm3']);
+  });
+
+  it('keeps GLM-5.3-Flash separate from both historical GLM buckets', () => {
+    expect(DISPLAY_MODEL_TO_DB['GLM-5.3-Flash']).toEqual(['glm5.3flash']);
+    expect(DISPLAY_MODEL_TO_DB['GLM-5.2']).toEqual(['glm5.2', 'glm5.3']);
+    expect(DISPLAY_MODEL_TO_DB['GLM-5']).toEqual(['glm5', 'glm5.1']);
+    expect(getModelReleaseDate('GLM-5.3-Flash')).toBeNull();
+  });
+
+  it('keeps minimaxm31flash in its own MiniMax-M3.1-Flash display bucket', () => {
+    expect(DISPLAY_MODEL_TO_DB['MiniMax-M3.1-Flash']).toEqual(['minimaxm31flash']);
+    expect(DISPLAY_MODEL_TO_DB['MiniMax-M3']).not.toContain('minimaxm31flash');
+  });
+
+  it('keeps kimik3.1 in its own Kimi-K3.1-Pro display bucket', () => {
+    expect(DISPLAY_MODEL_TO_DB['Kimi-K3.1-Pro']).toEqual(['kimik3.1']);
+    expect(DISPLAY_MODEL_TO_DB['Kimi-K3']).toEqual(['kimik3']);
+  });
+
+  it('keeps kimik3 out of the grouped Kimi-K2.5 display bucket', () => {
+    expect(DISPLAY_MODEL_TO_DB['Kimi-K3']).toEqual(['kimik3']);
+    expect(DISPLAY_MODEL_TO_DB['Kimi-K2.5']).not.toContain('kimik3');
+  });
+});
+
+describe('MODEL_RELEASE_DATES', () => {
+  it('stores every date as a real calendar day in YYYY-MM-DD', () => {
+    for (const [model, date] of Object.entries(MODEL_RELEASE_DATES)) {
+      expect(date, model).toMatch(/^\d{4}-\d{2}-\d{2}$/u);
+      expect(new Date(`${date}T00:00:00Z`).toISOString().slice(0, 10), model).toBe(date);
+    }
+  });
+
+  it('has no model releasing in the future', () => {
+    const today = new Date().toISOString().slice(0, 10);
+    for (const [model, date] of Object.entries(MODEL_RELEASE_DATES)) {
+      expect(
+        date.localeCompare(today),
+        `${model} released ${date}, after today`,
+      ).toBeLessThanOrEqual(0);
+    }
+  });
+
+  it('is keyed by display name, never by DB model key', () => {
+    const dbKeys = new Set(Object.keys(DB_MODEL_TO_DISPLAY));
+    for (const model of Object.keys(MODEL_RELEASE_DATES)) {
+      expect(dbKeys.has(model), `${model} is a DB key, not a display name`).toBe(false);
+    }
+  });
+
+  it('returns null rather than throwing for a model with no sourced date', () => {
+    expect(getModelReleaseDate('not-a-model')).toBeNull();
+    expect(getModelReleaseDate('')).toBeNull();
+  });
+});
+
+describe('sequenceToIslOsl', () => {
+  it('parses 1k/1k to 1024/1024', () => {
+    expect(sequenceToIslOsl('1k/1k')).toEqual({ isl: 1024, osl: 1024 });
+  });
+
+  it('parses 1k/8k to 1024/8192', () => {
+    expect(sequenceToIslOsl('1k/8k')).toEqual({ isl: 1024, osl: 8192 });
+  });
+
+  it('parses 8k/1k to 8192/1024', () => {
+    expect(sequenceToIslOsl('8k/1k')).toEqual({ isl: 8192, osl: 1024 });
+  });
+
+  it('returns null for unknown sequences', () => {
+    expect(sequenceToIslOsl('2k/2k')).toBeNull();
+    expect(sequenceToIslOsl('')).toBeNull();
+    expect(sequenceToIslOsl('invalid')).toBeNull();
+  });
+});
+
+describe('islOslToSequence', () => {
+  it('converts 1024/1024 to 1k/1k', () => {
+    expect(islOslToSequence(1024, 1024)).toBe('1k/1k');
+  });
+
+  it('converts 1024/8192 to 1k/8k', () => {
+    expect(islOslToSequence(1024, 8192)).toBe('1k/8k');
+  });
+
+  it('returns null for unmapped ISL/OSL pairs', () => {
+    expect(islOslToSequence(2048, 2048)).toBeNull();
+    expect(islOslToSequence(0, 0)).toBeNull();
+  });
+
+  it('round-trips with sequenceToIslOsl for all known sequences', () => {
+    for (const seq of ['1k/1k', '1k/8k', '8k/1k']) {
+      const parsed = sequenceToIslOsl(seq)!;
+      expect(islOslToSequence(parsed.isl, parsed.osl)).toBe(seq);
+    }
+  });
+});

@@ -1,0 +1,579 @@
+'use client';
+
+import type { ReactNode } from 'react';
+
+import { LabelWithTooltip } from '@/components/ui/label-with-tooltip';
+import { track } from '@/lib/analytics/analytics';
+import { ModelLogo } from '@/components/ui/model-logo';
+import { MultiSelect } from '@/components/ui/multi-select';
+import { SearchableSelect } from '@/components/ui/searchable-select';
+import { NewBadge } from '@/components/ui/new-badge';
+import { CaptionField } from '@/components/ui/result-context';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { InfoHelp } from '@/components/ui/option-info';
+import {
+  type Model,
+  type Precision,
+  type Sequence,
+  type Percentile,
+  PERCENTILE_OPTIONS,
+  getModelCategory,
+  getModelLabel,
+  getPercentileLabel,
+  getPrecisionLabel,
+  getSequenceCategoryForModel,
+  getSequenceLabel,
+  groupByCategory,
+  isRegisteredModel,
+  sequenceKind,
+} from '@/lib/catalog/data-mappings';
+import { useLocale } from '@/lib/i18n/use-locale';
+import { AGENTX_ROUTE } from '@/lib/routing/dashboard-routes';
+
+const STRINGS = {
+  en: {
+    model: 'Model',
+    modelTooltip: 'The language model being benchmarked.',
+    newModel: 'New',
+    islOsl: 'ISL / OSL',
+    islOslTooltip:
+      'Input Sequence Length / Output Sequence Length. Defines the number of input and output tokens for the benchmark (e.g., 1K/8K means 1,024 input tokens and 8,192 output tokens).',
+    scenario: 'Scenario',
+    scenarioTooltip:
+      'Benchmark scenario. Fixed sequence length runs use a defined input/output token count (ISL/OSL). The agentic scenario replays real agentic workloads with variable inputs/outputs.',
+    agenticScenarioTooltip: 'Realistic long-context, multi-turn agentic workload with sub-agents',
+    agenticScenarioLearnMore: 'Learn more',
+    latencyPercentile: 'Latency percentile',
+    latencyPercentileTooltip:
+      'Percentile of the latency distribution used for the chart x-axis on agentic runs.',
+    precision: 'Precision',
+    precisionTooltip:
+      "Numerical precision used for model weights. Lower precision like 'FP4' uses less memory and increases throughput but may slightly reduce accuracy compared to higher precisions like 'FP8'.",
+    fixedSequenceLength: 'Fixed sequence length',
+    deprecatedSequenceLabel: (label: string) => `${label} (deprecated)`,
+    experimentalSupport: 'Experimental support (WIP)',
+    maintenanceMode: 'Maintenance mode',
+    maintenanceReason: 'Updated at a lower priority because these models are irrelevant.',
+    deprecated: 'Deprecated',
+    deprecatedModelReason: 'Model is no longer actively benchmarked.',
+    deprecatedSequenceReason:
+      'CI capacity was reallocated to agentic coding and multi-turn chat scenarios.',
+    unregisteredModels: 'Unregistered models',
+    unregisteredModelReason:
+      'Only present in an unofficial run. InferenceX has no registry entry for it, so it is shown by its raw model prefix.',
+  },
+  zh: {
+    model: '模型',
+    modelTooltip: '正在进行基准测试的语言模型。',
+    newModel: '新',
+    islOsl: 'ISL / OSL',
+    islOslTooltip:
+      '输入序列长度 / 输出序列长度（Input Sequence Length / Output Sequence Length）。定义基准测试的输入和输出 token 数量（如 1K/8K 表示 1,024 个输入 token 和 8,192 个输出 token）。',
+    scenario: '场景',
+    scenarioTooltip:
+      '基准测试场景。Fixed Sequence Length 使用预设的输入/输出 token 数（ISL/OSL）。Agentic 场景回放具有可变输入/输出的真实智能体工作负载。',
+    agenticScenarioTooltip: '真实的长上下文、多轮、带子智能体（sub-agent）的智能体工作负载。',
+    agenticScenarioLearnMore: '了解更多',
+    latencyPercentile: '延迟分位数',
+    latencyPercentileTooltip: '用于智能体运行图表 X 轴的延迟分布分位数。',
+    precision: '精度',
+    precisionTooltip:
+      '模型权重的数值精度。FP4 等低精度占用更少显存并提高吞吐量，但与 FP8 等高精度相比可能略微降低准确度。',
+    fixedSequenceLength: '固定序列长度',
+    deprecatedSequenceLabel: (label: string) => `${label}（已弃用）`,
+    experimentalSupport: '实验性支持（开发中）',
+    maintenanceMode: '维护模式',
+    maintenanceReason: '这些模型的相关性较低，因此以较低优先级更新。',
+    deprecated: '已弃用',
+    deprecatedModelReason: '该模型已不再进行活跃基准测试。',
+    deprecatedSequenceReason: 'CI 容量已重新分配给智能体编程和多轮对话场景。',
+    unregisteredModels: '未注册模型',
+    unregisteredModelReason:
+      '仅出现在非官方运行中。InferenceX 的模型注册表中尚无该模型，因此直接显示其原始模型前缀。',
+  },
+} as const;
+
+function CategorySectionTitle({
+  id,
+  label,
+  reason,
+}: {
+  id: string;
+  label: string;
+  reason: string;
+}) {
+  return (
+    <span className="flex items-center gap-1">
+      {label}
+      <InfoHelp
+        label={label}
+        value={`selector-category-${id}`}
+        triggerTestId={`selector-category-${id}-info`}
+        triggerClassName="-my-1"
+        tabIndex={-1}
+      >
+        {reason}
+      </InfoHelp>
+    </span>
+  );
+}
+
+const toOption = (model: string, badge?: ReactNode) => ({
+  value: model,
+  label: getModelLabel(model as Model),
+  icon: <ModelLogo model={model as Model} />,
+  badge,
+});
+
+interface ModelSelectorProps {
+  id?: string;
+  value: string;
+  onChange: (value: Model) => void;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  availableModels: string[];
+  'data-testid'?: string;
+  trailing?: ReactNode;
+  newModels?: ReadonlySet<string>;
+  /**
+   * Extra details right-aligned on each model's row, e.g. its history and vendors. When set,
+   * the dropdown panel widens beyond the trigger so the details have room.
+   */
+  modelDetails?: ReadonlyMap<string, ReactNode>;
+}
+
+export function ModelSelector({
+  id = 'model-select',
+  value,
+  onChange,
+  open,
+  onOpenChange,
+  availableModels,
+  'data-testid': testId,
+  trailing,
+  newModels,
+  modelDetails,
+}: ModelSelectorProps) {
+  const t = STRINGS[useLocale()];
+  const groups = groupByCategory(availableModels.filter(isRegisteredModel), (m) =>
+    getModelCategory(m),
+  );
+  const unregistered = availableModels.filter((m) => !isRegisteredModel(m));
+  const optionFor = (model: string) =>
+    toOption(
+      model,
+      newModels?.has(model) || modelDetails?.has(model) ? (
+        <>
+          {newModels?.has(model) && <NewBadge data-new-badge="model-option">{t.newModel}</NewBadge>}
+          {modelDetails?.get(model)}
+        </>
+      ) : undefined,
+    );
+  const sections = [
+    {
+      id: 'default',
+      options: groups.default.map(optionFor),
+    },
+    ...(groups.experimental.length > 0
+      ? [
+          {
+            id: 'experimental',
+            header: t.experimentalSupport,
+            options: groups.experimental.map(optionFor),
+          },
+        ]
+      : []),
+    ...(groups.maintenance.length > 0
+      ? [
+          {
+            id: 'maintenance',
+            header: (
+              <CategorySectionTitle
+                id="maintenance-mode"
+                label={t.maintenanceMode}
+                reason={t.maintenanceReason}
+              />
+            ),
+            options: groups.maintenance.map(optionFor),
+          },
+        ]
+      : []),
+    ...(groups.deprecated.length > 0
+      ? [
+          {
+            id: 'deprecated',
+            header: (
+              <CategorySectionTitle
+                id="deprecated"
+                label={t.deprecated}
+                reason={t.deprecatedModelReason}
+              />
+            ),
+            options: groups.deprecated.map(optionFor),
+          },
+        ]
+      : []),
+    ...(unregistered.length > 0
+      ? [
+          {
+            id: 'unregistered',
+            header: (
+              <CategorySectionTitle
+                id="unregistered"
+                label={t.unregisteredModels}
+                reason={t.unregisteredModelReason}
+              />
+            ),
+            options: unregistered.map(optionFor),
+          },
+        ]
+      : []),
+  ];
+
+  return (
+    <div className="flex flex-col space-y-1.5 lg:col-span-2">
+      <LabelWithTooltip htmlFor={id} label={t.model} tooltip={t.modelTooltip} />
+      <div className="flex items-center gap-1.5">
+        <div className="min-w-0 flex-1">
+          <MultiSelect
+            sections={sections}
+            missingSelectedOption={toOption}
+            value={[value]}
+            onChange={(values) => {
+              const next = values[0];
+              if (!next) return;
+              track('selector_model_changed', { model: next });
+              onChange(next as Model);
+            }}
+            open={open}
+            onOpenChange={onOpenChange}
+            triggerId={id}
+            triggerTestId={testId}
+            placeholder={t.model}
+            minSelections={1}
+            maxSelections={1}
+            showClearAll={false}
+            searchable
+            plainSelectedText
+            showSelectionSummary={false}
+            contentClassName={modelDetails ? 'w-[min(44rem,calc(100vw-2rem))]' : undefined}
+          />
+        </div>
+        {trailing}
+      </div>
+    </div>
+  );
+}
+
+interface SequenceSelectorProps {
+  id?: string;
+  value: string;
+  onChange: (value: Sequence) => void;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  availableSequences: string[];
+  model?: Model | null;
+  'data-testid'?: string;
+}
+
+export function SequenceSelector({
+  id = 'sequence-select',
+  value,
+  onChange,
+  open,
+  onOpenChange,
+  availableSequences,
+  model,
+  'data-testid': testId,
+}: SequenceSelectorProps) {
+  const locale = useLocale();
+  const t = STRINGS[locale];
+  const groups = groupByCategory(availableSequences, (s) =>
+    getSequenceCategoryForModel(s as Sequence, model),
+  );
+  const sections = [
+    {
+      id: 'default',
+      options: groups.default.map((seq) => ({
+        value: seq,
+        label: getSequenceLabel(seq as Sequence, locale),
+      })),
+    },
+    ...(groups.deprecated.length > 0
+      ? [
+          {
+            id: 'deprecated',
+            header: (
+              <CategorySectionTitle
+                id="deprecated"
+                label={t.deprecated}
+                reason={t.deprecatedSequenceReason}
+              />
+            ),
+            options: groups.deprecated.map((seq) => ({
+              value: seq,
+              label: getSequenceLabel(seq as Sequence, locale),
+            })),
+          },
+        ]
+      : []),
+  ];
+
+  return (
+    <div className="flex flex-col space-y-1.5 lg:col-span-1">
+      <LabelWithTooltip htmlFor={id} label={t.islOsl} tooltip={t.islOslTooltip} />
+      <div>
+        <MultiSelect
+          sections={sections}
+          value={[value]}
+          onChange={(values) => {
+            const next = values[0];
+            if (!next) return;
+            track('selector_sequence_changed', { sequence: next });
+            onChange(next as Sequence);
+          }}
+          open={open}
+          onOpenChange={onOpenChange}
+          triggerId={id}
+          triggerTestId={testId}
+          placeholder={t.islOsl}
+          minSelections={1}
+          maxSelections={1}
+          showClearAll={false}
+          searchable={false}
+          plainSelectedText
+          showSelectionSummary={false}
+        />
+      </div>
+    </div>
+  );
+}
+
+interface ScenarioSelectorProps {
+  variant?: 'field' | 'caption';
+  id?: string;
+  value: string;
+  onChange: (value: Sequence) => void;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  availableSequences: string[];
+  model?: Model | null;
+  'data-testid'?: string;
+}
+
+export function ScenarioSelector({
+  variant = 'field',
+  id = 'scenario-select',
+  value,
+  onChange,
+  open,
+  onOpenChange,
+  availableSequences,
+  model,
+  'data-testid': testId,
+}: ScenarioSelectorProps) {
+  const locale = useLocale();
+  const t = STRINGS[locale];
+  const fixedSeq = availableSequences.filter((s) => sequenceKind(s as Sequence) === 'fixed-seq');
+  const agentic = availableSequences.filter((s) => sequenceKind(s as Sequence) === 'agentic');
+  const fixedGroups = groupByCategory(fixedSeq, (s) =>
+    getSequenceCategoryForModel(s as Sequence, model),
+  );
+  if (availableSequences.length <= 1) return null;
+  const scenarioLabel = (seq: string) => {
+    const label = getSequenceLabel(seq as Sequence, locale);
+    return getSequenceCategoryForModel(seq as Sequence, model) === 'deprecated'
+      ? t.deprecatedSequenceLabel(label)
+      : label;
+  };
+  const toScenarioOption = (seq: string) => ({
+    value: seq,
+    label: scenarioLabel(seq),
+    help:
+      sequenceKind(seq as Sequence) === 'agentic' ? (
+        <p>
+          {t.agenticScenarioTooltip}{' '}
+          <a
+            href={locale === 'zh' ? `/zh${AGENTX_ROUTE.path}` : AGENTX_ROUTE.path}
+            className="underline underline-offset-2"
+            data-testid="scenario-agentic-info-link"
+            onClick={() => track('selector_scenario_agentx_link')}
+          >
+            {t.agenticScenarioLearnMore}
+          </a>
+        </p>
+      ) : (
+        <>
+          <p>{t.islOslTooltip}</p>
+          {getSequenceCategoryForModel(seq as Sequence, model) === 'deprecated' && (
+            <p>{t.deprecatedSequenceReason}</p>
+          )}
+        </>
+      ),
+  });
+
+  const select = (
+    <SearchableSelect
+      size={variant === 'caption' ? 'sm' : undefined}
+      className={variant === 'caption' ? 'w-auto max-w-full text-xs' : undefined}
+      value={value}
+      initialLabel={scenarioLabel(value)}
+      contentClassName="min-w-[min(16rem,var(--radix-popover-content-available-width))]"
+      placeholder={t.scenario}
+      triggerId={id}
+      triggerTestId={testId}
+      searchable={false}
+      onValueChange={(v) => {
+        track('selector_scenario_changed', { scenario: v });
+        onChange(v as Sequence);
+      }}
+      open={open}
+      onOpenChange={onOpenChange}
+      groups={[
+        { label: '', options: agentic.map(toScenarioOption) },
+        {
+          label: t.fixedSequenceLength,
+          options: [...fixedGroups.default, ...fixedGroups.deprecated].map(toScenarioOption),
+        },
+      ].filter((group) => group.options.length > 0)}
+    />
+  );
+
+  // The chart footer's controls row: a standard small control whose label is only read by
+  // screen readers and printed in exported images, like the cost tier and TCO basis beside it.
+  if (variant === 'caption') {
+    return (
+      <CaptionField
+        label={t.scenario}
+        value={scenarioLabel(value)}
+        hideLabel
+        control={
+          <span className="inline-flex items-center gap-0.5">
+            {select}
+            <InfoHelp
+              label={scenarioLabel(value)}
+              value={value}
+              triggerTestId={`selected-option-help-${value}`}
+              contentTestId={`selected-option-help-content-${value}`}
+            >
+              {toScenarioOption(value).help}
+            </InfoHelp>
+          </span>
+        }
+        controlId={id}
+        testId="result-context-scenario"
+      />
+    );
+  }
+
+  return (
+    <div className="flex flex-col space-y-1.5 lg:col-span-1">
+      <LabelWithTooltip htmlFor={id} label={t.scenario} tooltip={t.scenarioTooltip} />
+      {select}
+    </div>
+  );
+}
+
+interface PercentileSelectorProps {
+  id?: string;
+  value: string;
+  onChange: (value: Percentile) => void;
+  'data-testid'?: string;
+}
+
+export function PercentileSelector({
+  id = 'percentile-select',
+  value,
+  onChange,
+  'data-testid': testId,
+}: PercentileSelectorProps) {
+  const t = STRINGS[useLocale()];
+  return (
+    <div className="flex flex-col space-y-1.5 lg:col-span-1">
+      <LabelWithTooltip
+        htmlFor={id}
+        label={t.latencyPercentile}
+        tooltip={t.latencyPercentileTooltip}
+      />
+      <Select
+        value={value}
+        onValueChange={(v) => {
+          track('selector_percentile_changed', { percentile: v });
+          onChange(v as Percentile);
+        }}
+      >
+        <SelectTrigger id={id} data-testid={testId} className="w-full">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {PERCENTILE_OPTIONS.map((p) => (
+            <SelectItem key={p} value={p}>
+              {getPercentileLabel(p)}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
+interface PrecisionSelectorProps {
+  id?: string;
+  value: string[];
+  onChange: (value: string[]) => void;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  availablePrecisions: string[];
+  'data-testid'?: string;
+}
+
+export function PrecisionSelector({
+  id = 'precision-select',
+  value,
+  onChange,
+  open,
+  onOpenChange,
+  availablePrecisions,
+  'data-testid': testId,
+}: PrecisionSelectorProps) {
+  const t = STRINGS[useLocale()];
+
+  if (availablePrecisions.length === 0) return null;
+  const isOnlySelectedPrecision =
+    availablePrecisions.length === 1 && value.length === 1 && availablePrecisions[0] === value[0];
+
+  return (
+    <div className="flex flex-col space-y-1.5 lg:col-span-1">
+      <LabelWithTooltip htmlFor={id} label={t.precision} tooltip={t.precisionTooltip} />
+      <div>
+        <MultiSelect
+          key={isOnlySelectedPrecision ? 'fixed' : 'selectable'}
+          disabled={isOnlySelectedPrecision}
+          plainSelectedText={isOnlySelectedPrecision}
+          className={isOnlySelectedPrecision ? 'disabled:opacity-100' : undefined}
+          options={availablePrecisions.map((p) => ({
+            value: p,
+            label: getPrecisionLabel(p as Precision),
+          }))}
+          value={value}
+          onChange={onChange}
+          open={isOnlySelectedPrecision ? false : open}
+          onOpenChange={onOpenChange}
+          triggerId={id}
+          triggerTestId={testId}
+          placeholder=""
+          minSelections={1}
+          showClearAll={false}
+          searchable={false}
+          wrapSelectedChips={false}
+        />
+      </div>
+    </div>
+  );
+}

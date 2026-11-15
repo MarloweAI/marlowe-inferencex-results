@@ -1,0 +1,65 @@
+import type * as d3 from 'd3';
+
+import { writeAttrs } from '../chart-update';
+import { lttbDownsample } from '../downsample';
+import type { ContinuousScale } from '../types';
+
+const DEFAULT_MAX_POINTS = 2000;
+
+export interface PointConfig<T> {
+  getCx: (d: T) => number;
+  getCy: (d: T) => number;
+  getColor: (d: T) => string;
+  getRadius?: (d: T) => number;
+  stroke?: string;
+  strokeWidth?: number;
+  keyFn?: (d: T) => string;
+  getX?: (d: T) => number;
+  getY?: (d: T) => number;
+  maxPoints?: number;
+}
+
+export function renderPoints<T>(
+  group: d3.Selection<SVGGElement, unknown, null, undefined>,
+  data: T[],
+  config: PointConfig<T>,
+  xScale?: ContinuousScale,
+  yScale?: ContinuousScale,
+): d3.Selection<SVGCircleElement, T, SVGGElement, unknown> {
+  const cx = config.getX && xScale ? (d: T) => xScale(config.getX!(d)) : config.getCx;
+  const cy = config.getY && yScale ? (d: T) => yScale(config.getY!(d)) : config.getCy;
+
+  let renderData = data;
+  if (config.getX && config.getY) {
+    const max = config.maxPoints ?? DEFAULT_MAX_POINTS;
+    if (data.length > max) {
+      renderData = lttbDownsample(data, max, config.getX, config.getY);
+    }
+  }
+
+  const points = group
+    .selectAll<SVGCircleElement, T>('.point')
+    .data(renderData, config.keyFn)
+    .join('circle');
+  return writeAttrs(points, {
+    class: 'point',
+    cx,
+    cy,
+    r: (d) => config.getRadius?.(d) ?? 4,
+    fill: (d) => config.getColor(d),
+    stroke: config.stroke ?? 'none',
+    'stroke-width': config.strokeWidth ?? 0,
+    cursor: 'pointer',
+  });
+}
+
+export function updatePointsOnZoom<T>(
+  group: d3.Selection<SVGGElement, unknown, null, undefined>,
+  getCx: (d: T) => number,
+  getCy: (d: T) => number,
+): void {
+  writeAttrs(group.selectAll<SVGCircleElement, T>('.point'), {
+    cx: (d) => getCx(d),
+    cy: (d) => getCy(d),
+  });
+}

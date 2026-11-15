@@ -1,0 +1,1475 @@
+'use client';
+
+import { chipBasisCsvNote, withTotalChipQualifier } from '@/lib/benchmarks/chip-basis';
+import { ControlPanel } from '@/components/ui/control-panel';
+import { MobileControlSection } from '@/components/ui/mobile-control-section';
+import { track } from '@/lib/analytics/analytics';
+import { selectionAnalyticsContext } from '@/lib/analytics/selection-context';
+import Link from 'next/link';
+import { BarChart3, Table2 } from 'lucide-react';
+import { useFeatureGate } from '@/lib/runtime/use-feature-gate';
+import { useLocale } from '@/lib/i18n/use-locale';
+import { useCallback, useMemo, useState } from 'react';
+
+import { HW_REGISTRY } from '@semianalysisai/inferencex-constants';
+
+import CalculatorTable from '@/components/calculator/CalculatorTable';
+import CostTargetPanel from '@/components/calculator/CostTargetPanel';
+import { CalculatorUrlSeedBoundary } from '@/components/calculator/url-seed-boundary';
+import {
+  GlobalFilterProvider,
+  useGlobalFilterActions,
+  useGlobalFilterAvailability,
+  useGlobalFilterRun,
+  useGlobalFilterSelection,
+  useGlobalFilterWorkflow,
+} from '@/providers/GlobalFilterContext';
+import { Card } from '@/components/ui/card';
+import { getDisplayLabel } from '@/lib/shared/utils';
+import { ChartButtons } from '@/components/ui/chart-buttons';
+import ChartLegend from '@/components/ui/chart-legend';
+import { ChartShareActions, PricesSourceLink } from '@/components/ui/chart-display-helpers';
+import { DashboardSectionHeader } from '@/components/ui/dashboard-section-header';
+import { Heading, HeadingQualifier } from '@/components/ui/heading';
+import {
+  ModelSelector,
+  PercentileSelector,
+  PrecisionSelector,
+  ScenarioSelector,
+} from '@/components/ui/chart-selectors';
+import { ExternalLinkIcon } from '@/components/ui/external-link-icon';
+import { LabelWithTooltip } from '@/components/ui/label-with-tooltip';
+import {
+  includesJalapenoResult,
+  includesVeraRubinResult,
+  includesTpuv7Result,
+  JalapenoOfficialPreviewNotice,
+  VeraRubinOfficialPreviewNotice,
+  Tpuv7OfficialPreviewNotice,
+} from '@/components/ui/official-preview-notice';
+import { useUnofficialRun } from '@/providers/unofficial-run-provider';
+import { overlayRunColor } from '@/lib/charts/overlay-run-style';
+import { localePath } from '@/lib/i18n/i18n';
+import { DEFAULT_FLEET_MW, readUrlParams, writeUrlParams } from '@/lib/routing/url-state';
+import { Switch } from '@/components/ui/switch';
+import { TooltipProvider } from '@/components/ui/tooltip';
+import { MultiSelect } from '@/components/ui/multi-select';
+import { lockedCostProviderOptions, useLockedTierDialog } from '@/components/ui/tco-model-dialog';
+import { SegmentedToggle, type SegmentedToggleOption } from '@/components/ui/segmented-toggle';
+import { RangeField } from '@/components/ui/range-field';
+import { TcoBasisToggle, useShowsTcoBasisSelector } from '@/components/ui/tco-basis-toggle';
+import { ChipBasisNote } from '@/components/ui/chip-basis-note';
+import { ChipBasisCaption } from '@/components/ui/chip-basis-toggle';
+import { plottedChipBases, TcoPriceTable } from '@/components/ui/editable-tco-badges';
+import { ResultContext } from '@/components/ui/result-context';
+import { ModelLogo } from '@/components/ui/model-logo';
+import { Skeleton } from '@/components/ui/skeleton';
+import {
+  Percentile,
+  Sequence,
+  type Model,
+  type Precision,
+  getModelLabel,
+  getPrecisionLabel,
+  getSequenceLabel,
+} from '@/lib/catalog/data-mappings';
+import { getGpuSpecs, getHardwareConfig, getModelSortIndex } from '@/lib/catalog/constants';
+import { useThemeColors } from '@/hooks/useThemeColors';
+import { useUrlState } from '@/hooks/useUrlState';
+import { useOpenDropdown } from '@/hooks/useOpenDropdown';
+import { useIsMobileViewport } from '@/hooks/useMediaQuery';
+
+import { exportToCsv } from '@/lib/export/csv-export';
+import { calculatorChartToCsv } from '@/lib/export/csv-export-helpers';
+
+import ThroughputBarChart, {
+  type ChartTitleParts,
+  getChartTitle,
+  getCostProviderLabel,
+  getResultLabel,
+  getThroughputForType,
+  getTpPerMwForType,
+} from './ThroughputBarChart';
+import type {
+  BarMetric,
+  CalculatorMode,
+  CostProvider,
+  CostType,
+  InterpolatedResult,
+} from './types';
+import { useThroughputData } from './useThroughputData';
+import { getDashboardRoute } from '@/lib/routing/dashboard-routes';
+
+const COST_PROVIDER_OPTIONS: {
+  value: CostProvider;
+  label: string;
+  labelZh: string;
+}[] = [
+  {
+    value: 'costh',
+    label: 'Owning at large hyperscaler volume',
+    labelZh: '自有 · 超大规模云厂商批量采购',
+  },
+  { value: 'costr', label: 'Rent – 3-year commit', labelZh: '租赁 - 3 年承诺' },
+];
+
+const COST_TYPE_OPTIONS: { value: CostType; label: string }[] = [
+  { value: 'total', label: 'Total tokens' },
+  { value: 'input', label: 'Input tokens' },
+  { value: 'output', label: 'Output tokens' },
+];
+
+const BAR_METRIC_OPTIONS: { value: BarMetric; label: string }[] = [
+  { value: 'throughput', label: 'Throughput' },
+  { value: 'power', label: 'tok/s/MW' },
+  { value: 'cost', label: 'Cost' },
+];
+
+export interface CalculatorVisibilityIntent {
+  scopeKey: string;
+  visible: Set<string>;
+  known: Set<string>;
+}
+
+export function resolveCalculatorVisibility(
+  intent: CalculatorVisibilityIntent | null,
+  scopeKey: string,
+  legendHwKeys: readonly string[],
+): Set<string> {
+  if (!intent || intent.scopeKey !== scopeKey) return new Set(legendHwKeys);
+  const available = new Set(legendHwKeys);
+  const next = new Set([...intent.visible].filter((key) => available.has(key)));
+  for (const key of legendHwKeys) {
+    if (!intent.known.has(key)) next.add(key);
+  }
+  return next.size === 0 && legendHwKeys.length > 0 ? available : next;
+}
+
+export function resolveCalculatorTarget(
+  requestedTarget: number,
+  hasData: boolean,
+  range: { min: number; max: number },
+): number {
+  if (!hasData) return requestedTarget;
+  return Math.max(range.min, Math.min(range.max, requestedTarget));
+}
+
+export function resolveCalculatorTargetInputValue(
+  editingValue: string,
+  effectiveTarget: number,
+  isEditing: boolean,
+): string {
+  return isEditing ? editingValue : String(effectiveTarget);
+}
+
+export function resolveCalculatorBarSelection(
+  intent: { resultsKey: string; selected: Set<string> } | null,
+  resultsKey: string,
+  availableResultKeys: ReadonlySet<string>,
+): Set<string> {
+  if (!intent || intent.resultsKey !== resultsKey) return new Set();
+  return new Set([...intent.selected].filter((resultKey) => availableResultKeys.has(resultKey)));
+}
+type CalculatorViewMode = 'chart' | 'table';
+
+const CALCULATOR_VIEW_MODE_OPTIONS: SegmentedToggleOption<CalculatorViewMode>[] = [
+  {
+    value: 'chart',
+    label: 'Chart',
+    icon: <BarChart3 className="size-3.5" />,
+    testId: 'calculator-chart-view-btn',
+  },
+  {
+    value: 'table',
+    label: 'Table',
+    icon: <Table2 className="size-3.5" />,
+    testId: 'calculator-table-view-btn',
+  },
+];
+
+const STRINGS = {
+  en: {
+    title: 'TCO calculator',
+    benchmarkGroup: 'Benchmark config',
+    pricingGroup: 'Pricing config',
+    comparisonGroup: 'Comparison target',
+    secondaryControls: 'More chart controls',
+    changed: 'changed',
+    description:
+      'Set a target interactivity (tokens/sec/user) and compare the throughput and cost across all chips. Values are interpolated from real benchmark data.',
+    costProviderLabel: 'Cost provider',
+    costProviderTooltip:
+      'The pricing tier used to calculate cost per million tokens. Owning at large hyperscaler purchasing volume (e.g. AWS/GCP) or renting on a 3-year commit. Locked rental terms (on demand through 2 year commit) are published in the SemiAnalysis AI Cloud TCO Model.',
+    costProviderPlaceholder: 'Cost provider',
+    tokenTypeLabel: 'Token type',
+    tokenTypeTooltip:
+      'Whether to show costs for total tokens, input tokens only, or output tokens only.',
+    tokenTypePlaceholder: 'Token type',
+    tcoBasisLabel: 'TCO basis',
+    tcoBasisTooltip:
+      'Choose External customer pricing or Internal owner cost. Internal only changes hardware with a separate owner cost, currently TPUv7.',
+    metricLabel: 'Metric',
+    metricTooltip:
+      'The comparison metric shown in the chart. Throughput (tok/s/chip), power efficiency (tok/s/MW), or cost per million tokens.',
+    targetLabel: 'Target interactivity (tok/s/user)',
+    targetTooltip:
+      'The interactivity operating point used for interpolation. Adjust the slider to compare chip throughput, cost, and power efficiency at different interactivity levels.',
+    targetAgenticLabel: (percentile: string) => `Target ${percentile} interactivity (tok/s/user)`,
+    targetAgenticTooltip: (percentile: string) =>
+      `The ${percentile} interactivity operating point used for agentic workload interpolation. Adjust the slider to compare chip throughput, cost, and power efficiency.`,
+    metricThroughput: 'Throughput',
+    metricCost: 'Cost',
+    viewChart: 'Chart',
+    viewTable: 'Table',
+    viewModeAria: 'View mode',
+    errorLoading: 'Error loading data. Please try a different selection.',
+    clickToCompare: 'selected. Click another bar to compare.',
+    clearSelection: 'Clear selection',
+    highContrast: 'High contrast',
+    totalTokens: 'Total tokens',
+    inputTokens: 'Input tokens',
+    outputTokens: 'Output tokens',
+    allInPower: 'All in power/chip',
+    source: 'Source: ',
+    note: 'Note:',
+    disaggCost:
+      ' Disaggregated inference configurations (e.g., MoRI SGLang, Dynamo TRTLLM) report input and output throughput per prefill chip and per decode chip rather than per chip overall, and $/M tok is derived from those rates — so on the Input and Output token types a disaggregated config reads cheaper than it is, by a median 2× and up to 18× across run history. Total-token cost is unaffected: it comes from throughput per chip overall, which both kinds report on the same basis. The Fleet Lifecycle page deliberately differs — it derives its per-token-type figures from that total, so everything there is on one denominator.',
+    disaggCostTotal:
+      ' Disaggregated inference configurations (e.g., MoRI SGLang, Dynamo TRTLLM) have their input and output throughput divided by every chip in the deployment, prefill plus decode, the same basis aggregated configs use, so $/M tok on the Input and Output token types compares like for like.',
+    disaggThroughputTotal:
+      ' Disaggregated inference configurations (e.g., MoRI SGLang, Dynamo TRTLLM) have their input and output throughput divided by every chip in the deployment, prefill plus decode, the same basis aggregated configs use, so the Input and Output token types compare like for like. Total throughput is the same on either basis.',
+    disaggThroughput:
+      ' Disaggregated inference configurations (e.g., MoRI SGLang, Dynamo TRTLLM) report input and output throughput per prefill chip and per decode chip rather than per chip overall — divided by fewer chips, so on the Input and Output token types a disaggregated config reads faster per chip than it is, by a median 2× and up to 18× on input and 7× on output. Total throughput is unaffected: both kinds report it per chip overall. The Fleet Lifecycle page deliberately differs — it derives its per-token-type figures from that total, so everything there is on one denominator.',
+    fleetMoved:
+      'Fleet Lifecycle has its own page: a fixed fleet sized against a power budget, projected across its life with every measured config improvement.',
+    fleetMovedLink: 'Open fleet lifecycle',
+    compMetricThroughput: 'throughput',
+    compMetricCost: 'cost efficiency',
+    compMetricPower: 'tok/s/MW',
+    hideSkuAboveConfigLimitLabel: 'Hide if target exceeds config range',
+    hideSkuAboveConfigLimitHelp:
+      'When enabled, SKUs whose measured interactivity range ends below the target are hidden instead of being projected from the max edge.',
+    unofficialRun: 'Unofficial run',
+    branch: 'Branch',
+    viewRun: 'View workflow run',
+  },
+  zh: {
+    title: 'TCO 计算器',
+    benchmarkGroup: '基准测试配置',
+    pricingGroup: '定价配置',
+    comparisonGroup: '对比目标',
+    secondaryControls: '更多图表设置',
+    changed: '项已更改',
+    description:
+      '设定目标交互性（tokens/sec/user），比较所有芯片的吞吐量和成本。数值基于真实基准测试数据插值计算。',
+    costProviderLabel: '计价方式',
+    costProviderTooltip:
+      '用于计算每百万 token 成本的定价层级。按超大规模云厂商的大批量采购价格自购（如 AWS/GCP）或 3 年承诺租赁。带锁的租赁期限（按需至 2 年承诺）收录于 SemiAnalysis AI Cloud TCO 模型。',
+    costProviderPlaceholder: '计价方式',
+    tokenTypeLabel: 'token 类型',
+    tokenTypeTooltip: '选择显示总 token、仅输入 token 还是仅输出 token 的成本。',
+    tokenTypePlaceholder: 'token 类型',
+    tcoBasisLabel: 'TCO 口径',
+    tcoBasisTooltip:
+      '选择按外部客户价格还是内部持有成本计算 TCO。只有另有内部持有成本的硬件才会受影响，目前仅 TPUv7。',
+    metricLabel: '指标',
+    metricTooltip:
+      '图表中显示的比较指标。吞吐量（tok/s/chip）、能效（tok/s/MW）或每百万 token 成本。',
+    targetLabel: '目标交互性 (tok/s/user)',
+    targetTooltip:
+      '用于插值计算的交互性目标值。拖动滑块，可比较不同交互性要求下各芯片的吞吐量、成本和能效。',
+    targetAgenticLabel: (percentile: string) => `目标 ${percentile} 交互性 (tok/s/user)`,
+    targetAgenticTooltip: (percentile: string) =>
+      `用于智能体工作负载插值计算的 ${percentile} 交互性目标值。拖动滑块，可比较各芯片的吞吐量、成本和能效。`,
+    metricThroughput: '吞吐量',
+    metricCost: '成本',
+    viewChart: '图表',
+    viewTable: '表格',
+    viewModeAria: '显示模式',
+    errorLoading: '加载数据出错，请尝试其他选择。',
+    clickToCompare: '已选中。点击其他柱形即可对比。',
+    clearSelection: '清除选择',
+    highContrast: '高对比度',
+    totalTokens: '总 token',
+    inputTokens: '输入 token',
+    outputTokens: '输出 token',
+    allInPower: '单芯片整机功耗',
+    source: '来源：',
+    note: '注意：',
+    disaggCost:
+      '分离式推理配置（如 MoRI SGLang、Dynamo TRTLLM）的输入与输出吞吐量分别按预填充芯片与解码芯片报告，而非按芯片总数，而 $/M tok 由这些速率推导。因此在「输入」与「输出」token 类型下，分离式配置显示的成本低于实际，中位数仅为实际值的 1/2，在运行历史中最低可至 1/18。总计口径的成本不受影响：它来自按芯片总数计的吞吐量，两种部署方式在该口径上一致。「集群生命周期」页面与此有意不同：它由该总量推导各 token 类型的数值，因此那里的所有数字都在同一分母上。',
+    disaggCostTotal:
+      '分离式推理配置（如 MoRI SGLang、Dynamo TRTLLM）的输入与输出吞吐量按部署中的芯片总数（预填充芯片 + 解码芯片）计算，与聚合配置口径一致，因此「输入」与「输出」token 类型下的 $/M tok 可以直接对比。',
+    disaggThroughputTotal:
+      '分离式推理配置（如 MoRI SGLang、Dynamo TRTLLM）的输入与输出吞吐量按部署中的芯片总数（预填充芯片 + 解码芯片）计算，与聚合配置口径一致，因此在「输入」与「输出」token 类型下可以直接对比。总吞吐量在两种口径下相同。',
+    disaggThroughput:
+      '分离式推理配置（如 MoRI SGLang、Dynamo TRTLLM）的输入与输出吞吐量分别按预填充芯片与解码芯片报告，而非按芯片总数。由于除以的芯片数更少，在「输入」与「输出」token 类型下，分离式配置显示的每芯片吞吐量高于实际，中位数为实际值的 2 倍，输入最高达 18 倍、输出最高达 7 倍。总计口径的吞吐量不受影响：两种部署方式均按芯片总数报告。「集群生命周期」页面与此有意不同：它由该总量推导各 token 类型的数值，因此那里的所有数字都在同一分母上。',
+    fleetMoved:
+      '「集群生命周期」已移至独立页面：按功率预算确定固定集群的规模，结合每次实测配置改进，测算其整个生命周期的经济性。',
+    fleetMovedLink: '打开集群生命周期',
+    compMetricThroughput: '吞吐量',
+    compMetricCost: '成本效率',
+    compMetricPower: 'tok/s/MW',
+    hideSkuAboveConfigLimitLabel: '隐藏超出配置上限的型号',
+    hideSkuAboveConfigLimitHelp:
+      '开启后，若目标交互性高于某个配置的实测上限，不再显示该 SKU，避免把结果投射到该配置最大边界。',
+    unofficialRun: '非官方运行',
+    branch: '分支',
+    viewRun: '查看工作流运行',
+  },
+} as const;
+
+export function formatCalculatorRatioZh(
+  higherLabel: string,
+  lowerLabel: string,
+  metricName: string,
+  ratio: number,
+): string {
+  return `${higherLabel} 的${metricName}是 ${lowerLabel} 的 ${ratio.toFixed(1)} 倍`;
+}
+
+export function getChartTitleZh(
+  barMetric: BarMetric,
+  mode: CalculatorMode,
+  targetValue: number,
+  costType: CostType,
+  costProvider?: CostProvider,
+  interactivityPercentile?: string,
+): ChartTitleParts {
+  const percentilePrefix = interactivityPercentile
+    ? `${interactivityPercentile.toUpperCase()} `
+    : '';
+  const qualifier =
+    mode === 'interactivity_to_throughput'
+      ? `（${targetValue} tok/s/user ${percentilePrefix}交互性）`
+      : `（${targetValue} tok/s/chip 吞吐量）`;
+  const tokenTypeLabel = costType === 'input' ? '输入' : costType === 'output' ? '输出' : '总';
+  switch (barMetric) {
+    case 'power': {
+      return { title: `每全电源配置兆瓦${tokenTypeLabel} token 吞吐量`, qualifier };
+    }
+    case 'cost': {
+      const providerLabel = getCostProviderLabel(costProvider || 'costh', 'zh');
+      return { title: `每百万${tokenTypeLabel} token 成本（${providerLabel}）`, qualifier };
+    }
+    default: {
+      return {
+        title:
+          mode === 'interactivity_to_throughput'
+            ? `每芯片 ${tokenTypeLabel} token 吞吐量`
+            : '交互性',
+        qualifier,
+      };
+    }
+  }
+}
+
+export default function ThroughputCalculatorDisplay({ routeModel }: { routeModel?: Model }) {
+  return (
+    <CalculatorUrlSeedBoundary routeModel={routeModel}>
+      {(urlSeed) => (
+        <GlobalFilterProvider
+          initialModel={urlSeed.model}
+          initialSequence={urlSeed.sequence}
+          initialPrecisions={urlSeed.precisions}
+          initialRunDate={urlSeed.runDate}
+          initialRunId={urlSeed.runId}
+        >
+          <ThroughputCalculatorInner initialPercentile={urlSeed.percentile ?? Percentile.P90} />
+        </GlobalFilterProvider>
+      )}
+    </CalculatorUrlSeedBoundary>
+  );
+}
+
+function ThroughputCalculatorInner({ initialPercentile }: { initialPercentile: Percentile }) {
+  const locale = useLocale();
+  const t = STRINGS[locale];
+  const { setUrlParam } = useUrlState();
+  const { openDropdown, handleDropdownOpenChange } = useOpenDropdown();
+  const { interceptLocked: interceptLockedTier, dialog: tcoModelDialog } = useLockedTierDialog(
+    'calculator_cost_provider',
+  );
+
+  const {
+    selectedModel,
+    effectiveSequence: selectedSequence,
+    effectivePrecisions: selectedPrecisions,
+    tcoBasis,
+    chipBasis,
+  } = useGlobalFilterSelection();
+  const scenarioShowsTcoBasis = useShowsTcoBasisSelector();
+  const { setSelectedModel, setSelectedSequence, setSelectedPrecisions, setChipBasis } =
+    useGlobalFilterActions();
+  const chipBasisControl = useMemo(
+    () => ({ value: chipBasis, onChange: setChipBasis, source: 'calculator' }),
+    [chipBasis, setChipBasis],
+  );
+  const readOnlyChipBasisControl = useMemo(
+    () => ({ ...chipBasisControl, readOnly: true }),
+    [chipBasisControl],
+  );
+  const { selectedRunDate, selectedRunId } = useGlobalFilterRun();
+  const { availablePrecisions, availableSequences, availableModels } =
+    useGlobalFilterAvailability();
+  const { availableRuns } = useGlobalFilterWorkflow();
+  const mode = 'interactivity_to_throughput' as const;
+  const [costProvider, setCostProvider] = useState<CostProvider>('costh');
+  const [costType, setCostType] = useState<CostType>('total');
+  const [requestedTargetValue, setRequestedTargetValue] = useState<number>(35);
+  const [inputValue, setInputValue] = useState<string>('35');
+  const [isTargetInputFocused, setIsTargetInputFocused] = useState(false);
+  const [barMetric, setBarMetric] = useState<BarMetric>('throughput');
+  const [selectedPercentile, setSelectedPercentile] = useState<Percentile>(initialPercentile);
+  const [mwInput, setMwInput] = useState<string>(() => readUrlParams().c_mw ?? DEFAULT_FLEET_MW);
+  const [visibilityIntent, setVisibilityIntent] = useState<CalculatorVisibilityIntent | null>(null);
+  const [barSelectionIntent, setBarSelectionIntent] = useState<{
+    resultsKey: string;
+    selected: Set<string>;
+  } | null>(null);
+  const [isLegendExpanded, setIsLegendExpanded] = useState(true);
+  const [highContrast, setHighContrast] = useState(false);
+  const [viewMode, setViewMode] = useState<CalculatorViewMode>('chart');
+  const [hideSkuAboveConfigLimit, setHideSkuAboveConfigLimit] = useState(true);
+  const secondaryCount =
+    (barMetric === 'throughput' ? 0 : 1) +
+    (hideSkuAboveConfigLimit === true ? 0 : 1) +
+    (costProvider === 'costh' ? 0 : 1) +
+    (costType === 'total' ? 0 : 1);
+  const isMobile = useIsMobileViewport();
+
+  const costTypeLabels: Record<CostType, string> = useMemo(
+    () => ({ total: t.totalTokens, input: t.inputTokens, output: t.outputTokens }),
+    [t],
+  );
+
+  const viewModeOptions = useMemo<SegmentedToggleOption<CalculatorViewMode>[]>(() => {
+    if (locale === 'en') return CALCULATOR_VIEW_MODE_OPTIONS;
+    return CALCULATOR_VIEW_MODE_OPTIONS.map((opt) => ({
+      ...opt,
+      label: opt.value === 'chart' ? t.viewChart : t.viewTable,
+    }));
+  }, [locale, t]);
+
+  const { isUnofficialRun, unofficialBenchmarkRows, unofficialRunInfos, runIndexByUrl } =
+    useUnofficialRun();
+
+  const overlayInput = useMemo(
+    () => ({ rows: unofficialBenchmarkRows, runIndexByUrl }),
+    [unofficialBenchmarkRows, runIndexByUrl],
+  );
+
+  const {
+    gpuDataByGroupKey,
+    hardwareConfig,
+    ranges,
+    getResults,
+    getOverlayResults,
+    loading,
+    error: throughputError,
+    hasData,
+    hasOverlayData,
+    availableHwKeys,
+    overlayAvailableHwKeys,
+  } = useThroughputData(
+    selectedModel,
+    selectedSequence,
+    selectedPrecisions,
+    selectedRunDate,
+    overlayInput,
+    selectedPercentile,
+    undefined,
+    true,
+    costType,
+    tcoBasis,
+    false,
+    chipBasis,
+  );
+  const error = throughputError;
+
+  const isAgenticSequence = selectedSequence === Sequence.AgenticTraces;
+  const featureGateUnlocked = useFeatureGate();
+  const percentileLabel = selectedPercentile.toUpperCase();
+
+  const legendHwKeys = useMemo(() => {
+    if (!isUnofficialRun || overlayAvailableHwKeys.length === 0) return availableHwKeys;
+    return [...new Set([...availableHwKeys, ...overlayAvailableHwKeys])];
+  }, [isUnofficialRun, availableHwKeys, overlayAvailableHwKeys]);
+
+  const handleMwInputChange = useCallback((raw: string) => {
+    setMwInput(raw);
+    const parsed = parseFloat(raw);
+    writeUrlParams({ c_mw: Number.isFinite(parsed) && parsed > 0 ? raw : '' });
+  }, []);
+
+  const mw = useMemo(() => {
+    const parsed = parseFloat(mwInput);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  }, [mwInput]);
+
+  const selectionKey = `${selectedModel}|${selectedSequence}|${[...selectedPrecisions]
+    .toSorted()
+    .join(',')}|${selectedRunDate}|${[...availableHwKeys].toSorted().join(',')}`;
+
+  const visibleHwKeys = useMemo(
+    () => resolveCalculatorVisibility(visibilityIntent, selectionKey, legendHwKeys),
+    [visibilityIntent, selectionKey, legendHwKeys],
+  );
+  const visibleKeysArray = useMemo(() => [...visibleHwKeys], [visibleHwKeys]);
+  const { resolveColor } = useThemeColors({
+    highContrast,
+    activeKeys: visibleKeysArray,
+  });
+
+  const hasAnyData = hasData || hasOverlayData;
+  const targetValue = useMemo(
+    () => resolveCalculatorTarget(requestedTargetValue, hasAnyData, ranges.interactivity),
+    [hasAnyData, ranges.interactivity, requestedTargetValue],
+  );
+
+  const results: InterpolatedResult[] = useMemo(() => {
+    if (!hasData) return [];
+    return getResults(targetValue, mode, costProvider, visibleHwKeys, hideSkuAboveConfigLimit);
+  }, [
+    hasData,
+    targetValue,
+    mode,
+    costProvider,
+    getResults,
+    visibleHwKeys,
+    hideSkuAboveConfigLimit,
+  ]);
+
+  const runInfoByIndex = useMemo(() => {
+    const map: Record<number, { branch: string; url: string }> = {};
+    unofficialRunInfos.forEach((info, idx) => {
+      map[idx] = { branch: info.branch || `run ${info.id}`, url: info.url };
+    });
+    return map;
+  }, [unofficialRunInfos]);
+
+  const overlayResults: InterpolatedResult[] = useMemo(() => {
+    if (!hasOverlayData) return [];
+    return getOverlayResults(
+      targetValue,
+      mode,
+      costProvider,
+      visibleHwKeys,
+      runInfoByIndex,
+      hideSkuAboveConfigLimit,
+    );
+  }, [
+    hasOverlayData,
+    targetValue,
+    mode,
+    costProvider,
+    getOverlayResults,
+    visibleHwKeys,
+    runInfoByIndex,
+    hideSkuAboveConfigLimit,
+  ]);
+
+  const barResults = useMemo(
+    () =>
+      [...results, ...overlayResults].filter(
+        (result) => barMetric !== 'power' || getGpuSpecs(result.hwKey).power > 0,
+      ),
+    [results, overlayResults, barMetric],
+  );
+  const showsJalapenoPreview = useMemo(
+    () => includesJalapenoResult(results.map((result) => result.hwKey)),
+    [results],
+  );
+  const showsVeraRubinPreview = useMemo(
+    () => includesVeraRubinResult(results.map((result) => result.hwKey)),
+    [results],
+  );
+  const showsTpuv7Preview = useMemo(
+    () => includesTpuv7Result(results.map((result) => result.hwKey)),
+    [results],
+  );
+  const barResultsKey = useMemo(
+    () =>
+      barResults
+        .map(
+          (result) =>
+            `${result.resultKey}:${result.value}:${result.cost}:${result.tpPerMw}:${result.concurrency}`,
+        )
+        .join('|'),
+    [barResults],
+  );
+  const selectedBars = useMemo(
+    () =>
+      resolveCalculatorBarSelection(
+        barSelectionIntent,
+        barResultsKey,
+        new Set(barResults.map((result) => result.resultKey)),
+      ),
+    [barSelectionIntent, barResultsKey, barResults],
+  );
+
+  const currentRange = ranges.interactivity;
+
+  const handleSliderChange = useCallback((value: number) => {
+    setRequestedTargetValue(value);
+    setInputValue(String(value));
+  }, []);
+
+  const handleInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    setInputValue(e.target.value);
+    const parsed = parseFloat(e.target.value);
+    if (!isNaN(parsed) && parsed >= 0) {
+      setRequestedTargetValue(parsed);
+    }
+  }, []);
+
+  const handleInputFocus = useCallback(() => {
+    setInputValue(String(targetValue));
+    setIsTargetInputFocused(true);
+  }, [targetValue]);
+
+  const handleInputBlur = useCallback(() => {
+    const parsed = parseFloat(inputValue);
+    if (isNaN(parsed) || parsed < 0) {
+      setInputValue(String(targetValue));
+    } else {
+      const { min, max } = ranges.interactivity;
+      const clamped = Math.max(min, Math.min(max, parsed));
+      setRequestedTargetValue(clamped);
+      setInputValue(String(clamped));
+    }
+    setIsTargetInputFocused(false);
+    track('calculator_target_set', { mode, value: targetValue });
+  }, [inputValue, targetValue, mode, ranges.interactivity]);
+
+  const handleCostProviderChange = useCallback((value: string) => {
+    setCostProvider(value as CostProvider);
+    track('calculator_cost_provider_changed', { provider: value });
+  }, []);
+
+  const handleCostTypeChange = useCallback((value: string) => {
+    setCostType(value as CostType);
+    track('calculator_cost_type_changed', { cost_type: value });
+  }, []);
+
+  const handleModelChange = useCallback(
+    (value: string) => {
+      setVisibilityIntent(null);
+      setSelectedModel(value as Model);
+      track('calculator_model_selected', { model: value });
+    },
+    [setSelectedModel],
+  );
+
+  const handleSequenceChange = useCallback(
+    (value: string) => {
+      setVisibilityIntent(null);
+      setSelectedSequence(value as Sequence);
+      track('calculator_sequence_selected', { sequence: value });
+    },
+    [setSelectedSequence],
+  );
+
+  const handlePrecisionChange = useCallback(
+    (value: string[]) => {
+      setVisibilityIntent(null);
+      setSelectedPrecisions(value);
+      track('calculator_precision_selected', { precision: value.join(',') });
+    },
+    [setSelectedPrecisions],
+  );
+
+  const handlePercentileChange = useCallback(
+    (value: Percentile) => {
+      setSelectedPercentile(value);
+      setUrlParam('i_pctl', value);
+      track('calculator_percentile_selected', { percentile: value });
+    },
+    [setUrlParam],
+  );
+
+  const handleBarMetricChange = useCallback((value: BarMetric) => {
+    setBarMetric(value);
+    track('calculator_bar_metric_changed', { metric: value });
+  }, []);
+
+  const toggleGpuVisibility = useCallback(
+    (hwKey: string) => {
+      const visibleLegendKeys = legendHwKeys.filter((key) => visibleHwKeys.has(key));
+      const allVisible = visibleLegendKeys.length === legendHwKeys.length;
+      const isVisible = visibleHwKeys.has(hwKey);
+      let next: Set<string>;
+      if (isVisible && allVisible) {
+        next = new Set([hwKey]);
+      } else if (isVisible && visibleLegendKeys.length === 1) {
+        next = new Set(legendHwKeys);
+      } else {
+        next = new Set(visibleHwKeys);
+        if (isVisible) next.delete(hwKey);
+        else next.add(hwKey);
+      }
+      setVisibilityIntent({
+        scopeKey: selectionKey,
+        visible: next,
+        known: new Set(legendHwKeys),
+      });
+      track('calculator_gpu_toggled', { gpu: hwKey });
+    },
+    [legendHwKeys, visibleHwKeys, selectionKey],
+  );
+
+  const removeGpu = useCallback(
+    (hwKey: string) => {
+      const next = new Set(visibleHwKeys);
+      next.delete(hwKey);
+      setVisibilityIntent({
+        scopeKey: selectionKey,
+        visible: next,
+        known: new Set(legendHwKeys),
+      });
+    },
+    [visibleHwKeys, selectionKey, legendHwKeys],
+  );
+
+  const handleExportCsv = useCallback(() => {
+    const { headers, rows } = calculatorChartToCsv(results, targetValue, (hwKey) => {
+      const config = hardwareConfig[hwKey] || getHardwareConfig(hwKey);
+      return config ? getDisplayLabel(config) : hwKey;
+    });
+    // Input and output columns follow the chip basis on disaggregated rows.
+    exportToCsv(`InferenceX_calculator_${selectedModel}`, headers, rows, [
+      chipBasisCsvNote(chipBasis, locale),
+    ]);
+  }, [results, targetValue, hardwareConfig, chipBasis, locale]);
+
+  const handleViewModeChange = useCallback((value: CalculatorViewMode) => {
+    setViewMode(value);
+    track('calculator_view_changed', { view: value });
+  }, []);
+
+  const handleHideSkuAboveLimitChange = useCallback((checked: boolean) => {
+    setHideSkuAboveConfigLimit(checked);
+    track('calculator_hide_over_limit_toggled', { enabled: checked });
+  }, []);
+
+  const handleResetGpus = useCallback(() => {
+    setVisibilityIntent({
+      scopeKey: selectionKey,
+      visible: new Set(legendHwKeys),
+      known: new Set(legendHwKeys),
+    });
+    track('calculator_gpu_reset', { gpu_count: legendHwKeys.length });
+  }, [legendHwKeys, selectionKey]);
+
+  const runUrl = availableRuns[selectedRunId]?.runUrl;
+
+  const handleBarSelect = useCallback(
+    (resultKey: string) => {
+      const next = new Set(selectedBars);
+      if (next.has(resultKey)) {
+        next.delete(resultKey);
+        track('calculator_bar_deselected', { result_key: resultKey });
+      } else {
+        next.add(resultKey);
+        track('calculator_bar_selected', { result_key: resultKey, total_selected: next.size });
+      }
+      setBarSelectionIntent({ resultsKey: barResultsKey, selected: next });
+    },
+    [selectedBars, barResultsKey],
+  );
+
+  const comparisonText = useMemo(() => {
+    if (selectedBars.size < 2) return null;
+
+    const selectedResults = barResults.filter((r) => selectedBars.has(r.resultKey));
+    if (selectedResults.length < 2) return null;
+
+    const getLabel = (r: InterpolatedResult) => getResultLabel(r, hardwareConfig);
+
+    const metricName =
+      barMetric === 'power'
+        ? t.compMetricPower
+        : barMetric === 'cost'
+          ? t.compMetricCost
+          : t.compMetricThroughput;
+
+    const comparisons: string[] = [];
+    for (let i = 0; i < selectedResults.length; i++) {
+      for (let j = i + 1; j < selectedResults.length; j++) {
+        const a = selectedResults[i];
+        const b = selectedResults[j];
+        const aVal =
+          barMetric === 'power'
+            ? getTpPerMwForType(a, costType)
+            : barMetric === 'cost'
+              ? costType === 'input'
+                ? a.costInput
+                : costType === 'output'
+                  ? a.costOutput
+                  : a.cost
+              : getThroughputForType(a, costType);
+        const bVal =
+          barMetric === 'power'
+            ? getTpPerMwForType(b, costType)
+            : barMetric === 'cost'
+              ? costType === 'input'
+                ? b.costInput
+                : costType === 'output'
+                  ? b.costOutput
+                  : b.cost
+              : getThroughputForType(b, costType);
+
+        const higher = aVal >= bVal ? a : b;
+        const lower = aVal >= bVal ? b : a;
+        const higherVal = Math.max(aVal, bVal);
+        const lowerVal = Math.min(aVal, bVal);
+
+        if (lowerVal > 0) {
+          const ratio = higherVal / lowerVal;
+          if (locale === 'zh') {
+            comparisons.push(
+              formatCalculatorRatioZh(getLabel(higher), getLabel(lower), metricName, ratio),
+            );
+          } else {
+            comparisons.push(
+              `${getLabel(higher)} is ${ratio.toFixed(1)}x more ${metricName} than ${getLabel(lower)}`,
+            );
+          }
+        }
+      }
+    }
+
+    return comparisons;
+  }, [selectedBars, barResults, hardwareConfig, barMetric, costType, mode, locale, t]);
+
+  const overlayLegendItems = useMemo(() => {
+    if (overlayResults.length === 0) return [];
+    return unofficialRunInfos
+      .map((info, idx) => {
+        if (!overlayResults.some((r) => r.runIndex === idx)) return null;
+        const branch = info.branch || `run ${info.id}`;
+        return {
+          name: `✕ unofficial-run-${info.id}`,
+          label: `✕ ${branch}`,
+          color: overlayRunColor(idx),
+          title: `${t.unofficialRun}: ${branch}`,
+          isHighlighted: true,
+          hw: `overlay-run-${info.id}`,
+          isActive: true,
+          isRemovable: false,
+          onClick: () => {},
+          tooltip: (
+            <div className="font-normal text-xs">
+              <div className="font-medium text-destructive">{t.unofficialRun}</div>
+              <div>
+                {t.branch}: {branch}
+              </div>
+              {info.url && (
+                <a href={info.url} target="_blank" rel="noopener noreferrer" className="underline">
+                  {t.viewRun}
+                </a>
+              )}
+            </div>
+          ),
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => item !== null);
+  }, [overlayResults, unofficialRunInfos, t]);
+
+  const legendItems = useMemo(() => {
+    const availableSet = new Set(legendHwKeys);
+    return [
+      ...overlayLegendItems,
+      ...Object.entries(hardwareConfig)
+        .filter(([key]) => availableSet.has(key))
+        .toSorted(([a], [b]) => getModelSortIndex(a) - getModelSortIndex(b) || a.localeCompare(b))
+        .map(([key, config]) => ({
+          name: config.name,
+          label: getDisplayLabel(config),
+          color: resolveColor(key),
+          title: config.gpu,
+          hw: key,
+          isActive: visibleHwKeys.has(key),
+          onClick: () => toggleGpuVisibility(key),
+        })),
+    ];
+  }, [
+    legendHwKeys,
+    overlayLegendItems,
+    hardwareConfig,
+    visibleHwKeys,
+    toggleGpuVisibility,
+    resolveColor,
+  ]);
+
+  // Input/Output values follow the chip basis; name the denominator on the total basis.
+  const totalChipBasis = chipBasis === 'total' && costType !== 'total';
+  const baseChartTitle =
+    locale === 'zh'
+      ? getChartTitleZh(
+          barMetric,
+          mode,
+          targetValue,
+          costType,
+          costProvider,
+          isAgenticSequence ? selectedPercentile : undefined,
+        )
+      : getChartTitle(
+          barMetric,
+          mode,
+          targetValue,
+          costType,
+          costProvider,
+          isAgenticSequence ? selectedPercentile : undefined,
+        );
+  const chartTitle = totalChipBasis
+    ? (withTotalChipQualifier(baseChartTitle.title, locale) ?? baseChartTitle.title)
+    : baseChartTitle.title;
+
+  const chartHeading = (
+    <div className="flex min-w-0 items-start md:pr-64">
+      <Heading as="h2" level="card" logo={<ModelLogo model={selectedModel} className="size-6" />}>
+        {chartTitle}
+        <HeadingQualifier>{baseChartTitle.qualifier}</HeadingQualifier>
+      </Heading>
+    </div>
+  );
+
+  if (!loading && error) {
+    console.error(error);
+    return (
+      <Card>
+        <div className="flex items-center justify-center h-64 text-muted-foreground">
+          {t.errorLoading}
+        </div>
+      </Card>
+    );
+  }
+
+  const showsTcoBasis =
+    scenarioShowsTcoBasis && barResults.some((r) => r.hwKey.split('_')[0] === 'tpuv7');
+
+  const secondaryConfig = (
+    <>
+      <ScenarioSelector
+        id="calc-sequence"
+        data-testid="calc-sequence-selector"
+        value={selectedSequence}
+        onChange={handleSequenceChange}
+        open={openDropdown === 'sequence'}
+        onOpenChange={handleDropdownOpenChange('sequence')}
+        availableSequences={availableSequences}
+        model={selectedModel}
+      />
+      {isAgenticSequence && featureGateUnlocked && (
+        <PercentileSelector
+          id="calc-percentile"
+          data-testid="calc-percentile-selector"
+          value={selectedPercentile}
+          onChange={handlePercentileChange}
+        />
+      )}
+      <PrecisionSelector
+        id="calc-precision"
+        data-testid="calc-precision-selector"
+        value={selectedPrecisions}
+        onChange={handlePrecisionChange}
+        open={openDropdown === 'precision'}
+        onOpenChange={handleDropdownOpenChange('precision')}
+        availablePrecisions={availablePrecisions}
+      />
+    </>
+  );
+
+  const pricingConfig = (
+    <>
+      <div className="flex flex-col space-y-1.5">
+        <LabelWithTooltip
+          htmlFor="calc-cost"
+          label={t.costProviderLabel}
+          tooltip={t.costProviderTooltip}
+        />
+        <div data-testid="calc-cost-selector">
+          <MultiSelect
+            triggerId="calc-cost"
+            options={[
+              ...COST_PROVIDER_OPTIONS.map((provider) => ({
+                value: provider.value,
+                label: locale === 'zh' ? provider.labelZh : provider.label,
+              })),
+              ...lockedCostProviderOptions(locale),
+            ]}
+            value={[costProvider]}
+            onChange={(values) => {
+              const next = values[0];
+              if (!next) return;
+              if (interceptLockedTier(next)) return;
+              handleCostProviderChange(next);
+            }}
+            open={openDropdown === 'costProvider'}
+            onOpenChange={handleDropdownOpenChange('costProvider')}
+            placeholder={t.costProviderPlaceholder}
+            minSelections={1}
+            maxSelections={1}
+            showClearAll={false}
+            searchable={false}
+            plainSelectedText
+            showSelectionSummary={false}
+          />
+        </div>
+      </div>
+      <div className="flex flex-col space-y-1.5">
+        <LabelWithTooltip
+          htmlFor="calc-cost-type"
+          label={t.tokenTypeLabel}
+          tooltip={t.tokenTypeTooltip}
+        />
+        <div data-testid="calc-cost-type-selector">
+          <MultiSelect
+            triggerId="calc-cost-type"
+            options={COST_TYPE_OPTIONS.map((ct) => ({
+              value: ct.value,
+              label: costTypeLabels[ct.value],
+            }))}
+            value={[costType]}
+            onChange={(values) => {
+              const next = values[0];
+              if (!next) return;
+              handleCostTypeChange(next);
+            }}
+            open={openDropdown === 'costType'}
+            onOpenChange={handleDropdownOpenChange('costType')}
+            placeholder={t.tokenTypePlaceholder}
+            minSelections={1}
+            maxSelections={1}
+            showClearAll={false}
+            searchable={false}
+            plainSelectedText
+            showSelectionSummary={false}
+          />
+        </div>
+      </div>
+      {showsTcoBasis && (
+        <div className="flex min-w-0 flex-col gap-1.5">
+          <LabelWithTooltip label={t.tcoBasisLabel} tooltip={t.tcoBasisTooltip} />
+          <TcoBasisToggle source="calculator" className="md:h-9" />
+        </div>
+      )}
+    </>
+  );
+
+  return (
+    <div className="flex flex-col gap-4">
+      <section data-testid="calculator-controls">
+        <Card className="relative z-30">
+          <div className="flex flex-col gap-4">
+            <DashboardSectionHeader
+              title={t.title}
+              description={t.description}
+              actions={<ChartShareActions />}
+            />
+
+            <TooltipProvider delayDuration={0}>
+              <ControlPanel
+                legend={t.benchmarkGroup}
+                className="md:grid-cols-2 lg:flex lg:flex-wrap lg:items-start"
+              >
+                <div className="min-w-0 lg:grow">
+                  <ModelSelector
+                    id="calc-model"
+                    data-testid="calc-model-selector"
+                    value={selectedModel}
+                    onChange={handleModelChange}
+                    open={openDropdown === 'model'}
+                    onOpenChange={handleDropdownOpenChange('model')}
+                    availableModels={availableModels}
+                  />
+                </div>
+                {!isMobile && <div className="hidden md:contents">{secondaryConfig}</div>}
+              </ControlPanel>
+
+              <MobileControlSection
+                label={t.secondaryControls}
+                count={secondaryCount}
+                countLabel={t.changed}
+                testId="calculator-secondary-controls"
+              >
+                {isMobile && <div className="grid min-w-0 gap-3 md:hidden">{secondaryConfig}</div>}
+                <div className="contents lg:flex lg:items-stretch lg:gap-4">
+                  <ControlPanel
+                    legend={t.pricingGroup}
+                    data-testid="calculator-pricing-panel"
+                    className="md:grid-cols-2 lg:flex lg:w-fit lg:shrink-0 lg:flex-wrap lg:items-start"
+                  >
+                    {pricingConfig}
+                  </ControlPanel>
+                  <ControlPanel
+                    legend={t.comparisonGroup}
+                    className="items-start md:grid-cols-[auto_minmax(0,1fr)] md:gap-x-6 lg:flex-1 lg:gap-x-4"
+                  >
+                    <div className="flex items-end gap-3">
+                      <div className="flex flex-col space-y-1.5">
+                        <LabelWithTooltip label={t.metricLabel} tooltip={t.metricTooltip} />
+                        <SegmentedToggle
+                          role="group"
+                          size="default"
+                          ariaLabel={t.metricLabel}
+                          value={barMetric}
+                          onValueChange={handleBarMetricChange}
+                          options={BAR_METRIC_OPTIONS.map((opt) => ({
+                            value: opt.value,
+                            testId: `calculator-metric-${opt.value}`,
+                            label:
+                              opt.value === 'throughput'
+                                ? t.metricThroughput
+                                : opt.value === 'cost'
+                                  ? t.metricCost
+                                  : 'tok/s/MW',
+                          }))}
+                        />
+                      </div>
+                    </div>
+                    {loading && <div aria-hidden="true" className="h-17" />}
+                    {!loading && hasAnyData && (
+                      <div className="space-y-2">
+                        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+                          <LabelWithTooltip
+                            htmlFor="calc-target"
+                            label={
+                              isAgenticSequence
+                                ? t.targetAgenticLabel(percentileLabel)
+                                : t.targetLabel
+                            }
+                            tooltip={
+                              isAgenticSequence
+                                ? t.targetAgenticTooltip(percentileLabel)
+                                : t.targetTooltip
+                            }
+                          />
+                          <div
+                            className="flex items-center gap-2"
+                            data-testid="calculator-hide-over-limit-control"
+                          >
+                            <LabelWithTooltip
+                              htmlFor="calc-hide-over-limit"
+                              label={t.hideSkuAboveConfigLimitLabel}
+                              tooltip={t.hideSkuAboveConfigLimitHelp}
+                            />
+                            <Switch
+                              id="calc-hide-over-limit"
+                              checked={hideSkuAboveConfigLimit}
+                              onCheckedChange={handleHideSkuAboveLimitChange}
+                              className="shrink-0"
+                            />
+                          </div>
+                        </div>
+                        <RangeField
+                          label={
+                            isAgenticSequence
+                              ? t.targetAgenticLabel(percentileLabel)
+                              : t.targetLabel
+                          }
+                          min={currentRange.min}
+                          max={currentRange.max}
+                          value={targetValue}
+                          onSliderChange={handleSliderChange}
+                          onSliderCommit={() =>
+                            track('calculator_target_slider_set', { mode, value: targetValue })
+                          }
+                          input={{
+                            id: 'calc-target',
+                            value: resolveCalculatorTargetInputValue(
+                              inputValue,
+                              targetValue,
+                              isTargetInputFocused,
+                            ),
+                            onFocus: handleInputFocus,
+                            onChange: handleInputChange,
+                            onBlur: handleInputBlur,
+                          }}
+                        />
+                      </div>
+                    )}
+                  </ControlPanel>
+                </div>
+              </MobileControlSection>
+            </TooltipProvider>
+          </div>
+        </Card>
+      </section>
+
+      {loading && (
+        <section aria-hidden="true">
+          <Card className="h-56 lg:h-55">
+            <Skeleton className="size-full" />
+          </Card>
+        </section>
+      )}
+      {!loading && hasData && (
+        <CostTargetPanel
+          gpuDataByGroupKey={gpuDataByGroupKey}
+          hardwareConfig={hardwareConfig}
+          costProvider={costProvider}
+          costType={costType}
+          visibleHwKeys={visibleHwKeys}
+          mw={mw}
+          mwInput={mwInput}
+          onMwInputChange={handleMwInputChange}
+        />
+      )}
+
+      <section data-testid="calculator-chart-section">
+        <figure
+          id="calculator-chart-body"
+          data-testid="calculator-figure"
+          className="relative min-w-0"
+        >
+          <Card className="relative">
+            <ChartButtons
+              className="md:absolute md:right-6 md:top-6 md:z-10 md:mb-0"
+              chartId="calculator-chart"
+              analyticsPrefix="calculator"
+              analyticsContext={selectionAnalyticsContext({
+                model: selectedModel,
+                sequence: selectedSequence,
+                precisions: selectedPrecisions,
+                gpuCount: visibleHwKeys.size,
+              })}
+              zoomResetEvent="d3chart_zoom_reset_calculator-chart"
+              onExportCsv={handleExportCsv}
+              setIsLegendExpanded={setIsLegendExpanded}
+              exportFileName={`InferenceX_calculator_${selectedModel}`}
+              leadingControls={
+                <SegmentedToggle
+                  value={viewMode}
+                  options={viewModeOptions}
+                  onValueChange={handleViewModeChange}
+                  ariaLabel={t.viewModeAria}
+                  testId="calculator-view-toggle"
+                  className="shrink-0"
+                />
+              }
+            />
+            {loading ? (
+              <Skeleton className="h-125 w-full" />
+            ) : (
+              <>
+                {(() => {
+                  const captionContent = (
+                    <>
+                      {chartHeading}
+                      {(showsJalapenoPreview || showsVeraRubinPreview || showsTpuv7Preview) && (
+                        <div className="mt-3 space-y-1">
+                          {showsJalapenoPreview && (
+                            <JalapenoOfficialPreviewNotice variant="inline" />
+                          )}
+                          {showsVeraRubinPreview && (
+                            <VeraRubinOfficialPreviewNotice variant="inline" />
+                          )}
+                          {showsTpuv7Preview && <Tpuv7OfficialPreviewNotice variant="inline" />}
+                        </div>
+                      )}
+                    </>
+                  );
+                  const plottedBases = plottedChipBases(
+                    barResults.map((r) => r.hwKey),
+                    (base) => base in HW_REGISTRY,
+                  );
+                  const priceTable =
+                    plottedBases.length > 0 && barMetric !== 'throughput' ? (
+                      <TcoPriceTable
+                        header={barMetric === 'power' ? 'kW' : undefined}
+                        rowLabel={barMetric === 'power' ? t.allInPower : undefined}
+                        twoDecimals={barMetric !== 'power'}
+                        items={plottedBases.map((base) => {
+                          const specs = HW_REGISTRY[base as keyof typeof HW_REGISTRY];
+                          return {
+                            base,
+                            label: specs.badgeLabel ?? base.toUpperCase(),
+                            value:
+                              barMetric === 'power'
+                                ? String(specs.power)
+                                : getGpuSpecs(base, tcoBasis)[costProvider].toFixed(2),
+                          };
+                        })}
+                        testId="calculator-cost-badges"
+                        cellTestId="calculator-cost-badge"
+                        inputIdPrefix="calculator-cost"
+                      />
+                    ) : undefined;
+                  const footerContent = (
+                    <div className="mt-3">
+                      <ResultContext
+                        locale={locale}
+                        layout="footer"
+                        chipBasis={
+                          costType === 'total' ? undefined : (
+                            <ChipBasisCaption control={chipBasisControl} />
+                          )
+                        }
+                        priceTable={priceTable}
+                        date={selectedRunDate}
+                        source={`${getModelLabel(selectedModel)} · ${selectedPrecisions
+                          .map((p) => getPrecisionLabel(p as Precision))
+                          .join(
+                            ', ',
+                          )} · ${getSequenceLabel(selectedSequence, locale)} · SemiAnalysis InferenceX™`}
+                        metaEnd={
+                          barMetric === 'cost' && plottedBases.length > 0 ? (
+                            <PricesSourceLink />
+                          ) : barMetric === 'power' && plottedBases.length > 0 ? (
+                            <span>
+                              {t.source}
+                              <Link
+                                target="_blank"
+                                className="text-brand hover:underline"
+                                href="https://semianalysis.com/datacenter-industry-model/"
+                              >
+                                SemiAnalysis Datacenter Industry Model
+                                <ExternalLinkIcon />
+                              </Link>
+                            </span>
+                          ) : undefined
+                        }
+                      />
+                      <ChipBasisNote
+                        visible={barMetric === 'cost' && costType !== 'total'}
+                        testId="calculator-disagg-cost-note"
+                        label={t.note}
+                        text={chipBasis === 'total' ? t.disaggCostTotal : t.disaggCost}
+                        chipBasis={readOnlyChipBasisControl}
+                      />
+                      <ChipBasisNote
+                        visible={barMetric === 'throughput' || barMetric === 'power'}
+                        testId="calculator-disagg-throughput-note"
+                        label={t.note}
+                        text={chipBasis === 'total' ? t.disaggThroughputTotal : t.disaggThroughput}
+                        chipBasis={readOnlyChipBasisControl}
+                      />
+                    </div>
+                  );
+
+                  return viewMode === 'chart' ? (
+                    <ThroughputBarChart
+                      caption={captionContent}
+                      footer={footerContent}
+                      results={barResults}
+                      hardwareConfig={hardwareConfig}
+                      mode={mode}
+                      targetValue={targetValue}
+                      barMetric={barMetric}
+                      costType={costType}
+                      totalChipBasis={totalChipBasis}
+                      runUrl={runUrl}
+                      selectedBars={selectedBars}
+                      onBarSelect={handleBarSelect}
+                      colorResolver={resolveColor}
+                      legendElement={
+                        legendHwKeys.length > 0 ? (
+                          <ChartLegend
+                            variant="sidebar"
+                            legendItems={legendItems}
+                            onItemRemove={removeGpu}
+                            isLegendExpanded={isLegendExpanded}
+                            onExpandedChange={(expanded) => {
+                              setIsLegendExpanded(expanded);
+                              track('calculator_legend_expanded', { enabled: expanded });
+                            }}
+                            switches={[
+                              {
+                                id: 'calc-high-contrast',
+                                label: t.highContrast,
+                                checked: highContrast,
+                                onCheckedChange: (checked: boolean) => {
+                                  setHighContrast(checked);
+                                  track('calculator_high_contrast_toggled', { enabled: checked });
+                                },
+                              },
+                            ]}
+                            reset={{
+                              id: 'calc-reset-filter',
+                              disabled: visibleHwKeys.size >= legendHwKeys.length,
+                              onClick: handleResetGpus,
+                            }}
+                            enableTooltips={true}
+                          />
+                        ) : undefined
+                      }
+                    />
+                  ) : (
+                    <>
+                      <figcaption>{captionContent}</figcaption>
+                      <CalculatorTable
+                        results={results}
+                        costType={costType}
+                        hardwareConfig={hardwareConfig}
+                      />
+                      {footerContent}
+                    </>
+                  );
+                })()}
+              </>
+            )}
+          </Card>
+        </figure>
+      </section>
+
+      {viewMode === 'chart' && selectedBars.size > 0 && (
+        <section data-testid="calculator-comparison-banner">
+          <Card>
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex-1">
+                {selectedBars.size === 1 && (
+                  <p className="text-sm text-muted-foreground">
+                    {(() => {
+                      const resultKey = [...selectedBars][0];
+                      const r = barResults.find((res) => res.resultKey === resultKey);
+                      if (!r) return resultKey;
+                      return getResultLabel(r, hardwareConfig);
+                    })()}{' '}
+                    {t.clickToCompare}
+                  </p>
+                )}
+                {comparisonText && comparisonText.length > 0 && (
+                  <div className="space-y-1">
+                    {comparisonText.map((text) => (
+                      <p key={text} className="text-sm font-medium">
+                        {text}
+                      </p>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  track('calculator_selection_cleared', { cleared_count: selectedBars.size });
+                  setBarSelectionIntent({ resultsKey: barResultsKey, selected: new Set() });
+                }}
+                className="text-xs text-muted-foreground hover:text-foreground underline shrink-0"
+              >
+                {t.clearSelection}
+              </button>
+            </div>
+          </Card>
+        </section>
+      )}
+
+      {!loading && hasData && (
+        <section data-testid="calculator-fleet-pointer">
+          <p className="text-sm text-muted-foreground">
+            {t.fleetMoved}{' '}
+            <Link
+              href={localePath(getDashboardRoute('fleet').path, locale)}
+              className="underline hover:text-foreground"
+              data-testid="calculator-fleet-pointer-link"
+            >
+              {t.fleetMovedLink}
+            </Link>
+          </p>
+        </section>
+      )}
+      {tcoModelDialog}
+    </div>
+  );
+}

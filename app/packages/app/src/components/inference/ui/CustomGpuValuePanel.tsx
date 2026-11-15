@@ -1,0 +1,297 @@
+'use client';
+
+import React, { memo, useCallback, useEffect, useRef, useState } from 'react';
+
+import {
+  useInferenceActions,
+  useInferenceDisplay,
+  useInferenceFilters,
+} from '@/components/inference/InferenceContext';
+import {
+  buildAppliedCustomGpuValues,
+  buildDefaultCustomGpuValues,
+  didCustomGpuPanelFiltersChange,
+  validateCustomGpuValueInput,
+  type CustomGpuPanelFilters,
+} from '@/components/inference/ui/custom-gpu-value-panel-utils';
+import { Button } from '@/components/ui/button';
+import { Card } from '@/components/ui/card';
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupInput,
+  InputGroupText,
+} from '@/components/ui/input-group';
+import { Skeleton } from '@/components/ui/skeleton';
+import { track } from '@/lib/analytics/analytics';
+import { useLocale } from '@/lib/i18n/use-locale';
+import { HW_REGISTRY, type HwEntry } from '@semianalysisai/inferencex-constants';
+type GpuValuePanelKind = 'powers';
+
+const STRINGS = {
+  en: {
+    reset: 'Reset',
+    resetToDefaults: 'Reset to defaults',
+    calculate: 'Calculate',
+    invalidNumber: 'Must be a valid number',
+    nonNegative: 'Must be a non-negative number',
+  },
+  zh: {
+    reset: '重置',
+    resetToDefaults: '恢复默认值',
+    calculate: '计算',
+    invalidNumber: '请输入有效数字',
+    nonNegative: '请输入非负数',
+  },
+} as const;
+
+const PANEL_CONFIG: Record<
+  GpuValuePanelKind,
+  {
+    title: string;
+    titleZh: string;
+    description: string;
+    descriptionZh: string;
+    sectionTestId: string;
+    calculateTestId: string;
+    inputIdPrefix: string;
+    resetEvent: string;
+    calculatedEvent: string;
+    getDefaultValue: (specs: HwEntry) => number;
+  }
+> = {
+  powers: {
+    title: 'Custom chip powers',
+    titleZh: '自定义芯片功耗',
+    description:
+      'Enter your own Token Throughput per All in Utility MW (tok/s/MW) values for each chip. These values will be used to calculate custom power metrics.',
+    descriptionZh:
+      '输入每个芯片的自定义全电源配置兆瓦 token 吞吐量（tok/s/MW）。这些值用于计算自定义功耗指标。',
+    sectionTestId: 'custom-powers-section',
+    calculateTestId: 'custom-powers-calculate',
+    inputIdPrefix: 'cost-input',
+    resetEvent: 'inference_custom_powers_reset',
+    calculatedEvent: 'inference_custom_powers_calculated',
+    getDefaultValue: (specs) => specs.power,
+  },
+};
+
+interface GpuValueInputGroupProps {
+  gpuKey: string;
+  gpuLabel: string;
+  inputIdPrefix: string;
+  inputValue: string;
+  error: string;
+  onChange: (value: string) => void;
+}
+
+const GpuValueInputGroup = memo(
+  ({ gpuKey, gpuLabel, inputIdPrefix, inputValue, error, onChange }: GpuValueInputGroupProps) => (
+    <div className="flex flex-col gap-2">
+      <InputGroup>
+        <InputGroupAddon align="inline-start">
+          <InputGroupText>{gpuLabel}:</InputGroupText>
+        </InputGroupAddon>
+        <InputGroupInput
+          id={`${inputIdPrefix}-${gpuKey}`}
+          type="number"
+          step="0.01"
+          min="0"
+          value={inputValue}
+          placeholder=""
+          onChange={(e) => {
+            onChange(e.target.value);
+          }}
+          className={error ? 'text-destructive' : ''}
+          aria-invalid={Boolean(error)}
+        />
+      </InputGroup>
+      {error && <p className="text-xs text-destructive mt-1">{error}</p>}
+    </div>
+  ),
+);
+
+GpuValueInputGroup.displayName = 'GpuValueInputGroup';
+
+function renderSkeleton(title: string, description: string) {
+  return (
+    <Card>
+      <h2 className="text-lg font-semibold mb-2">{title}</h2>
+      <p className="text-muted-foreground text-sm mb-4">{description}</p>
+      <div className="flex flex-col gap-4">
+        <div className="flex-1 grid grid-cols-2 md:grid-cols-3 gap-4">
+          {Array.from({ length: 6 }).map((_, index) => (
+            <div key={`skeleton-input-${index + 1}`} className="flex flex-col gap-2">
+              <div className="flex gap-2">
+                <Skeleton className="h-9 flex-1" />
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="self-end-safe justify-self-end-safe flex gap-2">
+          <Skeleton className="h-9 w-20" />
+          <Skeleton className="h-9 w-28" />
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+const CustomGpuValuePanel = memo(
+  ({ loading, kind }: { loading: boolean; kind: GpuValuePanelKind }) => {
+    const locale = useLocale();
+    const t = STRINGS[locale];
+    const { selectedYAxisMetric } = useInferenceDisplay();
+    const { selectedPrecisions, selectedModel, selectedSequence } = useInferenceFilters();
+    const { setUserPowers } = useInferenceActions();
+
+    const config = PANEL_CONFIG[kind];
+    const title = locale === 'zh' ? config.titleZh : config.title;
+    const description = locale === 'zh' ? config.descriptionZh : config.description;
+    const applyValues = setUserPowers;
+
+    const [inputErrors, setInputErrors] = useState<Record<string, string>>({});
+    const [defaultValues, setDefaultValues] = useState<Record<string, string>>({});
+    const [lastCalculatedValues, setLastCalculatedValues] = useState<
+      Record<string, string | number>
+    >({});
+
+    const previousFiltersRef = useRef<CustomGpuPanelFilters>({
+      model: selectedModel,
+      sequence: selectedSequence,
+      precisions: selectedPrecisions,
+      yAxisMetric: selectedYAxisMetric,
+    });
+
+    const stableGpus = React.useMemo(
+      () =>
+        Object.entries(HW_REGISTRY)
+          .filter(([, specs]) => config.getDefaultValue(specs) > 0)
+          .map(([base, specs]) => ({ base, label: base.toUpperCase(), specs })),
+      [config],
+    );
+
+    useEffect(() => {
+      const { defaultValues: defaults, numericDefaults } = buildDefaultCustomGpuValues(
+        stableGpus,
+        config.getDefaultValue,
+      );
+
+      setDefaultValues(defaults);
+      setLastCalculatedValues(defaults);
+      setInputErrors({});
+      applyValues(numericDefaults);
+    }, [applyValues, config, stableGpus]);
+
+    useEffect(() => {
+      const prevFilters = previousFiltersRef.current;
+      const currentFilters: CustomGpuPanelFilters = {
+        model: selectedModel,
+        sequence: selectedSequence,
+        precisions: selectedPrecisions,
+        yAxisMetric: selectedYAxisMetric,
+      };
+      const filtersChanged = didCustomGpuPanelFiltersChange(prevFilters, currentFilters);
+
+      if (filtersChanged) {
+        setLastCalculatedValues(defaultValues);
+        setInputErrors({});
+        previousFiltersRef.current = currentFilters;
+      }
+    }, [defaultValues, selectedModel, selectedPrecisions, selectedSequence, selectedYAxisMetric]);
+
+    const handleInputChange = useCallback(
+      (gpuKey: string, value: string) => {
+        const validationError = validateCustomGpuValueInput(value);
+        const localizedError =
+          locale === 'zh' && validationError === STRINGS.en.invalidNumber
+            ? t.invalidNumber
+            : locale === 'zh' && validationError === STRINGS.en.nonNegative
+              ? t.nonNegative
+              : validationError;
+
+        setInputErrors((prev) => ({
+          ...prev,
+          [gpuKey]: localizedError,
+        }));
+        setLastCalculatedValues((prev) => ({
+          ...prev,
+          [gpuKey]: value,
+        }));
+      },
+      [locale, t.invalidNumber, t.nonNegative],
+    );
+
+    const handleReset = useCallback(() => {
+      track(config.resetEvent, {
+        metric: selectedYAxisMetric,
+        gpu_count: stableGpus.length,
+      });
+
+      const { numericDefaults } = buildDefaultCustomGpuValues(stableGpus, config.getDefaultValue);
+
+      applyValues(numericDefaults);
+      setLastCalculatedValues(numericDefaults);
+      setInputErrors({});
+    }, [applyValues, config, selectedYAxisMetric, stableGpus]);
+
+    const handleRecalculate = useCallback(() => {
+      const hasErrors = Object.values(inputErrors).some((error) => error !== '');
+      if (hasErrors) return;
+
+      track(config.calculatedEvent, {
+        metric: selectedYAxisMetric,
+        gpu_count: stableGpus.length,
+      });
+
+      const currentValues = buildAppliedCustomGpuValues(stableGpus, lastCalculatedValues);
+      applyValues(currentValues);
+    }, [applyValues, config, inputErrors, lastCalculatedValues, selectedYAxisMetric, stableGpus]);
+
+    if (loading || stableGpus.length === 0) {
+      return renderSkeleton(title, description);
+    }
+
+    return (
+      <Card data-testid={config.sectionTestId}>
+        <h2 className="text-lg font-semibold mb-2">{title}</h2>
+        <p className="text-muted-foreground text-sm mb-4">{description}</p>
+
+        <div className="flex flex-col gap-4">
+          <div className="flex-1 grid grid-cols-2 md:grid-cols-3 gap-4">
+            {stableGpus.map((gpu) => (
+              <GpuValueInputGroup
+                key={gpu.base}
+                gpuKey={gpu.base}
+                gpuLabel={gpu.label}
+                inputIdPrefix={config.inputIdPrefix}
+                inputValue={(lastCalculatedValues[gpu.base] ?? '').toString()}
+                error={inputErrors[gpu.base] ?? ''}
+                onChange={(value) => {
+                  handleInputChange(gpu.base, value);
+                }}
+              />
+            ))}
+          </div>
+          <div className="self-end-safe justify-self-end-safe flex gap-2">
+            <Button
+              onClick={handleReset}
+              variant="ghost"
+              aria-label={t.resetToDefaults}
+              title={t.resetToDefaults}
+            >
+              {t.reset}
+            </Button>
+            <Button data-testid={config.calculateTestId} onClick={handleRecalculate}>
+              {t.calculate}
+            </Button>
+          </div>
+        </div>
+      </Card>
+    );
+  },
+);
+
+CustomGpuValuePanel.displayName = 'CustomGpuValuePanel';
+
+export default CustomGpuValuePanel;

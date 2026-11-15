@@ -1,0 +1,236 @@
+import { availabilityBody } from '../support/e2e';
+import { assertShareLinkParams } from '../support/share-link';
+import { expectHwKeyPoints, visiblePoints } from '../support/scatter-points';
+
+const POWER_MODEL = 'dsv4';
+const POWER_DATE = '2026-08-20';
+
+const powerPercentileLadder = (prefix: string, base: number): Record<string, number> => ({
+  [`median_${prefix}`]: base,
+  [`p75_${prefix}`]: base * 1.2,
+  [`p90_${prefix}`]: base * 1.5,
+  [`p95_${prefix}`]: base * 1.7,
+  [`p99_${prefix}`]: base * 2.2,
+  [`std_${prefix}`]: base * 0.3,
+});
+
+const powerMetrics = (conc: number): Record<string, number> => {
+  const scale = conc / 16;
+  const itl = 0.011 * scale;
+  return {
+    ...powerPercentileLadder('ttft', 0.4 * scale),
+    ...powerPercentileLadder('tpot', 0.012 * scale),
+    ...powerPercentileLadder('itl', itl),
+    ...powerPercentileLadder('e2el', 8 * scale),
+    median_intvty: 1 / itl,
+    p75_intvty: 1 / (itl * 1.2),
+    p90_intvty: 1 / (itl * 1.5),
+    p99_intvty: 1 / (itl * 2.2),
+    std_intvty: (1 / itl) * 0.1,
+    tput_per_gpu: 950 / Math.sqrt(scale),
+    output_tput_per_gpu: 210,
+    input_tput_per_gpu: 740,
+  };
+};
+
+const powerConfigs = [
+  { hardware: 'b200', framework: 'vllm', power: { avg_power_w: 560 } },
+  { hardware: 'mi300x', framework: 'sglang', power: { power_valid: 1, avg_power_w: 685.5 } },
+];
+
+const powerAvailability = powerConfigs.map((config) => ({
+  model: POWER_MODEL,
+  isl: 8192,
+  osl: 1024,
+  precision: 'fp4',
+  hardware: config.hardware,
+  framework: config.framework,
+  spec_method: 'none',
+  disagg: false,
+  benchmark_type: 'single_turn',
+  date: POWER_DATE,
+}));
+
+let powerBenchmarkId = 990000;
+const powerBenchmarks = powerConfigs.flatMap((config) =>
+  [16, 64, 128].map((conc) => ({
+    id: powerBenchmarkId++,
+    hardware: config.hardware,
+    framework: config.framework,
+    model: POWER_MODEL,
+    precision: 'fp4',
+    spec_method: 'none',
+    disagg: false,
+    is_multinode: false,
+    prefill_tp: 8,
+    decode_tp: 8,
+    num_prefill_gpu: 8,
+    num_decode_gpu: 8,
+    isl: 8192,
+    osl: 1024,
+    conc,
+    offload_mode: 'off',
+    benchmark_type: 'single_turn',
+    image: `${config.framework}/server:test`,
+    metrics: { ...powerMetrics(conc), ...config.power },
+    workers: null,
+    date: POWER_DATE,
+    run_url: null,
+  })),
+);
+
+function visitCertifiedPowerChart(
+  extraParams = '',
+  benchmarks = powerBenchmarks,
+  page: '/infx/inference' | '/pwx' = '/pwx',
+) {
+  cy.intercept('GET', '/api/v1/availability/compact', {
+    body: availabilityBody(powerAvailability),
+  }).as('availability');
+  cy.intercept('GET', '/api/v1/benchmarks*', { body: benchmarks }).as('benchmarks');
+  cy.visit(`${page}?g_model=DeepSeek-V4-Pro&i_seq=8k/1k&i_prec=fp4${extraParams}`, {
+    onBeforeLoad(win) {
+      win.localStorage.setItem('inferencex-star-modal-dismissed', String(Date.now()));
+      win.localStorage.setItem('inferencex-feature-gate-konami-v1', '1');
+    },
+  });
+  cy.wait(['@availability', '@benchmarks']);
+  cy.get('[data-testid="inference-chart-display"]').should('exist');
+  cy.get('[data-testid="chart-figure"]').should('have.length.at.least', 1);
+}
+
+const MEASURED_POWER_TITLE = 'Measured Average Power per Chip';
+const TOKENS_PER_DOLLAR_TITLE = 'Total Tokens per $1 TCO';
+
+const assertChartTitle = (title: string) => {
+  cy.get('[data-testid="chart-figure"] h2').should('contain.text', title);
+};
+
+const expectVisiblePowerPoints = (count: number) =>
+  cy.scatterPoints().should((points) => expect(visiblePoints(points)).to.have.length(count));
+
+describe('Validated vs historical measured power', () => {
+  beforeEach(() => {
+    cy.on('uncaught:exception', (error) => {
+      if (
+        error.message.split('\n\n')[1]?.trim() ===
+        '> ResizeObserver loop completed with undelivered notifications.'
+      ) {
+        return false;
+      }
+    });
+  });
+
+  it('filters validated and historical measured points via Quick Filters', () => {
+    // PowerX opens on Energy per token; the Validated / Historical filter is tested on the
+    // power scatter the article links to.
+    visitCertifiedPowerChart('&i_metric=y_measuredAvgPower');
+    assertChartTitle(MEASURED_POWER_TITLE);
+
+    expectHwKeyPoints('b200', true);
+    expectHwKeyPoints('mi300x', true);
+
+    cy.get('[data-testid="scatter-quick-filters"]').click();
+    cy.get('[data-testid="quick-filters-dialog"]').should('be.visible');
+    cy.get('[data-testid="quick-filter-power-certified"]').should('be.enabled');
+    cy.get('[data-testid="quick-filter-power-legacy"]').should('be.enabled');
+
+    cy.get('[data-testid="quick-filter-power-certified"]').click();
+    cy.get('[data-testid="quick-filters-selected-count"]').should('contain.text', '1 selected');
+    expectHwKeyPoints('b200', false);
+    expectHwKeyPoints('mi300x', true);
+    cy.get('[data-testid="inference-chart-display"] svg').should('exist');
+
+    cy.contains('button', 'Clear filters').click();
+    cy.get('[data-testid="quick-filters-selected-count"]').should('not.exist');
+    cy.get('[data-testid="quick-filter-power-certified"]').should(
+      'have.attr',
+      'aria-pressed',
+      'false',
+    );
+    cy.get('[data-testid="quick-filters-dialog"]').contains('button', 'Done').click();
+    expectHwKeyPoints('b200', true);
+  });
+
+  it('restores a shared i_power=certified link with the toggle pre-selected', () => {
+    visitCertifiedPowerChart('&i_metric=y_measuredAvgPower&i_power=certified');
+
+    expectHwKeyPoints('mi300x', true);
+    expectHwKeyPoints('b200', false);
+
+    cy.get('[data-testid="scatter-quick-filters"]').click();
+    cy.get('[data-testid="quick-filter-power-certified"]').should(
+      'have.attr',
+      'aria-pressed',
+      'true',
+    );
+    cy.get('[data-testid="quick-filters-selected-count"]').should('contain.text', '1 selected');
+  });
+
+  it('keeps an explicit tokens-per-dollar metric next to a power tier filter', () => {
+    visitCertifiedPowerChart(
+      '&i_metric=y_tokensPerDollarH&i_power=certified',
+      powerBenchmarks,
+      '/infx/inference',
+    );
+
+    cy.location('pathname').should('eq', '/infx/inference');
+    cy.get('[data-testid="yaxis-metric-selector"]').should('contain.text', TOKENS_PER_DOLLAR_TITLE);
+    assertChartTitle(TOKENS_PER_DOLLAR_TITLE);
+    assertShareLinkParams({ i_metric: null, i_power: 'certified' });
+  });
+
+  it('uses Optimal Only for measured markers while preserving the power boundary', () => {
+    const curveBenchmarks = powerBenchmarks.map((row) => ({
+      ...row,
+      metrics: {
+        ...row.metrics,
+        avg_power_w: row.metrics.avg_power_w + (row.conc === 64 ? 100 : row.conc === 128 ? 50 : 0),
+      },
+    }));
+    const powerView = '&i_metric=y_measuredAvgPower&i_best=0';
+    visitCertifiedPowerChart(`${powerView}&i_optimal=1`, curveBenchmarks);
+    cy.get('#scatter-hide-non-optimal').should('have.attr', 'data-state', 'checked');
+    expectVisiblePowerPoints(4);
+
+    cy.get<SVGSVGElement>('[data-testid="d3-chart-svg"]').should(($svg) => {
+      const svg = $svg[0];
+      expect(svg.getBoundingClientRect().width, 'chart matches its container width').to.equal(
+        svg.parentElement!.getBoundingClientRect().width,
+      );
+    });
+    cy.get<SVGPathElement & { __transition?: Record<string, { name?: string }> }>('.roofline-path')
+      .should('have.length', 2)
+      .should(($curves) => {
+        for (const curve of $curves) {
+          expect(
+            Object.values(curve.__transition ?? {}).some(
+              (schedule) => schedule.name === 'data-update',
+            ),
+            'initial curve transition is complete',
+          ).to.equal(false);
+        }
+      })
+      .then(($curves) => {
+        const geometry = Array.from($curves, (curve) => curve.getAttribute('d'));
+        expect(geometry.every((path) => path && !path.includes('NaN'))).to.equal(true);
+
+        cy.get('#scatter-hide-non-optimal').click();
+        expectVisiblePowerPoints(6);
+        cy.get('#scatter-hide-non-optimal').should('have.attr', 'data-state', 'unchecked');
+        cy.get<SVGPathElement>('.roofline-path').should(($current) => {
+          expect(Array.from($current, (curve) => curve.getAttribute('d'))).to.deep.equal(geometry);
+        });
+
+        cy.get('#scatter-hide-non-optimal').click();
+        expectVisiblePowerPoints(4);
+        cy.get<SVGPathElement>('.roofline-path').should(($current) => {
+          expect(Array.from($current, (curve) => curve.getAttribute('d'))).to.deep.equal(geometry);
+        });
+      });
+
+    visitCertifiedPowerChart(`${powerView}&i_optimal=0`, curveBenchmarks);
+    cy.get('#scatter-hide-non-optimal').should('have.attr', 'data-state', 'unchecked');
+    expectVisiblePowerPoints(6);
+  });
+});

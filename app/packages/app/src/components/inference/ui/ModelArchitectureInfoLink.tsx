@@ -1,0 +1,77 @@
+'use client';
+
+import Link from 'next/link';
+
+import { track } from '@/lib/analytics/analytics';
+import { Badge } from '@/components/ui/badge';
+import { TooltipContent, TooltipRoot, TooltipTrigger } from '@/components/ui/tooltip';
+import { getModelSlugEntryForDisplayName } from '@/lib/compare/compare-slug';
+import { formatParamCount, getModelArchitecture } from '@/lib/catalog/model-architectures';
+import { type Model, getModelLabel } from '@/lib/catalog/data-mappings';
+import { localePath } from '@/lib/i18n/i18n';
+
+export function ModelArchitectureInfoLink({
+  model,
+  locale,
+}: {
+  model: Model;
+  locale: 'en' | 'zh';
+}) {
+  const entry = getModelSlugEntryForDisplayName(model);
+  const arch = getModelArchitecture(model);
+  // Pending model registrations have routes but no sourced architecture article.
+  if (!entry || !arch) return null;
+  const label = getModelLabel(model);
+  const text =
+    locale === 'zh' ? `了解 ${label} 模型架构` : `Learn more about the ${label} architecture`;
+  return (
+    <TooltipRoot>
+      <TooltipTrigger asChild>
+        <Link
+          href={`https://inferencex.semianalysis.com${localePath(`/model/${entry.slug}`, locale)}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          aria-label={text}
+          data-testid="model-architecture-link"
+          className="border-input flex size-9 shrink-0 items-center justify-center rounded-md border bg-transparent text-muted-foreground shadow-xs transition-colors hover:bg-muted/50 hover:text-foreground"
+          onClick={() => track('model_architecture_link_clicked', { model, slug: entry.slug })}
+        >
+          <svg
+            className="size-4"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+          >
+            <rect x="3" y="3" width="18" height="18" rx="2" />
+            <line x1="3" y1="9" x2="21" y2="9" />
+            <line x1="9" y1="9" x2="9" y2="21" />
+          </svg>
+        </Link>
+      </TooltipTrigger>
+      <TooltipContent
+        side="top"
+        collisionPadding={10}
+        className="z-[130]"
+        data-testid="model-architecture-tooltip"
+      >
+        <span className="flex flex-wrap items-center gap-1.5">
+          {text}
+          {arch && (
+            <span className="flex items-center gap-1.5">
+              <Badge variant="outline" className="text-xs py-0">
+                {arch.architectureType === 'moe' ? 'MoE' : 'Dense'}
+              </Badge>
+              <Badge variant="outline" className="text-xs py-0">
+                {arch.attentionType === 'AlternatingSinkGQA' ? 'Sink/Full GQA' : arch.attentionType}
+              </Badge>
+              <Badge variant="outline" className="text-xs py-0">
+                {formatParamCount(arch.totalParams)}
+              </Badge>
+            </span>
+          )}
+        </span>
+      </TooltipContent>
+    </TooltipRoot>
+  );
+}

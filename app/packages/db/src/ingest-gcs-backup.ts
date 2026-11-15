@@ -1,0 +1,848 @@
+import fs from 'fs';
+import path from 'path';
+
+import { confirm, hasNoSslFlag, hasYesFlag } from './cli-utils';
+import { createAdminSql } from './etl/db-utils';
+import {
+  applyChangelogBackfills,
+  applyRunFrameworkOverridesToChangelogs,
+  planBenchmarkPoint,
+  PURGED_RUNS,
+  validateRunBackfills,
+} from './etl/run-overrides';
+import { createSkipTracker, type Skips } from './etl/skip-tracker';
+import { printIngestSummaryFooter } from './etl/ingest-summary';
+import { GPU_KEYS, parseIslOsl } from './etl/normalizers';
+import { createConfigCache } from './etl/config-cache';
+import { createWorkflowRunServices, type GithubRunInfo } from './etl/workflow-run';
+import { mapBenchmarkRow, type BenchmarkParams } from './etl/benchmark-mapper';
+import {
+  bulkIngestBenchmarkRows,
+  bulkIngestRunStats,
+  bulkUpsertAvailability,
+  insertServerLogFiles,
+} from './etl/benchmark-ingest';
+import { mapEvalRow, mapAggEvalRow, type EvalParams } from './etl/eval-mapper';
+import { ingestEvalRow } from './etl/eval-ingest';
+import { mapEvalSamples } from './etl/eval-samples-mapper';
+import { bulkIngestEvalSamples } from './etl/eval-samples-ingest';
+import {
+  parseChangelogEntries,
+  ingestChangelogEntries,
+  hasAppendOnlyFlag,
+  hasEvalsOnlyFlag,
+} from './etl/changelog-ingest';
+import { readZipJson, readZipJsonAndText, readZipJsonMap } from './etl/zip-reader';
+import { readServerLogArtifactZip, serverLogArtifactSuffix } from './etl/server-log-artifacts';
+
+const GCS_DIR = path.join(import.meta.dirname, '..', '..', '..', 'gcs');
+const CONCURRENCY = 20;
+const DB_CONCURRENCY = 10;
+
+const sql = createAdminSql({
+  noSsl: hasNoSslFlag(),
+  max: 20,
+  idle_timeout: 60,
+});
+
+type ChangelogEntry = ReturnType<typeof parseChangelogEntries>[number];
+
+interface WorkflowMapResult {
+  dateDir: string;
+  workflowDir: string;
+  githubRunId: number;
+  runName: string;
+  headBranch: string | undefined;
+  headSha: string | undefined;
+  createdAt: string;
+  ghInfo: GithubRunInfo | null;
+  bmkZips: {
+    zipFile: string;
+    rows: BenchmarkParams[];
+    serverLogArtifact?: { zipPath: string; artifactName: string };
+  }[];
+  statsRows: { hardware: string; nSuccess: number; total: number }[];
+  evalRows: { params: EvalParams; samplesText: string | null }[];
+  changelogs: { baseRef: string; headRef: string; entries: ChangelogEntry[] }[];
+  evalsOnly: boolean;
+  localSkips: Omit<Skips, 'dbError' | 'telemetryError'>;
+  localUnmappedModels: Set<string>;
+  localUnmappedHws: Set<string>;
+  warnings: string[];
+}
+
+interface WriteResult {
+  newBmk: number;
+  dupBmk: number;
+  newStats: number;
+  dupStats: number;
+  evals: number;
+  evalSamples: number;
+  changelogs: number;
+  warnings: string[];
+  localSkips: Omit<Skips, 'dbError' | 'telemetryError'>;
+  localUnmappedModels: string[];
+  localUnmappedHws: string[];
+}
+
+async function pMap<T, R>(
+  items: T[],
+  fn: (item: T) => Promise<R | null>,
+  concurrency: number,
+  failOnError = false,
+): Promise<(R | null)[]> {
+  const results: (R | null)[] = Array.from({ length: items.length }, () => null);
+  const errors: Error[] = [];
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      try {
+        results[i] = await fn(items[i]);
+      } catch (error: any) {
+        console.error(`  [ERROR] mapping task ${i} failed: ${error.message}`);
+        errors.push(error instanceof Error ? error : new Error(String(error)));
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  if (failOnError && errors.length > 0) {
+    throw new Error(`${errors.length} restore task(s) failed; first error: ${errors[0].message}`);
+  }
+  return results;
+}
+
+async function mapWorkflowDir(
+  dateDir: string,
+  workflowDir: string,
+  datePath: string,
+  fetchGithubRun: (id: number) => Promise<GithubRunInfo | null>,
+): Promise<WorkflowMapResult | null> {
+  const artifactsPath = path.join(datePath, workflowDir, 'artifacts');
+  if (!fs.existsSync(artifactsPath)) return null;
+
+  let githubRunId: number | null = null;
+  let headBranch: string | undefined;
+  let headSha: string | undefined;
+  let createdAt = `${dateDir}T00:00:00Z`;
+
+  const artifactCreatedAt = new Map<number, string>();
+  const metaPath = path.join(artifactsPath, 'artifacts_metadata.json');
+  if (fs.existsSync(metaPath)) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      if (Array.isArray(meta)) {
+        for (const a of meta) {
+          if (typeof a?.id === 'number' && typeof a?.created_at === 'string') {
+            artifactCreatedAt.set(a.id, a.created_at);
+          }
+        }
+        if (meta[0]?.workflow_run?.id) {
+          githubRunId = meta[0].workflow_run.id;
+          headBranch = meta[0].workflow_run.head_branch ?? undefined;
+          headSha = meta[0].workflow_run.head_sha ?? undefined;
+          createdAt = meta[0].created_at ?? createdAt;
+        }
+      }
+    } catch {}
+  }
+  if (!githubRunId) {
+    const match = workflowDir.match(/_(?<runId>\d{10,})$/u);
+    if (match) githubRunId = parseInt(match[1], 10);
+  }
+  if (!githubRunId) {
+    console.warn(`  [${dateDir}] no run ID found for: ${workflowDir.slice(0, 60)}`);
+    return null;
+  }
+  if (PURGED_RUNS.has(githubRunId)) {
+    console.log(`  [${dateDir}] skipping ignored run ${githubRunId}`);
+    return null;
+  }
+
+  const zipFiles = fs.readdirSync(artifactsPath).filter((f) => f.endsWith('.zip'));
+  const bmkZipFiles = zipFiles.filter((f) => f.startsWith('bmk_'));
+  const resultZips = zipFiles.filter((f) => f.startsWith('results_'));
+  const statsZips = zipFiles.filter(
+    (f) => f.startsWith('run-stats_') || f.startsWith('run_stats_'),
+  );
+  const evalAggZips = zipFiles.filter((f) => f.startsWith('eval_results_all_'));
+  const evalZips = zipFiles.filter(
+    (f) => f.startsWith('eval_') && !f.startsWith('eval_results_all_'),
+  );
+  const changelogZips = zipFiles.filter((f) => f.startsWith('changelog-metadata_'));
+  const serverLogZips = zipFiles.filter(
+    (f) => f.startsWith('server_logs_') || f.startsWith('multinode_server_logs_'),
+  );
+
+  if (
+    bmkZipFiles.length +
+      resultZips.length +
+      statsZips.length +
+      evalAggZips.length +
+      evalZips.length +
+      changelogZips.length ===
+    0
+  )
+    return null;
+
+  const islOslFallback = parseIslOsl(workflowDir);
+  const runName =
+    workflowDir
+      .replace(/_\d{10,}$/u, '')
+      .replaceAll('_', ' ')
+      .trim() || `Run ${githubRunId}`;
+
+  const ghInfo = await fetchGithubRun(githubRunId);
+
+  const local = createSkipTracker();
+  const warnings: string[] = [];
+
+  const serverLogArtifacts = new Map<string, { zipPath: string; artifactName: string }>();
+  for (const zipFile of serverLogZips) {
+    const artifactName = zipFile.replace(/_\d+_\d+\.zip$/u, '');
+    const configKey = serverLogArtifactSuffix(artifactName);
+    if (!configKey) continue;
+    serverLogArtifacts.set(configKey, {
+      zipPath: path.join(artifactsPath, zipFile),
+      artifactName,
+    });
+  }
+
+  const sortedBmkZips = [...bmkZipFiles].toSorted((a, b) => {
+    const idA = a.match(/_(?<artifactId>\d{10,})\.zip$/u)?.[1];
+    const idB = b.match(/_(?<artifactId>\d{10,})\.zip$/u)?.[1];
+    const tsA = idA ? (artifactCreatedAt.get(Number(idA)) ?? '') : '';
+    const tsB = idB ? (artifactCreatedAt.get(Number(idB)) ?? '') : '';
+    return tsA.localeCompare(tsB);
+  });
+
+  const bmkSources = sortedBmkZips.length > 0 ? sortedBmkZips : resultZips;
+
+  const bmkZips: WorkflowMapResult['bmkZips'] = [];
+  for (const zipFile of bmkSources) {
+    const allJsons = readZipJsonMap(path.join(artifactsPath, zipFile));
+    if (!allJsons || allJsons.size === 0) {
+      local.skips.badZip++;
+      warnings.push(`  [WARN] ${dateDir}/${zipFile}: bad/empty zip — skipped`);
+      continue;
+    }
+    const rawRows: Record<string, any>[] = [];
+    for (const data of allJsons.values()) {
+      if (Array.isArray(data)) rawRows.push(...data);
+      else if (typeof data === 'object' && data !== null) rawRows.push(data as Record<string, any>);
+    }
+    const snap = local.snapshot();
+    const rows: BenchmarkParams[] = [];
+    for (const row of rawRows) {
+      if (typeof row !== 'object' || row === null) {
+        local.skips.badZip++;
+        continue;
+      }
+      const mapped = mapBenchmarkRow(row, local, islOslFallback, githubRunId);
+      if (mapped) rows.push(mapped);
+    }
+    const d = local.diff(snap);
+    if (d.droppedModel + d.droppedHw + d.droppedIslOsl > 0) {
+      const parts: string[] = [];
+      if (d.droppedModel)
+        parts.push(`unmapped model (${d.newModels.join(', ')}): ${d.droppedModel}`);
+      if (d.droppedHw) parts.push(`unmapped hw (${d.newHws.join(', ')}): ${d.droppedHw}`);
+      if (d.droppedIslOsl) parts.push(`no isl/osl: ${d.droppedIslOsl}`);
+      warnings.push(
+        `  [WARN] ${dateDir}/${zipFile}: ${d.droppedModel + d.droppedHw + d.droppedIslOsl} rows dropped — ${parts.join('; ')}`,
+      );
+    }
+    if (rows.length > 0) {
+      let serverLogArtifact: { zipPath: string; artifactName: string } | undefined;
+      if (zipFile.startsWith('bmk_')) {
+        const bmkConfigKey = zipFile.replace(/^bmk_/u, '').replace(/_\d+_\d+\.zip$/u, '');
+        serverLogArtifact =
+          serverLogArtifacts.get(bmkConfigKey) ??
+          serverLogArtifacts.get(bmkConfigKey.replace(/^agentic_/u, ''));
+      }
+      bmkZips.push({ zipFile, rows, serverLogArtifact });
+    }
+  }
+
+  const statsRows: WorkflowMapResult['statsRows'] = [];
+  for (const zipFile of statsZips) {
+    const data = readZipJson(path.join(artifactsPath, zipFile));
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      local.skips.badZip++;
+      warnings.push(`  [WARN] ${dateDir}/${zipFile}: bad/empty zip — skipped`);
+      continue;
+    }
+    for (const [hwKey, stats] of Object.entries(data as Record<string, any>)) {
+      if (!GPU_KEYS.has(hwKey)) continue;
+      if (typeof stats?.n_success !== 'number' || typeof stats?.total !== 'number') continue;
+      statsRows.push({
+        hardware: hwKey,
+        nSuccess: stats.n_success,
+        total: stats.total,
+      });
+    }
+  }
+
+  const evalRows: WorkflowMapResult['evalRows'] = [];
+  for (const zipFile of evalZips) {
+    const zipPath = path.join(artifactsPath, zipFile);
+    const contents = readZipJsonAndText(
+      zipPath,
+      (name) => name.startsWith('samples_') && name.endsWith('.jsonl'),
+    );
+    if (!contents) {
+      local.skips.badZip++;
+      warnings.push(`  [WARN] ${dateDir}/${zipFile}: bad/empty zip — skipped`);
+      continue;
+    }
+    const { jsonFiles: files, textFiles: sampleTexts } = contents;
+    const meta = files.get('meta_env.json') as Record<string, any> | undefined;
+    const resultsEntry = [...files.entries()].find(
+      ([k]) => k.startsWith('results_') && k.endsWith('.json'),
+    );
+    if (!meta || !resultsEntry) {
+      local.skips.badZip++;
+      warnings.push(
+        `  [WARN] ${dateDir}/${zipFile}: missing meta_env.json or results_*.json — skipped`,
+      );
+      continue;
+    }
+    const results = resultsEntry[1] as Record<string, any> | null;
+    if (!results) {
+      local.skips.badZip++;
+      warnings.push(`  [WARN] ${dateDir}/${zipFile}: results JSON unparsable — skipped`);
+      continue;
+    }
+    const snap = local.snapshot();
+    const mapped = mapEvalRow(meta, results, local, githubRunId);
+    if (mapped.length === 0) {
+      const d = local.diff(snap);
+      const parts: string[] = [];
+      if (d.droppedModel)
+        parts.push(`unmapped model: ${meta.infmax_model_prefix ?? meta.model ?? '?'}`);
+      if (d.droppedHw) parts.push(`unmapped hw: ${meta.hw ?? '?'}`);
+      warnings.push(
+        `  [WARN] ${dateDir}/${zipFile}: eval row dropped — ${parts.join('; ') || 'empty task results'}`,
+      );
+      continue;
+    }
+
+    const samplesByTask = new Map<string, string>();
+    for (const [name, text] of sampleTexts) {
+      const m = name.match(/^samples_(?<task>.+?)_[^_]+\.jsonl$/u);
+      if (m) samplesByTask.set(m[1].toLowerCase(), text);
+    }
+
+    for (const params of mapped) {
+      evalRows.push({
+        params,
+        samplesText: samplesByTask.get(params.task) ?? null,
+      });
+    }
+  }
+
+  for (const zipFile of evalAggZips) {
+    const contents = readZipJsonAndText(path.join(artifactsPath, zipFile));
+    if (!contents) {
+      local.skips.badZip++;
+      warnings.push(`  [WARN] ${dateDir}/${zipFile}: bad/empty zip — skipped`);
+      continue;
+    }
+    const files = contents.jsonFiles;
+    const agg = files.get('agg_eval_all.json');
+    if (!Array.isArray(agg)) {
+      local.skips.badZip++;
+      warnings.push(`  [WARN] ${dateDir}/${zipFile}: missing agg_eval_all.json — skipped`);
+      continue;
+    }
+    for (const row of agg) {
+      if (typeof row !== 'object' || row === null) continue;
+      const snap = local.snapshot();
+      const mapped = mapAggEvalRow(row as Record<string, any>, local, githubRunId);
+      if (!mapped) {
+        const d = local.diff(snap);
+        const parts: string[] = [];
+        if (d.droppedModel) parts.push(`unmapped model: ${(row as any).model ?? '?'}`);
+        if (d.droppedHw) parts.push(`unmapped hw: ${(row as any).hw ?? '?'}`);
+        warnings.push(
+          `  [WARN] ${dateDir}/${zipFile}: agg eval row dropped — ${parts.join('; ') || 'mapping failed'}`,
+        );
+        continue;
+      }
+      evalRows.push({ params: mapped, samplesText: null });
+    }
+  }
+
+  const newestChangelogZip = [...changelogZips]
+    .toSorted((a, b) => {
+      const idA = a.match(/_(?<artifactId>\d+)\.zip$/u)?.[1];
+      const idB = b.match(/_(?<artifactId>\d+)\.zip$/u)?.[1];
+      const tsA = idA ? (artifactCreatedAt.get(Number(idA)) ?? '') : '';
+      const tsB = idB ? (artifactCreatedAt.get(Number(idB)) ?? '') : '';
+      return tsA.localeCompare(tsB) || Number(idA ?? 0) - Number(idB ?? 0);
+    })
+    .at(-1);
+  const changelogs: WorkflowMapResult['changelogs'] = [];
+  for (const zipFile of newestChangelogZip ? [newestChangelogZip] : []) {
+    const data = readZipJson(path.join(artifactsPath, zipFile)) as Record<string, any> | null;
+    if (!data || typeof data !== 'object') {
+      local.skips.badZip++;
+      warnings.push(`  [WARN] ${dateDir}/${zipFile}: bad/empty zip — skipped`);
+      continue;
+    }
+    const baseRef = String(data.base_ref ?? '');
+    const headRef = String(data.head_ref ?? '');
+    if (!baseRef || !headRef) continue;
+    const entries = parseChangelogEntries(data.entries);
+    if (entries.length > 0) changelogs.push({ baseRef, headRef, entries });
+  }
+
+  const backfilledChangelogs = applyChangelogBackfills(githubRunId, ghInfo?.runAttempt, changelogs);
+  for (const backfillId of backfilledChangelogs.backfillIds) {
+    warnings.push(`  [${dateDir}] applied changelog backfill ${backfillId}`);
+  }
+  const correctedChangelogs = applyRunFrameworkOverridesToChangelogs(
+    githubRunId,
+    backfilledChangelogs.changelogs,
+  );
+  for (const overrideId of correctedChangelogs.overrideIds) {
+    warnings.push(
+      `  [${dateDir}] applied run framework override ${overrideId} to changelog config keys`,
+    );
+  }
+  const evalsOnly = hasEvalsOnlyFlag(correctedChangelogs.changelogs);
+  if (evalsOnly) {
+    console.log(
+      `  [${dateDir}] evals-only run ${githubRunId} — skipping ${bmkZips.length} benchmark ZIP(s) and ${statsRows.length} stats row(s)`,
+    );
+  }
+
+  return {
+    dateDir,
+    workflowDir,
+    githubRunId,
+    runName,
+    headBranch,
+    headSha,
+    createdAt,
+    ghInfo,
+    bmkZips: evalsOnly ? [] : bmkZips,
+    statsRows: evalsOnly ? [] : statsRows,
+    evalRows,
+    changelogs: correctedChangelogs.changelogs,
+    evalsOnly,
+    localSkips: {
+      badZip: local.skips.badZip,
+      unmappedModel: local.skips.unmappedModel,
+      unmappedHw: local.skips.unmappedHw,
+      noIslOsl: local.skips.noIslOsl,
+      failedRun: local.skips.failedRun,
+      traceReplayMissing: local.skips.traceReplayMissing,
+    },
+    localUnmappedModels: new Set(local.unmappedModels),
+    localUnmappedHws: new Set(local.unmappedHws),
+    warnings,
+  };
+}
+
+async function main(): Promise<void> {
+  validateRunBackfills();
+  const githubToken = process.env.GITHUB_TOKEN;
+  if (!githubToken) {
+    console.error('  ERROR: GITHUB_TOKEN is not set (needed to read run metadata from GitHub)');
+    process.exit(1);
+  }
+  console.log('=== db:ingest:gcs ===');
+  console.log(
+    'This will ingest all GCS backup ZIP artifacts into the database.\n' +
+      'Inserts are idempotent (ON CONFLICT), so re-running is safe.\n',
+  );
+  console.log(`  GCS_DIR:     ${GCS_DIR}`);
+  console.log(`  CONCURRENCY: ${CONCURRENCY} (phase1), ${DB_CONCURRENCY} (phase2)\n`);
+
+  if (!hasYesFlag()) {
+    const ok = await confirm('Continue? (y/N) ');
+    if (!ok) {
+      console.log('Aborted.');
+      return;
+    }
+  }
+
+  if (!fs.existsSync(GCS_DIR)) {
+    console.error(`  ERROR: GCS_DIR not found: ${GCS_DIR}`);
+    process.exit(1);
+  }
+
+  const tracker = createSkipTracker();
+  const configCache = createConfigCache(sql);
+  const { getOrCreateConfig, preloadConfigs } = configCache;
+  const { fetchGithubRun, getOrCreateWorkflowRun } = createWorkflowRunServices(sql, githubToken);
+
+  await preloadConfigs();
+  console.log(`  ${configCache.size} configs preloaded`);
+
+  const dateDirs = fs
+    .readdirSync(GCS_DIR)
+    .filter((d) => /^\d{4}-\d{2}-\d{2}$/u.test(d))
+    .toSorted();
+  console.log(`  ${dateDirs.length} date directories  (${dateDirs[0]} → ${dateDirs.at(-1)})`);
+
+  interface Task {
+    dateDir: string;
+    workflowDir: string;
+    datePath: string;
+  }
+  const tasks: Task[] = [];
+  for (const dateDir of dateDirs) {
+    const datePath = path.join(GCS_DIR, dateDir);
+    for (const workflowDir of fs
+      .readdirSync(datePath)
+      .filter((d) => fs.statSync(path.join(datePath, d)).isDirectory())) {
+      tasks.push({ dateDir, workflowDir, datePath });
+    }
+  }
+
+  process.stdout.write(`\n  Phase 1: mapping ${tasks.length} workflow dirs...`);
+  const phase1Start = Date.now();
+  const rawResults = await pMap(
+    tasks,
+    ({ dateDir, workflowDir, datePath }) =>
+      mapWorkflowDir(dateDir, workflowDir, datePath, fetchGithubRun),
+    CONCURRENCY,
+  );
+  console.log(` ${Math.round((Date.now() - phase1Start) / 1000)}s`);
+
+  const byDate = new Map<string, WorkflowMapResult[]>();
+  for (const result of rawResults) {
+    if (!result) continue;
+    const arr = byDate.get(result.dateDir) ?? [];
+    arr.push(result);
+    byDate.set(result.dateDir, arr);
+  }
+
+  const phase2Start = Date.now();
+
+  let totalNewBmk = 0,
+    totalDupBmk = 0;
+  let totalNewStats = 0,
+    totalDupStats = 0;
+  let totalEvals = 0,
+    totalEvalSamples = 0,
+    totalChangelogs = 0;
+
+  async function writeWorkflowResult(result: WorkflowMapResult): Promise<WriteResult> {
+    const wr: WriteResult = {
+      newBmk: 0,
+      dupBmk: 0,
+      newStats: 0,
+      dupStats: 0,
+      evals: 0,
+      evalSamples: 0,
+      changelogs: 0,
+      warnings: result.warnings,
+      localSkips: result.localSkips,
+      localUnmappedModels: [...result.localUnmappedModels],
+      localUnmappedHws: [...result.localUnmappedHws],
+    };
+
+    const workflowRunId = await getOrCreateWorkflowRun({
+      githubRunId: result.githubRunId,
+      name: result.runName,
+      date: result.dateDir,
+      headBranch: result.headBranch,
+      headSha: result.headSha,
+      createdAt: result.createdAt,
+      appendOnly: hasAppendOnlyFlag(result.changelogs),
+      ghInfo: result.ghInfo,
+    });
+    if (workflowRunId === null) return wr;
+
+    const allInserted: (BenchmarkParams & { configId: number })[] = [];
+    const seenPointIdentities = new Map<string, string>();
+    for (const { zipFile, rows, serverLogArtifact } of result.bmkZips) {
+      const toInsert: (BenchmarkParams & { configId: number })[] = [];
+      for (const row of rows) {
+        let configId: number;
+        try {
+          configId = await getOrCreateConfig(row.config);
+        } catch (error: any) {
+          tracker.recordDbError('config', zipFile, error);
+          continue;
+        }
+        const plan = planBenchmarkPoint(
+          { githubRunId: result.githubRunId, runAttempt: result.ghInfo?.runAttempt },
+          { ...row, configId },
+          seenPointIdentities,
+        );
+        if (plan.kind === 'purged') {
+          console.log(
+            `  [${result.dateDir}] skipped purged benchmark point: config ${configId}, ` +
+              `${row.benchmarkType}, isl ${row.isl}, osl ${row.osl}, conc ${row.conc}, ` +
+              `offload ${row.offloadMode}, recipe ${row.recipeFingerprint ?? 'legacy'}`,
+          );
+          continue;
+        }
+        if (plan.backfillId) {
+          console.log(
+            `  [${result.dateDir}] applied benchmark point backfill ` +
+              `${plan.backfillId}: config ${configId}, conc ${row.conc}`,
+          );
+        }
+        toInsert.push(
+          plan.point.config === row.config
+            ? plan.point
+            : { ...plan.point, configId: await getOrCreateConfig(plan.point.config) },
+        );
+      }
+      if (toInsert.length > 0) {
+        try {
+          const { newCount, dupCount, insertedIds } = await bulkIngestBenchmarkRows(
+            sql,
+            toInsert,
+            workflowRunId,
+            result.dateDir,
+          );
+          wr.newBmk += newCount;
+          wr.dupBmk += dupCount;
+
+          allInserted.push(...toInsert);
+
+          if (serverLogArtifact && insertedIds.length > 0) {
+            const logFiles = await readServerLogArtifactZip(
+              serverLogArtifact.zipPath,
+              serverLogArtifact.artifactName,
+            );
+            await insertServerLogFiles(sql, insertedIds, logFiles);
+          }
+        } catch (error: any) {
+          tracker.recordDbError('benchmark', zipFile, error);
+        }
+      }
+    }
+
+    const availRows: {
+      model: string;
+      isl: number | null;
+      osl: number | null;
+      precision: string;
+      hardware: string;
+      framework: string;
+      specMethod: string;
+      disagg: boolean;
+      benchmarkType: string;
+    }[] = [];
+    for (const r of allInserted) {
+      availRows.push({
+        model: r.config.model,
+        isl: r.isl,
+        osl: r.osl,
+        precision: r.config.precision,
+        hardware: r.config.hardware,
+        framework: r.config.framework,
+        specMethod: r.config.specMethod,
+        disagg: r.config.disagg,
+        benchmarkType: r.benchmarkType,
+      });
+    }
+    if (availRows.length > 0) {
+      try {
+        await bulkUpsertAvailability(sql, availRows, result.dateDir);
+      } catch (error: any) {
+        tracker.recordDbError('availability', `${availRows.length} row(s)`, error);
+      }
+    }
+
+    if (result.statsRows.length > 0) {
+      try {
+        const { newCount, dupCount } = await bulkIngestRunStats(
+          sql,
+          result.statsRows,
+          workflowRunId,
+          result.dateDir,
+        );
+        wr.newStats += newCount;
+        wr.dupStats += dupCount;
+      } catch (error: any) {
+        tracker.recordDbError('run_stats', `${result.statsRows.length} row(s)`, error);
+      }
+    }
+
+    for (const { params, samplesText } of result.evalRows) {
+      try {
+        const configId = await getOrCreateConfig(params.config);
+        const { outcome, id: evalResultId } = await ingestEvalRow(
+          sql,
+          configId,
+          params,
+          workflowRunId,
+          result.dateDir,
+        );
+        if (outcome === 'new') wr.evals++;
+
+        if (samplesText) {
+          const samples = mapEvalSamples(samplesText, tracker);
+          if (samples.length > 0) {
+            const { newCount } = await bulkIngestEvalSamples(sql, evalResultId, samples);
+            wr.evalSamples += newCount;
+          }
+        }
+      } catch (error: any) {
+        tracker.recordDbError('eval', `run ${result.githubRunId} ${params.task}`, error);
+      }
+    }
+
+    for (const { baseRef, headRef, entries } of result.changelogs) {
+      try {
+        const written = await ingestChangelogEntries(
+          sql,
+          workflowRunId,
+          result.dateDir,
+          baseRef,
+          headRef,
+          entries,
+        );
+        wr.changelogs += written;
+      } catch (error: any) {
+        tracker.recordDbError('changelog', `${baseRef}..${headRef}`, error);
+      }
+    }
+
+    return wr;
+  }
+
+  const allResults = [...byDate.values()].flat();
+  let writesDone = 0;
+  const writeOutputs = await pMap(
+    allResults,
+    async (r) => {
+      const out = await writeWorkflowResult(r);
+      writesDone++;
+      process.stdout.write(`\r  Phase 2: writing to DB... ${writesDone}/${allResults.length}`);
+      return out;
+    },
+    DB_CONCURRENCY,
+    true,
+  );
+
+  interface DateTotal {
+    newBmk: number;
+    dupBmk: number;
+    newStats: number;
+    dupStats: number;
+    evals: number;
+    evalSamples: number;
+    changelogs: number;
+    warnings: string[];
+  }
+  const dateTotals = new Map<string, DateTotal>();
+  for (let i = 0; i < allResults.length; i++) {
+    const result = allResults[i];
+    const wr = writeOutputs[i];
+    if (!wr) continue;
+
+    tracker.skips.badZip += wr.localSkips.badZip;
+    tracker.skips.unmappedModel += wr.localSkips.unmappedModel;
+    tracker.skips.unmappedHw += wr.localSkips.unmappedHw;
+    tracker.skips.noIslOsl += wr.localSkips.noIslOsl;
+    for (const m of wr.localUnmappedModels) tracker.unmappedModels.add(m);
+    for (const h of wr.localUnmappedHws) tracker.unmappedHws.add(h);
+
+    totalNewBmk += wr.newBmk;
+    totalDupBmk += wr.dupBmk;
+    totalNewStats += wr.newStats;
+    totalDupStats += wr.dupStats;
+    totalEvals += wr.evals;
+    totalEvalSamples += wr.evalSamples;
+    totalChangelogs += wr.changelogs;
+
+    const acc: DateTotal = dateTotals.get(result.dateDir) ?? {
+      newBmk: 0,
+      dupBmk: 0,
+      newStats: 0,
+      dupStats: 0,
+      evals: 0,
+      evalSamples: 0,
+      changelogs: 0,
+      warnings: [],
+    };
+    acc.newBmk += wr.newBmk;
+    acc.dupBmk += wr.dupBmk;
+    acc.newStats += wr.newStats;
+    acc.dupStats += wr.dupStats;
+    acc.evals += wr.evals;
+    acc.evalSamples += wr.evalSamples;
+    acc.changelogs += wr.changelogs;
+    acc.warnings.push(...wr.warnings);
+    dateTotals.set(result.dateDir, acc);
+  }
+
+  console.log('\n');
+  for (const dateDir of dateDirs) {
+    const acc = dateTotals.get(dateDir);
+    if (!acc) continue;
+    for (const w of acc.warnings) console.warn(w);
+    const parts: string[] = [];
+    if (acc.newBmk + acc.dupBmk > 0) {
+      parts.push(acc.dupBmk > 0 ? `+${acc.newBmk} bmk (${acc.dupBmk} dup)` : `+${acc.newBmk} bmk`);
+    }
+    if (acc.newStats + acc.dupStats > 0) {
+      parts.push(
+        acc.dupStats > 0
+          ? `+${acc.newStats} stats (${acc.dupStats} dup)`
+          : `+${acc.newStats} stats`,
+      );
+    }
+    if (acc.evals > 0) parts.push(`+${acc.evals} eval`);
+    if (acc.evalSamples > 0) parts.push(`+${acc.evalSamples} samples`);
+    if (acc.changelogs > 0) parts.push(`+${acc.changelogs} changelog`);
+    if (parts.length > 0) console.log(`  ${dateDir}  ${parts.join('  ')}`);
+  }
+
+  console.log(` ${Math.round((Date.now() - phase2Start) / 1000)}s\n`);
+
+  console.log('\n=== Maintenance ===');
+
+  process.stdout.write('  Vacuuming tables...');
+  const vacuumEnd = Date.now();
+  await sql.unsafe('VACUUM FULL benchmark_results, run_stats');
+  console.log(` ${Math.round((Date.now() - vacuumEnd) / 1000)}s done`);
+
+  const [configCount] = await sql`select count(*)::int as n from configs`;
+  const [resultCount] = await sql`select count(*)::int as n from benchmark_results`;
+  const [statsCount] = await sql`select count(*)::int as n from run_stats`;
+  const [evalCount] = await sql`select count(*)::int as n from eval_results`;
+  const [sampleCount] = await sql`select count(*)::bigint as n from eval_samples`;
+  const [changelogCount] = await sql`select count(*)::int as n from changelog_entries`;
+
+  console.log('\n=== Summary ===');
+  console.log(
+    `  Benchmark results: ${totalNewBmk} new, ${totalDupBmk} duplicate (ON CONFLICT updates)`,
+  );
+  console.log(
+    `  Run stats:         ${totalNewStats} new, ${totalDupStats} duplicate (ON CONFLICT updates)`,
+  );
+  console.log(`  Eval results:      ${totalEvals} new`);
+  console.log(`  Eval samples:      ${totalEvalSamples} new`);
+  console.log(`  Changelog entries: ${totalChangelogs} written`);
+  printIngestSummaryFooter(
+    {
+      configs: configCount.n,
+      benchmarkResults: resultCount.n,
+      runStats: statsCount.n,
+      evalResults: evalCount.n,
+      evalSamples: sampleCount.n,
+      changelogEntries: changelogCount.n,
+    },
+    tracker,
+  );
+
+  console.log('\n=== db:ingest:gcs complete ===');
+  console.log('  Invalidate API cache: bun run admin:cache:invalidate');
+}
+
+main()
+  .catch((error) => {
+    console.error('ingest-gcs-backup failed:', error);
+    process.exitCode = 1;
+  })
+  .finally(() => sql.end());

@@ -1,0 +1,348 @@
+import { describe, it, expect } from 'vitest';
+import type { InferenceData } from '@/components/inference/types';
+import {
+  getParetoLabel,
+  parseLabelComponents,
+  labelSimilarity,
+  computeParetoPointLabels,
+  computeGradientStops,
+  PARETO_LABEL_COLORS,
+  buildGradientColorMap,
+  type ParetoPointLabel,
+} from './paretoLabels';
+
+const makePoint = (overrides: Partial<InferenceData> = {}): InferenceData =>
+  ({
+    x: 100,
+    y: 200,
+    tp: 8,
+    hwKey: 'h100_sxm_sglang',
+    precision: 'fp8',
+    ...overrides,
+  }) as InferenceData;
+
+describe('getParetoLabel', () => {
+  it('prefixes simple numeric tp with "TP"', () => {
+    const point = makePoint({ tp: 4 });
+    expect(getParetoLabel(point)).toBe('TP4');
+  });
+
+  it('prefixes tp=16 with "TP"', () => {
+    const point = makePoint({ tp: 16 });
+    expect(getParetoLabel(point)).toBe('TP16');
+  });
+
+  it('uses full parallelism label when ep is present', () => {
+    const point = makePoint({ tp: 4, ep: 8 });
+    const label = getParetoLabel(point);
+    expect(label).not.toBe('TP4');
+    expect(label).toContain('EP');
+  });
+
+  it('uses full parallelism label when dp_attention is present', () => {
+    const point = makePoint({ tp: 4, ep: 8, dp_attention: true });
+    const label = getParetoLabel(point);
+    expect(label).not.toBe('TP4');
+    expect(label).toContain('DPA');
+  });
+
+  it('returns exact "DEP8" when tp === ep and dp_attention is true', () => {
+    const point = makePoint({ tp: 8, ep: 8, dp_attention: true });
+    expect(getParetoLabel(point)).toBe('DEP8');
+  });
+
+  it('returns exact "TEP4" when tp === ep and dp_attention is false', () => {
+    const point = makePoint({ tp: 4, ep: 4, dp_attention: false });
+    expect(getParetoLabel(point)).toBe('TEP4');
+  });
+
+  it('returns "DPAEP16" when ep > 1, ep !== tp, dp_attention is true', () => {
+    const point = makePoint({ tp: 4, ep: 16, dp_attention: true });
+    expect(getParetoLabel(point)).toBe('DPAEP16');
+  });
+
+  it('returns "EP8" when ep > 1, ep !== tp, dp_attention is false', () => {
+    const point = makePoint({ tp: 4, ep: 8, dp_attention: false });
+    expect(getParetoLabel(point)).toBe('EP8');
+  });
+
+  it('returns "TP1" for tp=1 with no ep field', () => {
+    const point = makePoint({ tp: 1 });
+    expect(getParetoLabel(point)).toBe('TP1');
+  });
+
+  it('appends "+ CPU KV Offloading" when kv_offloading tier is set', () => {
+    const point = makePoint({ tp: 4, kv_offloading: 'dram' });
+    expect(getParetoLabel(point)).toBe('TP4 + CPU KV Offloading');
+  });
+
+  it('does not append "+ CPU KV Offloading" when kv_offloading is "none"', () => {
+    const point = makePoint({ tp: 4, kv_offloading: 'none' });
+    expect(getParetoLabel(point)).toBe('TP4');
+  });
+
+  it('appends "+ CPU KV Offloading" for legacy offload_mode="on" rows', () => {
+    const point = makePoint({ tp: 8, offload_mode: 'on' });
+    expect(getParetoLabel(point)).toBe('TP8 + CPU KV Offloading');
+  });
+
+  it('does not append "+ CPU KV Offloading" for legacy offload_mode="off" rows', () => {
+    const point = makePoint({ tp: 8, offload_mode: 'off' });
+    expect(getParetoLabel(point)).toBe('TP8');
+  });
+
+  it('appends "+ CPU KV Offloading" to full parallelism labels too', () => {
+    const point = makePoint({ tp: 8, ep: 8, dp_attention: true, kv_offloading: 'dram' });
+    expect(getParetoLabel(point)).toBe('DEP8 + CPU KV Offloading');
+  });
+
+  it('kv_offloading="none" wins over legacy offload_mode="on"', () => {
+    const point = makePoint({ tp: 4, kv_offloading: 'none', offload_mode: 'on' });
+    expect(getParetoLabel(point)).toBe('TP4');
+  });
+
+  it('handles multinode disagg format with "TP" prefix stripped', () => {
+    const point = makePoint({
+      tp: 8,
+      ep: 4,
+      is_multinode: true,
+      disagg: true,
+      prefill_tp: 4,
+      prefill_ep: 4,
+      prefill_dp_attention: false,
+      decode_tp: 8,
+      decode_ep: 8,
+      decode_dp_attention: true,
+      prefill_num_workers: 2,
+      decode_num_workers: 1,
+    });
+    const label = getParetoLabel(point);
+    expect(label).toContain('2x');
+    expect(label).toContain('+');
+    expect(label).toContain('1x');
+  });
+});
+
+describe('parseLabelComponents', () => {
+  it('parses simple TP label', () => {
+    expect(parseLabelComponents('TP8')).toEqual(['TP8']);
+  });
+
+  it('parses TEP label', () => {
+    expect(parseLabelComponents('TEP8')).toEqual(['TEP8']);
+  });
+
+  it('strips multiplier prefix', () => {
+    expect(parseLabelComponents('1xDPAEP4')).toEqual(['DPAEP4']);
+    expect(parseLabelComponents('3xTP8')).toEqual(['TP8']);
+  });
+
+  it('parses multi-node labels with "+"', () => {
+    expect(parseLabelComponents('1xDPAEP4+1xDPAEP32')).toEqual(['DPAEP4', 'DPAEP32']);
+  });
+
+  it('parses mixed multi-node labels', () => {
+    expect(parseLabelComponents('2xEP4+1xDPAEP32')).toEqual(['EP4', 'DPAEP32']);
+  });
+
+  it('parses the KV offload marker as its own component', () => {
+    expect(parseLabelComponents('TP8 + CPU KV Offloading')).toEqual(['TP8', 'CPU KV Offloading']);
+    expect(parseLabelComponents('2xEP4+1xDPAEP32 + CPU KV Offloading')).toEqual([
+      'EP4',
+      'DPAEP32',
+      'CPU KV Offloading',
+    ]);
+  });
+});
+
+describe('labelSimilarity', () => {
+  it('returns 1 for identical labels', () => {
+    expect(labelSimilarity('TP8', 'TP8')).toBe(1);
+    expect(labelSimilarity('1xDPAEP4+1xDPAEP32', '1xDPAEP4+1xDPAEP32')).toBe(1);
+  });
+
+  it('returns 0 for completely different labels', () => {
+    expect(labelSimilarity('TP8', 'TEP4')).toBe(0);
+  });
+
+  it('returns fractional value for partial overlap', () => {
+    const sim = labelSimilarity('1xDPAEP4+1xDPAEP32', '1xDPAEP4+1xDPAEP16');
+    expect(sim).toBeCloseTo(1 / 3);
+  });
+
+  it('returns partial similarity between offload-on and offload-off of the same parallelism', () => {
+    expect(labelSimilarity('TP8', 'TP8 + CPU KV Offloading')).toBeCloseTo(0.5);
+  });
+
+  it('returns higher similarity for more shared components', () => {
+    const sim1 = labelSimilarity('TP8', 'TEP4');
+    const sim2 = labelSimilarity('1xDPAEP4+1xDPAEP32', '1xDPAEP4+1xDPAEP16');
+    expect(sim2).toBeGreaterThan(sim1);
+  });
+});
+
+describe('computeParetoPointLabels', () => {
+  it('maps points to labels with colors from colorMap', () => {
+    const colorMap = new Map([
+      ['TP4', '#aaa'],
+      ['TP8', '#bbb'],
+    ]);
+    const points = [makePoint({ tp: 4, x: 10 }), makePoint({ tp: 8, x: 20 })];
+    const result = computeParetoPointLabels(points, colorMap);
+
+    expect(result).toHaveLength(2);
+    expect(result[0].label).toBe('TP4');
+    expect(result[0].color).toBe('#aaa');
+    expect(result[0].point).toBe(points[0]);
+    expect(result[1].label).toBe('TP8');
+    expect(result[1].color).toBe('#bbb');
+  });
+
+  it('falls back to #888 for unknown labels', () => {
+    const colorMap = new Map<string, string>();
+    const points = [makePoint({ tp: 99 })];
+    const result = computeParetoPointLabels(points, colorMap);
+    expect(result[0].color).toBe('#888');
+  });
+});
+
+const linearScale = (x: number) => x;
+
+const makeParetoLabel = (x: number, label: string, color: string): ParetoPointLabel => ({
+  point: makePoint({ x, y: 100 }),
+  label,
+  color,
+});
+
+describe('computeGradientStops', () => {
+  it('returns null for fewer than 2 points', () => {
+    const result = computeGradientStops([makeParetoLabel(10, 'TP4', '#aaa')], linearScale);
+    expect(result).toBeNull();
+  });
+
+  it('returns null when all labels are the same', () => {
+    const result = computeGradientStops(
+      [makeParetoLabel(10, 'TP4', '#aaa'), makeParetoLabel(20, 'TP4', '#aaa')],
+      linearScale,
+    );
+    expect(result).toBeNull();
+  });
+
+  it('returns gradient stops for two distinct labels', () => {
+    const stops = computeGradientStops(
+      [makeParetoLabel(10, 'TP4', '#aaa'), makeParetoLabel(20, 'TP8', '#bbb')],
+      linearScale,
+    );
+    expect(stops).not.toBeNull();
+    expect(stops!.length).toBeGreaterThanOrEqual(3);
+    expect(stops![0].color).toBe('#aaa');
+    expect(stops![stops!.length - 1].color).toBe('#bbb');
+    for (const stop of stops!) {
+      expect(stop.offset).toBeGreaterThanOrEqual(0);
+      expect(stop.offset).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it('returns null when x range is zero', () => {
+    const result = computeGradientStops(
+      [makeParetoLabel(10, 'TP4', '#aaa'), makeParetoLabel(10, 'TP8', '#bbb')],
+      linearScale,
+    );
+    expect(result).toBeNull();
+  });
+
+  it('handles three points with two distinct labels', () => {
+    const stops = computeGradientStops(
+      [
+        makeParetoLabel(10, 'TP4', '#aaa'),
+        makeParetoLabel(20, 'TP4', '#aaa'),
+        makeParetoLabel(30, 'TP8', '#bbb'),
+      ],
+      linearScale,
+    );
+    expect(stops).not.toBeNull();
+    expect(stops![0].color).toBe('#aaa');
+    expect(stops![stops!.length - 1].color).toBe('#bbb');
+  });
+
+  it('produces stops covering the full 0..1 range', () => {
+    const stops = computeGradientStops(
+      [
+        makeParetoLabel(10, 'TP4', '#aaa'),
+        makeParetoLabel(20, 'TP8', '#bbb'),
+        makeParetoLabel(30, 'TP16', '#ccc'),
+      ],
+      linearScale,
+    );
+    expect(stops).not.toBeNull();
+    expect(stops![0].offset).toBe(0);
+    expect(stops![stops!.length - 1].offset).toBe(1);
+    const colors = new Set(stops!.map((s) => s.color));
+    expect(colors.has('#aaa')).toBe(true);
+    expect(colors.has('#bbb')).toBe(true);
+    expect(colors.has('#ccc')).toBe(true);
+  });
+
+  it('returns null for descending-x points (paretoFrontLowerRight order)', () => {
+    const descendingPoints = [
+      makeParetoLabel(30, 'TP16', '#ccc'),
+      makeParetoLabel(20, 'TP8', '#bbb'),
+      makeParetoLabel(10, 'TP4', '#aaa'),
+    ];
+    const result = computeGradientStops(descendingPoints, linearScale);
+    expect(result).toBeNull();
+  });
+
+  it('works correctly when descending-x points are sorted to ascending before calling', () => {
+    const points = [
+      makeParetoLabel(30, 'TP16', '#ccc'),
+      makeParetoLabel(20, 'TP8', '#bbb'),
+      makeParetoLabel(10, 'TP4', '#aaa'),
+    ];
+    points.sort((a, b) => a.point.x - b.point.x);
+
+    const stops = computeGradientStops(points, linearScale);
+    expect(stops).not.toBeNull();
+    expect(stops![0].offset).toBe(0);
+    expect(stops![stops!.length - 1].offset).toBe(1);
+    expect(stops![0].color).toBe('#aaa');
+    expect(stops![stops!.length - 1].color).toBe('#ccc');
+  });
+});
+
+describe('PARETO_LABEL_COLORS', () => {
+  it('has 10 distinct colors', () => {
+    expect(PARETO_LABEL_COLORS).toHaveLength(10);
+    expect(new Set(PARETO_LABEL_COLORS).size).toBe(10);
+  });
+
+  it('all colors are valid hex strings', () => {
+    for (const color of PARETO_LABEL_COLORS) {
+      expect(color).toMatch(/^#[0-9a-f]{6}$/iu);
+    }
+  });
+});
+
+describe('buildGradientColorMap', () => {
+  const ptA = { tp: 4 } as InferenceData;
+  const ptB = { tp: 8 } as InferenceData;
+  const ptC = { tp: 16 } as InferenceData;
+
+  it('maps each point reference to its gradient color', () => {
+    const labelsByKey: Record<string, ParetoPointLabel[]> = {
+      h200_trt_fp8: [
+        { point: ptA, label: 'TP4', color: '#aaa' },
+        { point: ptB, label: 'TP8', color: '#bbb' },
+      ],
+      b200_trt_fp8: [{ point: ptC, label: 'TP16', color: '#ccc' }],
+    };
+    const map = buildGradientColorMap(labelsByKey);
+    expect(map.get(ptA)).toBe('#aaa');
+    expect(map.get(ptB)).toBe('#bbb');
+    expect(map.get(ptC)).toBe('#ccc');
+  });
+
+  it('returns empty map for empty input', () => {
+    expect(buildGradientColorMap({}).size).toBe(0);
+  });
+});

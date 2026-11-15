@@ -1,0 +1,146 @@
+describe('Compare Interpolated Table', () => {
+  before(() => {
+    cy.window().then((win) => {
+      win.localStorage.setItem('inferencex-star-modal-dismissed', String(Date.now()));
+    });
+    cy.visit('/compare/deepseek-r1-gb200-vs-h100');
+    cy.get('[data-testid="compare-interpolated-table"]').should('exist');
+  });
+
+  beforeEach(() => {
+    cy.document().then((doc) => {
+      delete doc.body.dataset.scrollLocked;
+      doc.body.style.removeProperty('pointer-events');
+    });
+  });
+
+  it('keeps metric context visible while scrolling the mobile comparison', () => {
+    cy.viewport(390, 720);
+    cy.get('[data-testid="compare-interpolated-table"]')
+      .parent()
+      .should('have.attr', 'tabindex', '0')
+      .scrollTo('right');
+    cy.get('[data-testid="compare-interpolated-table"] tbody tr')
+      .first()
+      .within(() => {
+        cy.get('td')
+          .first()
+          .should(($cell) => {
+            const bounds = $cell[0].getBoundingClientRect();
+            expect(bounds.left).to.be.at.least(0);
+            expect(bounds.right).to.be.lessThan(300);
+          });
+      });
+    cy.get('[data-testid="compare-interpolated-table"]').parent().scrollTo('left');
+    cy.get('[data-testid="compare-table-target-0"]')
+      .should('have.attr', 'aria-label', 'Target interactivity 1 (tok/s/user)')
+      .invoke('outerHeight')
+      .should('be.gte', 44);
+    cy.viewport(1280, 720);
+  });
+
+  it('commits target value when pressing Enter and updates the throughput cell', () => {
+    cy.get('[data-testid="compare-interpolated-table"] tbody td').should('contain.text', 'GB200');
+    cy.get('[data-testid="compare-interpolated-table"] tbody td').should('contain.text', 'H100');
+
+    cy.get('[data-testid="compare-table-target-1"]').then(($input) => {
+      const original = Number($input.val() as string);
+      const next = original + 3;
+      cy.contains('[data-testid="compare-interpolated-table"] tbody tr', 'Throughput (tok/s/chip)')
+        .find('td')
+        .eq(2)
+        .invoke('text')
+        .then((initialCell) => {
+          cy.get('[data-testid="compare-table-target-1"]').clear().type(`${next}{enter}`);
+          cy.get('[data-testid="compare-table-target-1"]').should('have.value', String(next));
+          cy.contains(
+            '[data-testid="compare-interpolated-table"] tbody tr',
+            'Throughput (tok/s/chip)',
+          )
+            .find('td')
+            .eq(2)
+            .should(($cell) => {
+              const text = $cell.text();
+              expect(text).to.match(/[0-9]/u);
+              expect(text).not.to.equal(initialCell);
+            });
+        });
+    });
+  });
+
+  it('updates interpolated values when a target input is changed and blurred', () => {
+    cy.get('[data-testid="compare-table-target-2"]').then(($input) => {
+      const original = Number($input.val() as string);
+      const next = original - 3;
+      cy.contains('[data-testid="compare-interpolated-table"] tbody tr', 'Throughput (tok/s/chip)')
+        .find('td')
+        .eq(3)
+        .invoke('text')
+        .then((initialCell) => {
+          cy.get('[data-testid="compare-table-target-2"]').clear().type(String(next)).blur();
+          cy.get('[data-testid="compare-table-target-2"]').should('have.value', String(next));
+          cy.contains(
+            '[data-testid="compare-interpolated-table"] tbody tr',
+            'Throughput (tok/s/chip)',
+          )
+            .find('td')
+            .eq(3)
+            .should(($cell) => {
+              const text = $cell.text();
+              expect(text).to.match(/[0-9]/u);
+              expect(text).not.to.equal(initialCell);
+            });
+        });
+    });
+  });
+
+  it('flags out-of-range interactivity inputs and clears flag after blur commit', () => {
+    cy.get('[data-testid="compare-table-target-0"]').clear().type('999999999');
+    cy.get('[data-testid="compare-table-target-0"]').should(
+      'have.attr',
+      'data-compare-target-oob',
+      'true',
+    );
+    cy.get('[data-testid="compare-table-target-0"]').blur();
+    cy.get('[data-testid="compare-table-target-0"]').should(
+      'not.have.attr',
+      'data-compare-target-oob',
+    );
+  });
+
+  it('localizes the comparison reader and target input names', () => {
+    cy.visit('/zh/compare/deepseek-r1-gb200-vs-h100');
+    cy.get('[data-testid="compare-interpolated-table"]')
+      .should('contain.text', '吞吐量（tok/s/chip）')
+      .and('contain.text', '成本（$/M tok）')
+      .and('contain.text', '并发数');
+    cy.get('[data-testid="compare-table-target-0"]').should(
+      'have.attr',
+      'aria-label',
+      '目标交互性 1（tok/s/user）',
+    );
+  });
+});
+
+describe('Compare table with a shared sequence', () => {
+  // The server renders this page's table for 8k/1k; the shared URL asks for 1k/1k.
+  const SHARED_URL = '/compare/deepseek-r1-b200-vs-h200/8k-1k?i_seq=1k%2F1k';
+  const SHARED_SEQUENCE_ROWS = {
+    method: 'GET',
+    pathname: '/api/v1/benchmarks',
+    query: { view: 'calculator', sequence: '1k/1k' },
+  };
+
+  beforeEach(() => {
+    cy.window().then((win) => {
+      win.localStorage.setItem('inferencex-star-modal-dismissed', String(Date.now()));
+    });
+  });
+
+  it('drops the server cells when the shared sequence fails to load', () => {
+    cy.intercept(SHARED_SEQUENCE_ROWS, { statusCode: 500, body: { error: 'unavailable' } });
+    cy.visit(SHARED_URL);
+    cy.get('[data-testid="compare-table-status"]').should('have.attr', 'data-status', 'error');
+    cy.get('[data-testid="compare-interpolated-table"]').should('not.exist');
+  });
+});

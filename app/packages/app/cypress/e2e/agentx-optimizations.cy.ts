@@ -1,0 +1,187 @@
+import { expectNoPageOverflow, unlockAgenticGate } from '../support/e2e';
+
+const FRAMEWORK_SLUGS = [
+  'vllm',
+  'sglang',
+  'tensorrt-llm',
+  'atom',
+  'aiter',
+  'dynamo',
+  'lmcache',
+  'mooncake',
+  'mori-umbp',
+] as const;
+
+const FRAMEWORK_NAMES: Record<(typeof FRAMEWORK_SLUGS)[number], string> = {
+  vllm: 'vLLM',
+  sglang: 'SGLang',
+  'tensorrt-llm': 'TensorRT-LLM',
+  atom: 'AMD ATOM',
+  aiter: 'ROCm AITER',
+  dynamo: 'NVIDIA Dynamo',
+  lmcache: 'LMCache',
+  mooncake: 'Mooncake',
+  'mori-umbp': 'MoRI UMBP',
+};
+
+const ROUTE_VIEWPORTS = [
+  { width: 1440, height: 900 },
+  { width: 390, height: 844 },
+] as const;
+
+describe('AgentX optimizations', () => {
+  beforeEach(() => {
+    cy.intercept('GET', '/api/v1/datasets', { statusCode: 200, body: [] });
+  });
+
+  it('links from /infx/agentx to the optimizations index and to each project', () => {
+    cy.visit('/infx/agentx', { onBeforeLoad: unlockAgenticGate });
+
+    cy.get('[data-testid="agentx-optimizations-callout"]').within(() => {
+      cy.contains('h2', 'Optimizations for agentic workloads').should('be.visible');
+      cy.get('[data-testid="agentx-optimizations-framework-link"]').should(
+        'have.length',
+        FRAMEWORK_SLUGS.length,
+      );
+      cy.get('[data-testid="agentx-optimizations-framework-link"][data-framework="sglang"]').should(
+        'have.attr',
+        'href',
+        '/infx/agentx/optimizations/sglang',
+      );
+      cy.get(
+        '[data-testid="agentx-optimizations-framework-link"][data-framework="mori-umbp"]',
+      ).should('have.attr', 'href', '/infx/agentx/optimizations/mori-umbp');
+      cy.get('[data-testid="agentx-optimizations-cta"]')
+        .should('contain.text', 'Read the optimizations')
+        .click();
+    });
+
+    cy.location('pathname').should('eq', '/infx/agentx/optimizations');
+  });
+
+  it('publishes the index with the ecosystem primer, every project, and sourced PRs', () => {
+    cy.visit('/infx/agentx/optimizations', { onBeforeLoad: unlockAgenticGate });
+
+    cy.get('[data-testid="agentx-optimizations-index"]').within(() => {
+      cy.get('h1').should('have.text', 'Optimizations for agentic workloads');
+      cy.get('[data-testid="agentx-optimizations-card"]').should(
+        'have.length',
+        FRAMEWORK_SLUGS.length,
+      );
+      cy.get('[data-testid="agentx-optimizations-section-ecosystem"]').should(
+        'contain.text',
+        'A brief introduction to the distributed inference ecosystem',
+      );
+      cy.get('[data-testid="agentx-optimizations-figure-servingStack"] img').should('be.visible');
+      cy.get('[data-testid="agentx-optimizations-section-other"]')
+        .find('[data-testid="agentx-optimizations-pr"]')
+        .first()
+        .should('have.attr', 'href')
+        .and('match', /^https:\/\/github\.com\/vllm-project\/vllm\/pull\/\d+$/u);
+      cy.get('[data-testid="agentx-optimizations-card"][data-framework="vllm"]').click();
+    });
+
+    cy.location('pathname').should('eq', '/infx/agentx/optimizations/vllm');
+  });
+
+  it('renders the index and representative projects at 1440px and 390px in both locales', () => {
+    const matrixSlugs = ['tensorrt-llm', 'mooncake'] as const;
+    for (const viewport of ROUTE_VIEWPORTS) {
+      for (const locale of ['', '/zh']) {
+        cy.viewport(viewport.width, viewport.height);
+        cy.visit(`${locale}/infx/agentx/optimizations`, { onBeforeLoad: unlockAgenticGate });
+        cy.get('[data-testid="agentx-optimizations-index"]').should('be.visible');
+        cy.get('[data-testid="agentx-optimizations-card"]').should(
+          'have.length',
+          FRAMEWORK_SLUGS.length,
+        );
+        cy.get('[data-testid="language-toggle"]').should(
+          'have.attr',
+          'href',
+          locale === '/zh' ? '/infx/agentx/optimizations' : '/zh/infx/agentx/optimizations',
+        );
+        expectNoPageOverflow();
+
+        for (const slug of matrixSlugs) {
+          cy.visit(`${locale}/infx/agentx/optimizations/${slug}`, {
+            onBeforeLoad: unlockAgenticGate,
+          });
+          cy.get('[data-testid="agentx-optimizations-article"]')
+            .should('be.visible')
+            .and('have.attr', 'data-framework', slug)
+            .find('h1')
+            .should('have.text', FRAMEWORK_NAMES[slug]);
+          cy.get('[data-testid="agentx-optimizations-pr"]')
+            .first()
+            .should('have.attr', 'href')
+            .and('match', /^https:\/\/github\.com\/.+\/pull\/\d+$/u);
+          cy.get('[data-testid="language-toggle"]').should(
+            'have.attr',
+            'href',
+            locale === '/zh'
+              ? `/infx/agentx/optimizations/${slug}`
+              : `/zh/infx/agentx/optimizations/${slug}`,
+          );
+          expectNoPageOverflow();
+        }
+      }
+    }
+  });
+
+  it('returns 404 for a project that does not exist', () => {
+    cy.request({ url: '/infx/agentx/optimizations/not-a-framework', failOnStatusCode: false })
+      .its('status')
+      .should('eq', 404);
+  });
+
+  it('ships the Simplified Chinese index and project pages', () => {
+    cy.visit('/zh/infx/agentx', { onBeforeLoad: unlockAgenticGate });
+    cy.get('[data-testid="agentx-optimizations-callout"]').within(() => {
+      cy.contains('h2', '面向智能体负载的优化').should('be.visible');
+      cy.get('[data-testid="agentx-optimizations-cta"]')
+        .should('contain.text', '查看优化详情')
+        .and('have.attr', 'href', '/zh/infx/agentx/optimizations');
+    });
+
+    cy.visit('/zh/infx/agentx/optimizations', { onBeforeLoad: unlockAgenticGate });
+    cy.get('[data-testid="agentx-optimizations-index"]').within(() => {
+      cy.get('h1').should('have.text', '面向智能体负载的优化');
+      cy.contains('分布式推理生态简介').should('be.visible');
+      cy.get('[data-testid="agentx-optimizations-card"]').should(
+        'have.length',
+        FRAMEWORK_SLUGS.length,
+      );
+      cy.get('[data-testid="agentx-optimizations-card"][data-framework="lmcache"]').should(
+        'have.attr',
+        'href',
+        '/zh/infx/agentx/optimizations/lmcache',
+      );
+    });
+    cy.get('link[rel="alternate"][hreflang="en"]').should(
+      'have.attr',
+      'href',
+      'https://inferencex.semianalysis.com/infx/agentx/optimizations',
+    );
+
+    cy.visit('/zh/infx/agentx/optimizations/sglang', { onBeforeLoad: unlockAgenticGate });
+    cy.get('[data-testid="agentx-optimizations-article"]').within(() => {
+      cy.get('h1').should('have.text', 'SGLang');
+      cy.contains('HiCache offload').should('be.visible');
+      cy.contains('并发 384 下输出吞吐量提升 26.75%').should('be.visible');
+      cy.get('[data-testid="agentx-optimizations-pr"]')
+        .first()
+        .should('have.attr', 'href')
+        .and('match', /^https:\/\/github\.com\/sgl-project\/sglang\/pull\/\d+$/u);
+    });
+    cy.get('link[rel="alternate"][hreflang="en"]').should(
+      'have.attr',
+      'href',
+      'https://inferencex.semianalysis.com/infx/agentx/optimizations/sglang',
+    );
+    cy.get('link[rel="alternate"][hreflang="zh-CN"]').should(
+      'have.attr',
+      'href',
+      'https://inferencex.semianalysis.com/zh/infx/agentx/optimizations/sglang',
+    );
+  });
+});

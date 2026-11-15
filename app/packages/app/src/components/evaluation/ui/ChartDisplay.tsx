@@ -1,0 +1,263 @@
+'use client';
+
+import { useCallback, useMemo, useState } from 'react';
+import { BarChart3, Table2 } from 'lucide-react';
+
+import { track } from '@/lib/analytics/analytics';
+import { selectionAnalyticsContext } from '@/lib/analytics/selection-context';
+import { useLocale } from '@/lib/i18n/use-locale';
+import { useEvaluation } from '@/components/evaluation/EvaluationContext';
+import EvaluationTable from '@/components/evaluation/ui/EvaluationTable';
+import { InlineNudgeSlot } from '@/components/nudges/inline-nudge-slot';
+import { NUDGE_SLOTS } from '@/lib/nudges/inline-slot';
+import { Card } from '@/components/ui/card';
+import { ChartShareActions } from '@/components/ui/chart-display-helpers';
+import { ChartSection } from '@/components/ui/chart-section';
+import { DashboardSectionHeader } from '@/components/ui/dashboard-section-header';
+import { Heading, HeadingQualifier } from '@/components/ui/heading';
+import { ModelLogo } from '@/components/ui/model-logo';
+import { ResultContext } from '@/components/ui/result-context';
+import { type SegmentedToggleOption, SegmentedToggle } from '@/components/ui/segmented-toggle';
+import { RetryableQueryError } from '@/components/ui/retryable-query-error';
+import { Skeleton } from '@/components/ui/skeleton';
+import { useUnofficialRun } from '@/providers/unofficial-run-provider';
+import {
+  type Model,
+  type Precision,
+  getModelLabel,
+  getPrecisionLabel,
+} from '@/lib/catalog/data-mappings';
+import { exportToCsv } from '@/lib/export/csv-export';
+import { evaluationChartToCsv } from '@/lib/export/csv-export-helpers';
+
+import EvaluationChartControls from './ChartControls';
+import EvalBarChartD3 from './BarChartD3';
+
+type EvalViewMode = 'chart' | 'table';
+
+export const EVALUATION_DISPLAY_STRINGS = {
+  en: {
+    chartView: 'Chart',
+    tableView: 'Table',
+    viewModeAria: 'View mode',
+    heading: 'Accuracy evals',
+    description:
+      'Benchmark results showing model quality versus throughput trade-offs across different chips, quantization levels, and inference configurations',
+    captionTitle: 'evaluation score',
+    captionQualifier: (precision: string) =>
+      precision ? `By hardware configuration · ${precision}` : 'By hardware configuration',
+    queryError: 'Failed to load evaluation data',
+    availabilityError: 'Failed to load filter availability data',
+    combinedError: 'Failed to load evaluation and filter availability data',
+    tableLoading: 'Loading evaluation data…',
+  },
+  zh: {
+    chartView: '图表',
+    tableView: '表格',
+    viewModeAria: '视图模式',
+    heading: '准确率评估',
+    description: '基准测试结果展示不同芯片、量化精度和推理配置下，模型质量与吞吐量之间的权衡',
+    captionTitle: '评估得分',
+    captionQualifier: (precision: string) =>
+      precision ? `按硬件配置 · ${precision}` : '按硬件配置',
+    queryError: '评估数据加载失败',
+    availabilityError: '筛选项可用性数据加载失败',
+    combinedError: '评估数据与筛选项可用性数据均加载失败',
+    tableLoading: '正在加载评估数据……',
+  },
+};
+
+export function evaluationTableDisplayState({
+  isEvaluationDataSettled,
+  isEvaluationDataError,
+  hasDisplayData,
+}: {
+  isEvaluationDataSettled: boolean;
+  isEvaluationDataError: boolean;
+  hasDisplayData: boolean;
+}): 'loading' | 'ready' | 'error' {
+  if (hasDisplayData) return 'ready';
+  if (isEvaluationDataError) return 'error';
+  return isEvaluationDataSettled ? 'ready' : 'loading';
+}
+
+export default function EvaluationChartDisplay() {
+  const locale = useLocale();
+  const t = EVALUATION_DISPLAY_STRINGS[locale];
+  const CHART_ID = 'evaluation-chart';
+  const {
+    selectedModel,
+    selectedRunDate,
+    selectedBenchmark,
+    setIsLegendExpanded,
+    chartData,
+    unofficialChartData,
+    selectedPrecisions,
+    enabledHardware,
+    isError,
+    isAvailabilityError,
+    isEvaluationDataError,
+    isEvaluationDataSettled,
+    retry,
+  } = useEvaluation();
+  const { isUnofficialRun } = useUnofficialRun();
+  const tableData = useMemo(
+    () => (isUnofficialRun ? [...chartData, ...unofficialChartData] : chartData),
+    [isUnofficialRun, chartData, unofficialChartData],
+  );
+
+  const [viewMode, setViewMode] = useState<EvalViewMode>('table');
+  const tableDisplayState = evaluationTableDisplayState({
+    isEvaluationDataSettled,
+    isEvaluationDataError,
+    hasDisplayData: tableData.length > 0,
+  });
+  const handleViewModeChange = (value: EvalViewMode) => {
+    setViewMode(value);
+    track('evaluation_view_changed', { view: value });
+  };
+
+  const viewModeOptions = useMemo(
+    (): SegmentedToggleOption<EvalViewMode>[] => [
+      {
+        value: 'chart',
+        label: t.chartView,
+        icon: <BarChart3 className="size-3.5" />,
+        testId: 'evaluation-chart-view-btn',
+      },
+      {
+        value: 'table',
+        label: t.tableView,
+        icon: <Table2 className="size-3.5" />,
+        testId: 'evaluation-table-view-btn',
+      },
+    ],
+    [t],
+  );
+
+  const handleExportCsv = useCallback(() => {
+    const { headers, rows } = evaluationChartToCsv(chartData);
+    exportToCsv(`InferenceX_evaluation_${selectedModel}_${selectedBenchmark}`, headers, rows);
+  }, [chartData]);
+
+  const caption = (
+    <>
+      <div className="md:pr-72">
+        <Heading
+          as="h3"
+          level="card"
+          logo={
+            selectedModel ? (
+              <ModelLogo model={selectedModel as Model} className="size-6" />
+            ) : undefined
+          }
+        >
+          {selectedModel ? `${getModelLabel(selectedModel as Model)} ` : ''}
+          {selectedBenchmark ? `${selectedBenchmark.toUpperCase()} ` : ''}
+          {t.captionTitle}
+          <HeadingQualifier>
+            {t.captionQualifier(
+              selectedPrecisions.map((p) => getPrecisionLabel(p as Precision)).join(', '),
+            )}
+          </HeadingQualifier>
+        </Heading>
+      </div>
+    </>
+  );
+  const footer = (
+    <ResultContext
+      locale={locale}
+      layout="footer"
+      date={selectedRunDate}
+      source={
+        isUnofficialRun
+          ? locale === 'zh'
+            ? 'SemiAnalysis InferenceX™ + 非官方 overlays'
+            : 'SemiAnalysis InferenceX™ + unofficial overlays'
+          : 'SemiAnalysis InferenceX™'
+      }
+    />
+  );
+
+  return (
+    <div data-testid="evaluation-chart-display" className="flex flex-col gap-4">
+      <section className="relative z-10">
+        <Card>
+          <div className="flex flex-col gap-4">
+            <DashboardSectionHeader
+              title={t.heading}
+              description={t.description}
+              actions={<ChartShareActions />}
+            />
+            <EvaluationChartControls />
+          </div>
+        </Card>
+      </section>
+
+      <ChartSection
+        chartId={CHART_ID}
+        mobileActions
+        analyticsPrefix="evaluation"
+        analyticsContext={selectionAnalyticsContext({
+          model: selectedModel,
+          precisions: selectedPrecisions,
+          gpuCount: enabledHardware.size,
+        })}
+        setIsLegendExpanded={setIsLegendExpanded}
+        onExportCsv={handleExportCsv}
+        exportFileName={`InferenceX_evaluation_${selectedModel}_${selectedBenchmark}`}
+        hideImageExport={viewMode === 'table'}
+        leadingControls={
+          <SegmentedToggle
+            value={viewMode}
+            options={viewModeOptions}
+            onValueChange={handleViewModeChange}
+            ariaLabel={t.viewModeAria}
+            testId="evaluation-view-toggle"
+          />
+        }
+      >
+        <>
+          {isError && (
+            <RetryableQueryError
+              message={
+                isAvailabilityError && isEvaluationDataError
+                  ? t.combinedError
+                  : isEvaluationDataError
+                    ? t.queryError
+                    : t.availabilityError
+              }
+              analyticsEvent="evaluation_data_retry_clicked"
+              onRetry={retry}
+              testId="evaluation-query-error"
+            />
+          )}
+          {tableDisplayState !== 'error' &&
+            (viewMode === 'table' ? (
+              tableDisplayState === 'loading' ? (
+                <div
+                  role="status"
+                  aria-live="polite"
+                  data-testid="evaluation-table-loading"
+                  className="space-y-3 py-3"
+                >
+                  <p className="text-sm text-muted-foreground">{t.tableLoading}</p>
+                  <Skeleton className="h-8 w-1/3" />
+                  <Skeleton className="h-154 w-full" />
+                </div>
+              ) : (
+                <>
+                  {caption}
+                  <InlineNudgeSlot slot={NUDGE_SLOTS.evaluationTable} className="mb-3" />
+                  <EvaluationTable data={tableData} />
+                  <div className="mt-3">{footer}</div>
+                </>
+              )
+            ) : (
+              <EvalBarChartD3 caption={caption} footer={footer} />
+            ))}
+        </>
+      </ChartSection>
+    </div>
+  );
+}

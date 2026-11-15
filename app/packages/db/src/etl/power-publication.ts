@@ -1,0 +1,225 @@
+import { isDeepStrictEqual } from 'node:util';
+import { MEASURED_POWER_METRIC_KEYS } from '@semianalysisai/inferencex-constants';
+import { isAgenticRow, type BenchmarkParams } from './benchmark-mapper';
+import type { ConfigParams } from './config-cache';
+import type { TelemetryReceipt } from './telemetry-receipt';
+
+const CONFIG_FIELDS = {
+  hardware: 'hardware',
+  framework: 'framework',
+  model: 'model',
+  precision: 'precision',
+  specMethod: 'spec_method',
+  disagg: 'disagg',
+  isMultinode: 'is_multinode',
+  prefillTp: 'prefill_tp',
+  prefillEp: 'prefill_ep',
+  prefillDpAttn: 'prefill_dp_attention',
+  prefillNumWorkers: 'prefill_num_workers',
+  decodeTp: 'decode_tp',
+  decodeEp: 'decode_ep',
+  decodeDpAttn: 'decode_dp_attention',
+  decodeNumWorkers: 'decode_num_workers',
+  numPrefillGpu: 'num_prefill_gpu',
+  numDecodeGpu: 'num_decode_gpu',
+} as const satisfies Record<keyof ConfigParams, string>;
+const IDENTITY_FIELDS = [
+  ...Object.values(CONFIG_FIELDS),
+  'benchmark_type',
+  'isl',
+  'osl',
+  'conc',
+  'offload_mode',
+  'recipe_fingerprint',
+  'image',
+  'run_url',
+] as const;
+const POWER_FIELDS = [
+  ...MEASURED_POWER_METRIC_KEYS,
+  'power_valid',
+  'power_metric_schema_version',
+  'cpu_power_valid',
+];
+export const POWER_WORKLOADS = [
+  { scenario: 'agentic', benchmarkType: 'agentic_traces', isl: null, osl: null },
+  { scenario: '1k1k', benchmarkType: 'single_turn', isl: 1024, osl: 1024 },
+  { scenario: '8k1k', benchmarkType: 'single_turn', isl: 8192, osl: 1024 },
+] as const;
+export type PowerWorkload = (typeof POWER_WORKLOADS)[number];
+
+export function powerWorkloadOf(row: {
+  benchmarkType: string;
+  isl: number | null;
+  osl: number | null;
+}): PowerWorkload | null {
+  return (
+    POWER_WORKLOADS.find(
+      (workload) =>
+        workload.benchmarkType === row.benchmarkType &&
+        workload.isl === row.isl &&
+        workload.osl === row.osl,
+    ) ?? null
+  );
+}
+
+export function rawPowerWorkloadOf(raw: Record<string, unknown>): PowerWorkload | null {
+  return powerWorkloadOf(
+    isAgenticRow(raw)
+      ? { benchmarkType: 'agentic_traces', isl: null, osl: null }
+      : { benchmarkType: 'single_turn', isl: Number(raw.isl), osl: Number(raw.osl) },
+  );
+}
+
+export function powerWorkloadForScenario(scenario: string): PowerWorkload | undefined {
+  return POWER_WORKLOADS.find((workload) => workload.scenario === scenario);
+}
+export interface PowerPublicationPoint {
+  identity: Record<string, unknown>;
+  metrics: Record<string, number>;
+  workers: unknown;
+  power_invalid_reasons: unknown;
+  power_audit: unknown;
+  artifact: { path: string; sha256: string };
+}
+export interface PowerPublicationManifest {
+  version: 1;
+  runId: number;
+  runAttempt: number;
+  points: PowerPublicationPoint[];
+  ingestErrors?: string[];
+  publicationWarnings?: string[];
+  telemetryWarnings?: string[];
+  telemetry?: TelemetryReceipt;
+}
+
+export function powerVerificationReceipt(
+  manifest: PowerPublicationManifest,
+  errors: readonly string[],
+  checkedAt = new Date().toISOString(),
+) {
+  const counts = { strict: 0, invalid: 0, other: 0 };
+  for (const point of manifest.points) {
+    if (point.metrics.power_valid === 1 && point.metrics.power_metric_schema_version === 2)
+      counts.strict++;
+    else if (point.metrics.power_valid === 0) counts.invalid++;
+    else counts.other++;
+  }
+  return {
+    runId: manifest.runId,
+    runAttempt: manifest.runAttempt,
+    checkedAt,
+    points: manifest.points.length,
+    counts,
+    status:
+      errors.length > 0 ? 'failed' : manifest.points.length > 0 ? 'matched' : 'no_power_points',
+    errors: [...errors],
+    publicationWarnings: manifest.publicationWarnings ?? [],
+    telemetryWarnings: manifest.telemetryWarnings ?? [],
+    ...(manifest.telemetry ? { telemetry: manifest.telemetry } : {}),
+  };
+}
+
+export function unmappedPowerResultIssue(
+  raw: Record<string, unknown>,
+  failed: boolean,
+  relativeFile: string,
+): { error: string } | { warning: string } | null {
+  const workload = rawPowerWorkloadOf(raw);
+  if (!workload) return null;
+  return failed
+    ? { warning: `Known-failed ${workload.scenario} result excluded: ${relativeFile}` }
+    : { error: `Unmapped ${workload.scenario} result: ${relativeFile}` };
+}
+
+export interface PublishedPowerRow extends Record<string, unknown> {
+  metrics: Record<string, number>;
+}
+
+export function stablePowerPointIdentity(row: Record<string, unknown>): string {
+  return JSON.stringify(
+    IDENTITY_FIELDS.filter((key) => key !== 'image' && key !== 'run_url').map(
+      (key) => row[key] ?? null,
+    ),
+  );
+}
+
+export function publicationIdentity(row: Record<string, unknown>): string {
+  return JSON.stringify(IDENTITY_FIELDS.map((key) => row[key] ?? null));
+}
+
+export function benchmarkPublicationIdentity(
+  row: BenchmarkParams,
+  runUrl = '',
+): Record<string, unknown> {
+  const identity: Record<string, unknown> = Object.fromEntries(
+    Object.entries(CONFIG_FIELDS).map(([source, target]) => [
+      target,
+      row.config[source as keyof typeof CONFIG_FIELDS],
+    ]),
+  );
+  Object.assign(identity, {
+    benchmark_type: row.benchmarkType,
+    isl: row.isl,
+    osl: row.osl,
+    conc: row.conc,
+    offload_mode: row.offloadMode,
+    recipe_fingerprint: row.recipeFingerprint,
+    image: row.image,
+    run_url: runUrl,
+  });
+  return identity;
+}
+
+export function powerPublicationPoint(
+  row: BenchmarkParams,
+  runUrl: string,
+  artifact: PowerPublicationPoint['artifact'],
+): PowerPublicationPoint | null {
+  if (!powerWorkloadOf(row)) return null;
+  const identity = benchmarkPublicationIdentity(row, runUrl);
+  return {
+    identity,
+    metrics: Object.fromEntries(
+      POWER_FIELDS.filter((key) => Object.hasOwn(row.metrics, key)).map((key) => [
+        key,
+        row.metrics[key],
+      ]),
+    ),
+    workers: row.workers ?? null,
+    power_invalid_reasons: row.powerInvalidReasons ?? null,
+    power_audit: row.powerAudit ?? null,
+    artifact,
+  };
+}
+
+export function verifyPowerPublication(
+  expected: readonly PowerPublicationPoint[],
+  actual: readonly PublishedPowerRow[],
+  source: string,
+): string[] {
+  const byIdentity = new Map<string, PublishedPowerRow[]>();
+  for (const row of actual) {
+    const key = publicationIdentity(row);
+    byIdentity.set(key, [...(byIdentity.get(key) ?? []), row]);
+  }
+  const errors: string[] = [];
+  for (const point of expected) {
+    const rows = byIdentity.get(publicationIdentity(point.identity)) ?? [];
+    const label = `${source}: ${point.identity.hardware}/${point.identity.model} conc=${point.identity.conc} (${point.artifact.path})`;
+    if (rows.length !== 1) {
+      errors.push(`${label}: expected one exact source point, found ${rows.length}`);
+      continue;
+    }
+    const row = rows[0];
+    for (const key of POWER_FIELDS) {
+      if (!Object.is(point.metrics[key], row.metrics[key]))
+        errors.push(
+          `${label}: ${key} expected ${point.metrics[key] ?? 'absent'}, got ${row.metrics[key] ?? 'absent'}`,
+        );
+    }
+    for (const key of ['workers', 'power_invalid_reasons', 'power_audit'] as const) {
+      if (!isDeepStrictEqual(point[key], row[key] ?? null)) errors.push(`${label}: ${key} differs`);
+    }
+  }
+  return errors;
+}

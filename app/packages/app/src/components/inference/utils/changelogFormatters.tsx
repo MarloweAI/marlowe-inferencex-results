@@ -1,0 +1,94 @@
+import {
+  FRAMEWORK_ALIASES,
+  FW_REGISTRY,
+  GPU_RUNNER_ALIASES,
+  resolveFrameworkAlias,
+  resolveFrameworkPartLabel,
+} from '@semianalysisai/inferencex-constants';
+
+import {
+  type Precision,
+  MODEL_PREFIX_MAPPING,
+  getPrecisionLabel,
+} from '@/lib/catalog/data-mappings';
+import { getHardwareConfig } from '@/lib/catalog/constants';
+import { getDisplayLabel } from '@/lib/shared/utils';
+
+const CHANGELOG_FRAMEWORK_KEYS = [
+  ...Object.keys(FW_REGISTRY),
+  ...Object.keys(FRAMEWORK_ALIASES),
+].toSorted((a, b) => b.length - a.length);
+
+export function changelogConfigToHwKey(
+  configKey: string,
+  benchmarkType?: 'single_turn' | 'agentic_traces',
+): string | null {
+  const parts = configKey.toLowerCase().split('-');
+  const gpu = GPU_RUNNER_ALIASES[parts[2]] ?? parts[2];
+  const remainder = parts.slice(3).join('-');
+  if (!gpu || !remainder) return null;
+
+  const framework = CHANGELOG_FRAMEWORK_KEYS.find(
+    (candidate) => remainder === candidate || remainder.startsWith(`${candidate}-`),
+  );
+  if (!framework) return null;
+
+  const trailingParts = remainder.slice(framework.length).split('-').filter(Boolean);
+  const isAgentic = trailingParts.includes('agentic');
+  if (benchmarkType === 'agentic_traces' && !isAgentic) return null;
+  const specSuffix =
+    benchmarkType === 'agentic_traces' && isAgentic
+      ? ''
+      : trailingParts.includes('mtp')
+        ? '_mtp'
+        : '';
+  return `${gpu}_${resolveFrameworkAlias(framework)}${specSuffix}`;
+}
+
+export function formatChangelogDescription(desc: string | string[]) {
+  if (typeof desc === 'string') {
+    return (
+      <ul className="list-disc pl-4">
+        {desc
+          .split('- ')
+          .filter((item) => item.trim() !== '')
+          .map((item, index) => (
+            <li key={index}>{item}</li>
+          ))}
+      </ul>
+    );
+  }
+  return (
+    <ul className="list-disc pl-4">
+      {desc.map((item, index) => (
+        <li key={index}>{item}</li>
+      ))}
+    </ul>
+  );
+}
+
+export function configKeyMatchesHwKey(
+  configKey: string,
+  hwKey: string,
+  benchmarkType?: 'single_turn' | 'agentic_traces',
+): boolean {
+  return changelogConfigToHwKey(configKey, benchmarkType) === hwKey;
+}
+
+export function formatConfigKeys(key: string) {
+  const parts = key.split('-');
+  const model = parts[0];
+  const precision = parts[1];
+  const modelLabel = MODEL_PREFIX_MAPPING[model];
+  const hwKey = changelogConfigToHwKey(key);
+
+  if (!hwKey) {
+    const gpu = parts[2]?.toUpperCase() ?? '';
+    const framework = parts.slice(3).join('-');
+    const frameworkLabel = resolveFrameworkPartLabel(modelLabel, framework);
+    return `${gpu} (${frameworkLabel}) ${modelLabel} ${getPrecisionLabel(precision as Precision)}`;
+  }
+
+  const hardwareLabel = getDisplayLabel(getHardwareConfig(hwKey, modelLabel));
+  return `${hardwareLabel} ${modelLabel} ${getPrecisionLabel(precision as Precision)}`;
+}

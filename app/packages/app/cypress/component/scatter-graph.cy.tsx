@@ -1,0 +1,3490 @@
+import { useReducer, useState } from 'react';
+import {
+  GlobalFilterActionsContext,
+  GlobalFilterSelectionContext,
+} from '@/providers/GlobalFilterContext';
+import { InferenceContextsProvider } from '@/components/inference/InferenceContext';
+import { overlaySelectionReducer, UnofficialRunContext } from '@/providers/unofficial-run-provider';
+import ScatterGraph from '@/components/inference/ui/ScatterGraph';
+import { useParetoHighlightToggle } from '@/components/inference/hooks/useParetoHighlightToggle';
+import ChartDisplay from '@/components/inference/ui/ChartDisplay';
+import { PowerXSurfaceProvider } from '@/components/inference/ui/powerx-surface';
+import chartDefinitions from '@/components/inference/metric-registry';
+import { mountWithProviders } from '../support/test-utils';
+import { expandLegendAdvanced } from '../support/legend-advanced';
+import {
+  clickScatterPoint,
+  hoverTopmostAt,
+  hoverTopmostOver,
+  visiblePoints,
+} from '../support/scatter-points';
+import {
+  createMockInferenceData,
+  createMockChartDefinition,
+  createMockHardwareConfig,
+  createMockGlobalFilterContexts,
+  createMockInferenceContextValues,
+  createMockUnofficialRunContext,
+} from '../support/mock-data';
+import { Model, Precision, Sequence } from '@/lib/catalog/data-mappings';
+import { buildExclusion, resolveExclusionGroups } from '@/lib/benchmarks/exclusion';
+import { PathnameContext } from 'next/dist/shared/lib/hooks-client-context.shared-runtime';
+
+const defaultChartDef = createMockChartDefinition();
+const hwConfig = createMockHardwareConfig();
+
+const expectPointsFaded = (faded: boolean) =>
+  cy.scatterPoints('#global-pareto-test').should((points) => {
+    expect(points).to.have.length(2);
+    for (const point of points) expect(point.faded, point.key).to.equal(faded);
+  });
+
+const expectVisiblePointCount = (scope: string, count: number) =>
+  cy.scatterPoints(scope).should((points) => expect(visiblePoints(points)).to.have.length(count));
+
+const mouse = (type: string, x: number, y: number, buttons: number) =>
+  new MouseEvent(type, {
+    clientX: x,
+    clientY: y,
+    button: 0,
+    buttons,
+    bubbles: true,
+    cancelable: true,
+    view: window,
+  });
+
+describe('ScatterGraph', () => {
+  for (const overlay of [false, true]) {
+    it(`dismisses pinned ${overlay ? 'unofficial' : 'official'} details outside the chart and on Escape`, () => {
+      const data = [
+        createMockInferenceData({
+          hwKey: 'b200_sglang',
+          precision: Precision.FP4,
+          x: 20,
+          y: 80,
+          conc: 16,
+        }),
+      ];
+      const runUrl = 'https://github.com/SemiAnalysisAI/InferenceX/actions/runs/123';
+      const overlayData = overlay
+        ? {
+            data: [
+              createMockInferenceData({
+                hwKey: 'h100_vllm',
+                precision: Precision.FP4,
+                x: 50,
+                y: 40,
+                conc: 32,
+                run_url: runUrl,
+              }),
+            ],
+            hardwareConfig: hwConfig,
+            label: 'Preview',
+            runUrl,
+          }
+        : undefined;
+      function DismissalHarness() {
+        const [clicks, setClicks] = useState(0);
+        return (
+          <div style={{ width: 1000 }}>
+            <button
+              data-testid="outside-chart"
+              onClick={(event) => {
+                event.stopPropagation();
+                setClicks((value) => value + 1);
+              }}
+            >
+              Outside clicks: {clicks}
+            </button>
+            <ScatterGraph
+              chartId="outside-dismissal"
+              modelLabel="DeepSeek R1"
+              data={data}
+              xLabel="Interactivity"
+              yLabel="Throughput"
+              chartDefinition={defaultChartDef}
+              transitionDuration={0}
+              overlayData={overlayData}
+            />
+          </div>
+        );
+      }
+      mountWithProviders(<DismissalHarness />, {
+        inference: {
+          hardwareConfig: hwConfig,
+          activeHwTypes: new Set(['b200_sglang']),
+          hwTypesWithData: new Set(['b200_sglang']),
+          selectedPrecisions: [Precision.FP4],
+        },
+        unofficial: {
+          isUnofficialRun: overlay,
+          activeOverlayHwTypes: new Set(['h100_vllm']),
+          allOverlayHwTypes: new Set(['h100_vllm']),
+        },
+      });
+      const pin = () => {
+        if (overlay) {
+          cy.get('#outside-dismissal .unofficial-overlay-pt').first().click();
+        } else {
+          cy.scatterPoints('#outside-dismissal')
+            .should('have.length', 1)
+            .then(([point]) => clickScatterPoint(point));
+        }
+        cy.get('#outside-dismissal [data-testid="point-details-panel"]')
+          .should('be.visible')
+          .find('[data-pinned-config]')
+          .should('contain.text', `conc ${overlay ? 32 : 16}`);
+      };
+      pin();
+      cy.get('[data-pinned-config]').click();
+      cy.get('#outside-dismissal [data-testid="point-details-panel"]').should('be.visible');
+      cy.get('[data-testid="outside-chart"]').click().should('have.text', 'Outside clicks: 1');
+      cy.get('[data-testid="point-details-panel"]').should('not.exist');
+      pin();
+      cy.get('body').trigger('keydown', { key: 'Escape' });
+      cy.get('[data-testid="point-details-panel"]').should('not.exist');
+    });
+  }
+
+  it('shows the zoom hint above the plot corner until the first zoom', () => {
+    mountWithProviders(
+      <div style={{ width: 1000 }}>
+        <ScatterGraph
+          chartId="zoom-hint"
+          modelLabel="DeepSeek R1"
+          data={[
+            createMockInferenceData({
+              hwKey: 'b200_sglang',
+              precision: Precision.FP4,
+              x: 20,
+              y: 80,
+            }),
+            createMockInferenceData({
+              hwKey: 'b200_sglang',
+              precision: Precision.FP4,
+              x: 60,
+              y: 30,
+            }),
+          ]}
+          xLabel="Interactivity"
+          yLabel="Throughput"
+          chartDefinition={defaultChartDef}
+          transitionDuration={0}
+        />
+      </div>,
+      {
+        inference: {
+          hardwareConfig: hwConfig,
+          activeHwTypes: new Set(['b200_sglang']),
+          hwTypesWithData: new Set(['b200_sglang']),
+          selectedPrecisions: [Precision.FP4],
+        },
+        unofficial: {},
+      },
+    );
+    cy.scatterPoints('#zoom-hint').should('have.length', 2);
+    cy.get('#zoom-hint [data-testid="chart-instructions"]')
+      .should('be.visible')
+      .and('have.text', 'Shift+Scroll to zoom · Drag to pan · Double-click to reset')
+      .should(($hint) => {
+        const hint = $hint[0].getBoundingClientRect();
+        const doc = $hint[0].ownerDocument;
+        const svg = doc.querySelector('#zoom-hint [data-testid="d3-chart-svg"]')!;
+        const xDomain = svg.querySelector('.x-axis > .domain')!.getBoundingClientRect();
+        const yDomain = svg.querySelector('.y-axis > .domain')!.getBoundingClientRect();
+        expect(hint.bottom).to.be.at.most(yDomain.top);
+        expect(yDomain.top - hint.bottom).to.be.lessThan(8);
+        expect(hint.right).to.be.at.most(xDomain.right);
+        expect(xDomain.right - hint.right).to.be.lessThan(20);
+        expect(doc.elementFromPoint(hint.left + 4, hint.top + 4)).not.to.equal($hint[0]);
+      });
+    cy.get('#zoom-hint [data-testid="d3-chart-svg"]').then(($svg) => {
+      const svg = $svg[0];
+      const bounds = svg.getBoundingClientRect();
+      const x = bounds.x + bounds.width / 2;
+      const y = bounds.y + bounds.height / 2;
+      // A click, hovering away, plain scrolling, and a drag while fully zoomed out (there is
+      // nowhere to pan to): none of these move the chart.
+      svg.dispatchEvent(mouse('mousedown', x, y, 1));
+      window.dispatchEvent(mouse('mouseup', x, y, 0));
+      svg.dispatchEvent(mouse('mousemove', x + 200, y, 0));
+      svg.dispatchEvent(new WheelEvent('wheel', { deltaY: -240, bubbles: true, view: window }));
+      svg.dispatchEvent(mouse('mousedown', x, y, 1));
+      window.dispatchEvent(mouse('mousemove', x + 120, y, 1));
+      window.dispatchEvent(mouse('mouseup', x + 120, y, 0));
+    });
+    cy.wait(600);
+    cy.get('#zoom-hint [data-testid="chart-instructions"]')
+      .should('be.visible')
+      .and('not.have.attr', 'data-dismissed');
+    cy.get('#zoom-hint [data-testid="d3-chart-svg"]').then(($svg) => {
+      const bounds = $svg[0].getBoundingClientRect();
+      $svg[0].dispatchEvent(
+        new WheelEvent('wheel', {
+          deltaY: -240,
+          shiftKey: true,
+          clientX: bounds.x + bounds.width / 2,
+          clientY: bounds.y + bounds.height / 2,
+          bubbles: true,
+          cancelable: true,
+          view: window,
+        }),
+      );
+    });
+    cy.get('#zoom-hint [data-testid="chart-instructions"]')
+      .should('not.be.visible')
+      .and('have.attr', 'data-dismissed');
+  });
+
+  it('shows the unofficial card for an overlay point drawn on an official point', () => {
+    const runUrl = 'https://github.com/SemiAnalysisAI/InferenceX/actions/runs/123';
+    const shared = { precision: Precision.FP4, x: 20, y: 80 };
+    mountWithProviders(
+      <div style={{ width: 1000 }}>
+        <ScatterGraph
+          chartId="overlap-hover"
+          modelLabel="DeepSeek R1"
+          data={[
+            createMockInferenceData({ hwKey: 'b200_sglang', conc: 16, ...shared }),
+            createMockInferenceData({
+              hwKey: 'b200_sglang',
+              precision: Precision.FP4,
+              x: 60,
+              y: 30,
+              conc: 64,
+            }),
+          ]}
+          xLabel="Interactivity"
+          yLabel="Throughput"
+          chartDefinition={defaultChartDef}
+          transitionDuration={0}
+          overlayData={{
+            data: [
+              createMockInferenceData({ hwKey: 'h100_vllm', conc: 32, run_url: runUrl, ...shared }),
+            ],
+            hardwareConfig: hwConfig,
+            label: 'Preview',
+            runUrl,
+          }}
+        />
+      </div>,
+      {
+        inference: {
+          hardwareConfig: hwConfig,
+          activeHwTypes: new Set(['b200_sglang']),
+          hwTypesWithData: new Set(['b200_sglang']),
+          selectedPrecisions: [Precision.FP4],
+        },
+        unofficial: {
+          isUnofficialRun: true,
+          activeOverlayHwTypes: new Set(['h100_vllm']),
+          allOverlayHwTypes: new Set(['h100_vllm']),
+        },
+      },
+    );
+    const tooltip = '[data-chart-tooltip="overlap-hover"]';
+    cy.scatterPoints('#overlap-hover').should('have.length', 2);
+    cy.get('#overlap-hover .unofficial-overlay-pt > circle').then(([hit]) => hoverTopmostOver(hit));
+    cy.get(`${tooltip} [data-hover-notice]`).should('have.text', '✕ Preview');
+    cy.get(tooltip).should('contain.text', 'conc 32');
+    cy.scatterPoints('#overlap-hover').then((points) => {
+      const lone = points.find((point) => point.datum.conc === 64)!;
+      hoverTopmostAt(lone.hitArea.ownerDocument, lone.clientX, lone.clientY);
+    });
+    cy.get(tooltip)
+      .should('contain.text', 'conc 64')
+      .find('[data-hover-notice]')
+      .should('not.exist');
+  });
+
+  it('keeps compact hover and pins full cache and role details in the UI font', () => {
+    const data = [
+      createMockInferenceData({
+        hwKey: 'h100',
+        precision: Precision.FP4,
+        x: 20,
+        y: 80,
+        benchmark_type: 'agentic_traces',
+        framework: 'sglang',
+        disagg: true,
+        is_multinode: true,
+        physicalChips: 64,
+        conc: 10888,
+        prefill_tp: 2,
+        prefill_ep: 2,
+        prefill_dp_attention: true,
+        prefill_num_workers: 16,
+        num_prefill_gpu: 32,
+        decode_tp: 32,
+        decode_ep: 32,
+        decode_dp_attention: true,
+        decode_num_workers: 1,
+        num_decode_gpu: 32,
+        kv_offloading: 'dram',
+        kv_offload_backend: 'hicache',
+        server_gpu_cache_hit_rate: 0.707,
+        server_cpu_cache_hit_rate: 0.242,
+        theoretical_cache_hit_rate: 0.973,
+        total_prompt_tokens: 566443844,
+        total_generation_tokens: 4180360,
+      }),
+    ];
+    mountWithProviders(
+      <div style={{ width: 1000 }}>
+        <ScatterGraph
+          chartId="pinned-details-test"
+          modelLabel="DeepSeek R1"
+          data={data}
+          xLabel="Interactivity"
+          yLabel="Throughput"
+          chartDefinition={defaultChartDef}
+          transitionDuration={0}
+        />
+      </div>,
+      {
+        inference: { hardwareConfig: hwConfig, selectedPrecisions: [Precision.FP4] },
+        unofficial: {},
+      },
+    );
+    cy.scatterPoints()
+      .should('have.length', 1)
+      .then(([point]) => {
+        cy.wrap(point.hitArea).trigger('mousemove', {
+          clientX: point.clientX,
+          clientY: point.clientY,
+          force: true,
+        });
+        cy.get('[data-hover-tooltip]').should('contain.text', 'FP4 · conc 10888');
+        cy.get('[data-pinned-config]').should('not.exist');
+        clickScatterPoint(point);
+      });
+    cy.get('[data-testid="point-details-panel"] p').first().should('contain.text', 'FP4');
+    cy.get('[data-pinned-config]')
+      .should('contain.text', 'Multi-node disaggregated · 64 chips · conc 10,888')
+      .and('not.have.css', 'font-family', 'monospace');
+    cy.get('[data-pinned-parallelism]')
+      .should('contain.text', 'Prefill')
+      .and('contain.text', 'Decode')
+      .and('contain.text', 'DEP2')
+      .find('.pinned-compact-topology tbody tr')
+      .should('have.length', 2)
+      .first()
+      .should('contain.text', 'DEP2');
+    cy.get('.pinned-raw-topology').should('not.exist');
+    cy.get('[data-pinned-parallelism]')
+      .should('not.contain.text', 'Configuration details')
+      .and('not.contain.text', '配置详情');
+    cy.get('[data-pinned-cache]')
+      .should('contain.text', 'Chip 70.7%')
+      .and('contain.text', 'CPU 24.2%')
+      .and('contain.text', 'theoretical 97.3%')
+      .find('[data-hover-cache-bar]')
+      .scrollIntoView()
+      .should('be.visible');
+    cy.get('[data-pinned-tokens]')
+      .should('contain.text', '566,443,844')
+      .and('contain.text', '4,180,360');
+    cy.get('.inferencex-pinned-tooltip').should(($card) => {
+      expect($card[0].scrollWidth).to.equal($card[0].clientWidth);
+    });
+    cy.get('[data-testid="point-details-close"]').click();
+    cy.get('[data-pinned-config]').should('not.exist');
+  });
+
+  it('keeps the frontier modes and overlay winners without exposing the retired hinterland', () => {
+    const official = [
+      createMockInferenceData({ hwKey: 'h100', precision: Precision.FP8, x: 20, y: 80 }),
+      createMockInferenceData({ hwKey: 'h100', precision: Precision.FP8, x: 80, y: 20 }),
+    ];
+    const overlay = [
+      createMockInferenceData({ hwKey: 'b200', precision: Precision.FP8, x: 90, y: 90 }),
+      createMockInferenceData({ hwKey: 'b200', precision: Precision.FP8, x: 80, y: 95 }),
+      createMockInferenceData({ hwKey: 'h200', precision: Precision.FP8, x: 10, y: 15 }),
+      createMockInferenceData({ hwKey: 'h200', precision: Precision.FP8, x: 15, y: 10 }),
+    ];
+    const base = createMockInferenceContextValues();
+    function ParetoHarness() {
+      const {
+        visible: showParetoFrontier,
+        playful: paretoFrontierPlayful,
+        setVisible: setShowParetoFrontier,
+      } = useParetoHighlightToggle();
+      const [showOverlay, setShowOverlay] = useState(true);
+      const [showLineLabels, setShowLineLabels] = useState(false);
+      const [showGradientLabels, setShowGradientLabels] = useState(false);
+      const inference = {
+        ...base,
+        hardwareConfig: hwConfig,
+        activeHwTypes: new Set(['h100']),
+        hwTypesWithData: new Set(['h100']),
+        selectedPrecisions: [Precision.FP8],
+        hideNonOptimal: false,
+        showParetoFrontier,
+        setShowParetoFrontier,
+        paretoFrontierPlayful,
+        showLineLabels,
+        setShowLineLabels,
+        showGradientLabels,
+        setShowGradientLabels,
+      };
+      return (
+        <InferenceContextsProvider
+          data={inference}
+          filters={inference}
+          display={inference}
+          actions={inference}
+        >
+          <button onClick={() => setShowOverlay(false)}>Dismiss test overlay</button>
+          <div style={{ width: 1000 }}>
+            <ScatterGraph
+              chartId="global-pareto-test"
+              modelLabel="DeepSeek R1"
+              data={official}
+              overlayData={
+                showOverlay ? { data: overlay, hardwareConfig: hwConfig, label: 'test' } : undefined
+              }
+              xLabel="Interactivity"
+              yLabel="Throughput"
+              chartDefinition={{ ...defaultChartDef, y_tpPerGpu_roofline: 'upper_left' }}
+              transitionDuration={0}
+            />
+          </div>
+        </InferenceContextsProvider>
+      );
+    }
+    mountWithProviders(<ParetoHarness />, {
+      unofficial: {
+        activeOverlayHwTypes: new Set(['b200', 'h200']),
+        allOverlayHwTypes: new Set(['b200', 'h200']),
+      },
+    });
+    cy.get('.global-pareto-frontier, .pareto-hinterland').should('not.exist');
+    cy.get('#global-pareto-test-pareto-frontier').should('not.exist');
+    cy.get('#global-pareto-test-pareto-hinterland').should('not.exist');
+    expandLegendAdvanced();
+    cy.get('#global-pareto-test-pareto-hinterland').should('not.exist');
+    cy.contains('Pareto Hinterland').should('not.exist');
+    cy.get('#global-pareto-test-pareto-frontier').click();
+    cy.get('.global-pareto-frontier').should('have.attr', 'stroke-dasharray', '1,6');
+    cy.get('.global-pareto-frontier')
+      .should('have.attr', 'pointer-events', 'none')
+      .and('have.attr', 'fill', 'none');
+    cy.get('.global-pareto-frontier-area')
+      .should('have.attr', 'fill', '#22c55e')
+      .and('have.attr', 'data-style', 'plain');
+    cy.get('.global-pareto-highlight circle').should('have.length', 2);
+    expectPointsFaded(true);
+    cy.get('.roofline-path').should(($marks) => {
+      $marks.each((_, mark) => {
+        expect(mark.style.filter).to.equal('opacity(0.2)');
+      });
+    });
+    cy.get('.unofficial-overlay-pt').should(($marks) => {
+      expect($marks).to.have.length(4);
+      $marks.each((_, mark) => {
+        const hw = (mark as unknown as { __data__: { hwKey: string } }).__data__.hwKey;
+        expect(mark.style.filter).to.equal(hw === 'b200' ? '' : 'opacity(0.2)');
+      });
+    });
+    cy.get('.overlay-roofline-path').should(($curves) => {
+      expect($curves).to.have.length(2);
+      $curves.each((_, curve) => {
+        const hw = (curve as unknown as { __data__: { points: { hwKey: string }[] } }).__data__
+          .points[0].hwKey;
+        expect(curve.style.filter).to.equal(hw === 'b200' ? '' : 'opacity(0.2)');
+      });
+    });
+    cy.get('#scatter-line-labels').click();
+    cy.get('.line-label[data-hw-key="h100"]').should(($labels) => {
+      $labels.each((_, label) => {
+        expect(label.style.filter).to.equal('opacity(0.2)');
+      });
+    });
+    cy.get('#scatter-line-labels').click();
+    cy.get('#scatter-line-labels').click();
+    cy.get('.line-label[data-hw-key="h100"]').should(($labels) => {
+      $labels.each((_, label) => {
+        expect(label.style.filter).to.equal('opacity(0.2)');
+      });
+    });
+    cy.get('#global-pareto-test-pareto-frontier').click();
+    expectPointsFaded(false);
+    cy.get('.roofline-path, .unofficial-overlay-pt, .overlay-roofline-path').should(($marks) => {
+      $marks.each((_, mark) => {
+        expect(mark.style.filter).to.equal('');
+      });
+    });
+    cy.get('#global-pareto-test-pareto-frontier').click();
+    expectPointsFaded(true);
+    cy.get('.pareto-hinterland').should('not.exist');
+    cy.contains('button', 'Dismiss test overlay').click();
+    cy.get('.global-pareto-highlight circle').should('have.length', 2);
+    expectPointsFaded(false);
+    cy.get('.roofline-path').should(($marks) => {
+      $marks.each((_, mark) => {
+        expect(mark.style.filter).to.equal('');
+      });
+    });
+    cy.get('#global-pareto-test-pareto-frontier').click();
+    cy.get('.global-pareto-frontier').should('not.exist');
+    cy.get('.global-pareto-frontier-area').should('not.exist');
+    cy.get('#global-pareto-test-pareto-frontier').click();
+    cy.get('.global-pareto-frontier-area')
+      .should('have.length', 1)
+      .each(($area) => {
+        expect($area.attr('data-style')).to.equal('plain');
+      });
+    cy.get('#global-pareto-test-pareto-frontier').click();
+    cy.get('#global-pareto-test-pareto-frontier').click();
+    cy.get('.global-pareto-frontier-area')
+      .should('have.length', 1)
+      .each(($area) => {
+        expect($area.attr('data-style')).to.equal('playful');
+        expect($area.attr('fill')).to.match(/^url\(#/);
+      });
+    cy.get('pattern[id$="-scene"]').should('have.length', 1);
+    cy.get('pattern[id$="-scene"] text').should('not.exist');
+    cy.get('pattern[id$="-scene"] image')
+      .should('have.length', 1)
+      .each(($image) => {
+        expect($image.attr('preserveAspectRatio')).to.equal('xMidYMid slice');
+        expect(Number($image.attr('width'))).to.be.greaterThan(160);
+        expect($image.attr('width')).to.equal($image.parent().attr('width'));
+        expect($image.attr('height')).to.equal($image.parent().attr('height'));
+        expect($image.attr('href')).to.equal('/decorative/pareto/sunny-castle.webp');
+      });
+    cy.get('.global-pareto-frontier-area').each(($area) => {
+      expect($area.attr('fill-opacity')).to.equal('0.3');
+    });
+    cy.get('#global-pareto-test-pareto-frontier').click();
+    cy.get('.global-pareto-frontier-area').should('not.exist');
+    cy.get('pattern[id$="-scene"]').should('not.exist');
+    cy.get('#global-pareto-test-pareto-frontier').click();
+    cy.get('.global-pareto-frontier-area').should('have.attr', 'data-style', 'plain');
+    cy.get('.global-pareto-frontier-area').should('have.attr', 'fill', '#22c55e');
+    cy.get('[data-testid="legend-advanced-toggle"]').click();
+    cy.get('#global-pareto-test-pareto-frontier').should('not.exist');
+    cy.get('.global-pareto-frontier-area').should('have.length', 1);
+    cy.get('.pareto-hinterland, .pareto-hinterland-area').should('not.exist');
+  });
+
+  for (const mixedRuns of [false, true]) {
+    it(`${mixedRuns ? 'hides' : 'shows'} the refresh changelog for a ${mixedRuns ? 'mixed' : 'matching'} run series`, () => {
+      const refreshUrl =
+        'https://github.com/SemiAnalysisAI/InferenceX/actions/runs/33219708211/attempts/1';
+      const point = createMockInferenceData({
+        hwKey: 'gb300_dynamo-trt',
+        model: Model.Qwen3_5,
+        run_url: refreshUrl,
+        benchmark_type: 'agentic_traces',
+      });
+      const description = 'Refresh to collect TensorRT-LLM server metrics.';
+      mountWithProviders(
+        <div style={{ width: 1000, height: 600 }}>
+          <ScatterGraph
+            chartId="changelog-provenance"
+            modelLabel="Qwen3.5 397B"
+            data={
+              mixedRuns
+                ? [
+                    point,
+                    {
+                      ...point,
+                      x: 50,
+                      run_url:
+                        'https://github.com/SemiAnalysisAI/InferenceX/actions/runs/31927376673/attempts/1',
+                    },
+                  ]
+                : [point]
+            }
+            xLabel="Interactivity"
+            yLabel="Throughput"
+            chartDefinition={defaultChartDef}
+          />
+        </div>,
+        {
+          inference: {
+            selectedModel: Model.Qwen3_5,
+            selectedSequence: Sequence.AgenticTraces,
+            selectedRunId: '33219708211',
+            selectedPrecisions: [Precision.FP4],
+            activeHwTypes: new Set(['gb300_dynamo-trt']),
+            hwTypesWithData: new Set(['gb300_dynamo-trt']),
+            hardwareConfig: {
+              'gb300_dynamo-trt': {
+                name: 'gb300-dynamo-trt',
+                label: 'GB300',
+                suffix: '(Dynamo TRTLLM)',
+                gpu: 'GB300',
+              },
+            },
+            availableRuns: {
+              '33219708211': {
+                runId: '33219708211',
+                runUrl: refreshUrl,
+                runDate: '2026-09-01',
+                conclusion: 'success',
+                changelog: {
+                  entries: [
+                    {
+                      config_keys: ['qwen3.5-fp4-gb300-dynamo-trt-agentic-disagg'],
+                      description,
+                      pr_link: null,
+                    },
+                  ],
+                },
+              },
+            },
+          },
+          unofficial: {},
+        },
+      );
+      cy.get('label[for="checkbox-gb300_dynamo-trt"]')
+        .parent()
+        .trigger('pointermove', { pointerType: 'mouse' });
+      cy.contains('[role="tooltip"]', description).should(mixedRuns ? 'not.exist' : 'exist');
+    });
+  }
+
+  it('offers the complete table when matching official points are all clipped', () => {
+    const point = createMockInferenceData({ hwKey: 'b200_trt', precision: Precision.FP4 });
+    mountWithProviders(
+      <div style={{ width: 800 }}>
+        <ScatterGraph
+          chartId="empty-clipped"
+          modelLabel="DeepSeek R1"
+          data={[]}
+          clippedData={[{ point, reasons: ['cost'] }]}
+          xLabel="Concurrency"
+          yLabel="Cost"
+          chartDefinition={defaultChartDef}
+          onShowTable={cy.stub().as('showCompleteTable')}
+        />
+      </div>,
+      {
+        inference: {
+          hardwareConfig: hwConfig,
+          activeHwTypes: new Set(['b200_trt']),
+          hwTypesWithData: new Set(['b200_trt']),
+          selectedPrecisions: [Precision.FP4],
+        },
+        unofficial: {},
+      },
+    );
+    cy.get('[data-testid="scatter-empty-state"]').should('have.attr', 'data-reason', 'clipped');
+    cy.get('[data-testid="scatter-empty-show-table"]').click();
+    cy.get('@showCompleteTable').should('have.been.calledOnce');
+    cy.get('@setQuickFilterVendors').should('not.have.been.called');
+    cy.get('@selectAllHwTypes').should('not.have.been.called');
+  });
+
+  it('explains when the selected dataset lacks role-local energy', () => {
+    mountWithProviders(
+      <div style={{ width: 800, height: 600 }}>
+        <ScatterGraph
+          chartId="test-scatter-role-energy-empty"
+          modelLabel="DeepSeek R1"
+          data={[]}
+          xLabel="Interactivity"
+          yLabel="Measured Prefill J per Input Token"
+          chartDefinition={defaultChartDef}
+        />
+      </div>,
+      {
+        inference: {
+          hardwareConfig: hwConfig,
+          activeHwTypes: new Set(['mi355x']),
+          hwTypesWithData: new Set(),
+          selectedYAxisMetric: 'y_measuredPrefillJPerInputToken',
+        },
+        unofficial: {},
+      },
+    );
+
+    cy.contains('This dataset does not report role-level prefill/decode energy.').should(
+      'be.visible',
+    );
+    cy.contains(
+      'No measurements to plot for this selection. Review the benchmark controls above or adjust quick filters.',
+    ).should('not.exist');
+  });
+
+  it('explains why All in Measured has no points', () => {
+    cy.viewport(1280, 720);
+    mountWithProviders(
+      <div style={{ width: 800, height: 600 }}>
+        <ScatterGraph
+          chartId="test-scatter-all-in-measured-empty"
+          modelLabel="Kimi K3"
+          data={[]}
+          xLabel="Interactivity"
+          yLabel="All in Measured Power per Chip"
+          chartDefinition={defaultChartDef}
+        />
+      </div>,
+      {
+        inference: {
+          hardwareConfig: hwConfig,
+          activeHwTypes: new Set(['b200_trt']),
+          hwTypesWithData: new Set(),
+          selectedYAxisMetric: 'y_utilityModeledWatts',
+        },
+        unofficial: {},
+      },
+    );
+
+    cy.contains('No values are available for All in Measured in this selection.').should(
+      'be.visible',
+    );
+    cy.contains('No measurements to plot for this selection.').should('not.exist');
+    cy.contains('eight-GPU HGX/OAM systems, or whole GB200/GB300 NVL72 compute trays').should(
+      'be.visible',
+    );
+  });
+
+  for (const selectedYAxisMetric of ['y_tpPerGpu', 'y_measuredPrefillJPerInputToken'] as const) {
+    it(`offers targeted quick-filter recovery on ${selectedYAxisMetric} without changing model, precision or date`, () => {
+      mountWithProviders(
+        <div style={{ width: 800 }}>
+          <ScatterGraph
+            chartId="empty-filtered"
+            modelLabel="DeepSeek R1"
+            data={[]}
+            xLabel="Concurrency"
+            yLabel="Throughput"
+            chartDefinition={defaultChartDef}
+          />
+        </div>,
+        {
+          inference: {
+            selectedYAxisMetric,
+            quickFilters: {
+              vendors: ['AMD'],
+              frameworks: ['vllm'],
+              deployment: [],
+              spec: [],
+              power: [],
+            },
+          },
+          unofficial: {},
+        },
+      );
+      cy.get('[data-testid="scatter-empty-state"]').should('have.attr', 'data-reason', 'filtered');
+      cy.contains('No points match this selection. Try removing a quick filter;').should(
+        'be.visible',
+      );
+      cy.contains('This dataset does not report role-level prefill/decode energy.').should(
+        'not.exist',
+      );
+      cy.get('[data-testid="scatter-empty-clear-filters"]').click();
+      cy.get('@setQuickFilterVendors').should('have.been.calledWith', []);
+      cy.get('@setQuickFilterFrameworks').should('have.been.calledWith', []);
+      cy.get('@setSelectedModel').should('not.have.been.called');
+      cy.get('@setSelectedPrecisions').should('not.have.been.called');
+      cy.get('@setSelectedDateRange').should('not.have.been.called');
+    });
+  }
+
+  it('restores hidden matching official and unofficial chip series together', () => {
+    const restore = cy.stub().as('restoreUnified');
+    const official = createMockInferenceData({ hwKey: 'b200_trt', precision: Precision.FP4 });
+    const overlay = createMockInferenceData({ hwKey: 'h100', precision: Precision.FP4 });
+    mountWithProviders(
+      <div style={{ width: 800 }}>
+        <ScatterGraph
+          chartId="empty-hidden"
+          modelLabel="DeepSeek R1"
+          data={[official]}
+          xLabel="Concurrency"
+          yLabel="Throughput"
+          chartDefinition={defaultChartDef}
+          overlayData={{ data: [overlay], hardwareConfig: hwConfig, label: 'test-run' }}
+        />
+      </div>,
+      {
+        inference: {
+          hardwareConfig: hwConfig,
+          activeHwTypes: new Set(),
+          hwTypesWithData: new Set(['b200_trt']),
+          selectedPrecisions: [Precision.FP4],
+        },
+        unofficial: {
+          isUnofficialRun: true,
+          localOfficialOverride: new Set(),
+          activeOverlayHwTypes: new Set(),
+          allOverlayHwTypes: new Set(['h100']),
+          setUnifiedOverlaySelection: restore,
+        },
+      },
+    );
+    cy.get('[data-testid="scatter-empty-state"]').should('have.attr', 'data-reason', 'hidden');
+    cy.get('[data-testid="scatter-empty-show-chips"]').click();
+    cy.get('@restoreUnified')
+      .should('have.been.calledOnce')
+      .then(() => {
+        expect([...restore.lastCall.args[0]]).to.include('b200_trt');
+        expect([...restore.lastCall.args[1]]).to.include('h100');
+      });
+    cy.get('@setQuickFilterVendors').should('not.have.been.called');
+  });
+
+  it('keeps official-only legend toggles active after a scope change', () => {
+    const chartDefinition = createMockChartDefinition({
+      chartType: 'interactivity',
+      y_tpPerGpu_roofline: 'upper_left',
+    });
+    const officialData = ['b200_sglang', 'h100_vllm'].flatMap((hwKey, hwIndex) =>
+      [8, 16, 32].map((x, index) =>
+        createMockInferenceData({
+          hwKey,
+          x,
+          y: 320 - hwIndex * 20 - index * 40,
+          precision: Precision.FP4,
+        }),
+      ),
+    );
+    const baseInference = createMockInferenceContextValues();
+
+    function OfficialScopeHarness() {
+      const [secondScope, setSecondScope] = useState(false);
+      const activeHwTypes = new Set([secondScope ? 'h100_vllm' : 'b200_sglang']);
+      const selectedModel = secondScope ? Model.DeepSeek_R1 : Model.DeepSeek_V4_Pro;
+      const inference = {
+        ...baseInference,
+        hardwareConfig: hwConfig,
+        activeHwTypes,
+        hwTypesWithData: new Set(['b200_sglang', 'h100_vllm']),
+        selectedModel,
+        selectedSequence: Sequence.AgenticTraces,
+        selectedPrecisions: [Precision.FP4],
+      };
+
+      return (
+        <InferenceContextsProvider
+          data={inference}
+          filters={inference}
+          display={inference}
+          actions={inference}
+        >
+          <button data-testid="change-official-scope" onClick={() => setSecondScope(true)}>
+            Change official scope
+          </button>
+          <div style={{ width: 800, height: 600 }}>
+            <ScatterGraph
+              chartId="test-scatter-official-scope"
+              modelLabel={selectedModel}
+              data={officialData}
+              xLabel="Concurrency"
+              yLabel="Throughput / Chip (tok/s)"
+              chartDefinition={chartDefinition}
+            />
+          </div>
+        </InferenceContextsProvider>
+      );
+    }
+
+    mountWithProviders(<OfficialScopeHarness />, { unofficial: {} });
+
+    cy.get('#test-scatter-official-scope svg .roofline-path[data-hw-key="b200_sglang"]').should(
+      'have.css',
+      'opacity',
+      '1',
+    );
+    cy.get('#test-scatter-official-scope svg .roofline-path[data-hw-key="h100_vllm"]').should(
+      'have.css',
+      'opacity',
+      '0',
+    );
+
+    cy.get('[data-testid="change-official-scope"]').click();
+    cy.get('#test-scatter-official-scope svg .roofline-path[data-hw-key="b200_sglang"]').should(
+      'have.css',
+      'opacity',
+      '0',
+    );
+    cy.get('#test-scatter-official-scope svg .roofline-path[data-hw-key="h100_vllm"]').should(
+      'have.css',
+      'opacity',
+      '1',
+    );
+  });
+
+  it('keeps a preview scope pending until official data arrives', () => {
+    const chartDefinition = createMockChartDefinition({
+      chartType: 'interactivity',
+      y_tpPerGpu_roofline: 'upper_left',
+    });
+    const baseInference = createMockInferenceContextValues();
+    const baseUnofficial = createMockUnofficialRunContext();
+
+    function DelayedOfficialScopeHarness() {
+      const [secondScope, setSecondScope] = useState(false);
+      const [secondScopeLoaded, setSecondScopeLoaded] = useState(false);
+      const [activeOverlayKeys, setActiveOverlayKeys] = useState(new Set(['h100_vllm']));
+      const [officialOverride, setOfficialOverride] = useState<Set<string> | null>(
+        new Set(['h100_sglang']),
+      );
+      const model = secondScope ? Model.DeepSeek_R1 : Model.DeepSeek_V4_Pro;
+      const officialKeys = secondScope ? ['b200_sglang', 'h100_vllm'] : ['h100_sglang'];
+      const visibleOfficialKeys = secondScope && !secondScopeLoaded ? [] : officialKeys;
+      const officialRows = visibleOfficialKeys.flatMap((hwKey, hwIndex) =>
+        [8, 16, 32].map((x, index) =>
+          createMockInferenceData({
+            hwKey,
+            model,
+            x,
+            y: 320 - hwIndex * 20 - index * 40,
+            precision: Precision.FP4,
+          }),
+        ),
+      );
+      const overlayKey = secondScope ? 'b200_vllm' : 'h100_vllm';
+      const overlayData = {
+        data: [8, 16, 32].map((x, index) =>
+          createMockInferenceData({
+            hwKey: overlayKey,
+            model,
+            x,
+            y: 260 - index * 40,
+            precision: Precision.FP4,
+          }),
+        ),
+        hardwareConfig: hwConfig,
+        label: 'delayed-official-scope',
+      };
+      const inference = {
+        ...baseInference,
+        hardwareConfig: hwConfig,
+        activeHwTypes: new Set([officialKeys[0]]),
+        hwTypesWithData: new Set(visibleOfficialKeys),
+        loading: secondScope && !secondScopeLoaded,
+        selectedModel: model,
+        selectedSequence: Sequence.AgenticTraces,
+        selectedPrecisions: [Precision.FP4],
+      };
+      const unofficial = {
+        ...baseUnofficial,
+        isUnofficialRun: true,
+        activeOverlayHwTypes: activeOverlayKeys,
+        setUnifiedOverlaySelection: (official: Set<string>, overlay: Set<string>) => {
+          setOfficialOverride(official);
+          setActiveOverlayKeys(overlay);
+        },
+        allOverlayHwTypes: new Set(['h100_vllm', 'b200_vllm']),
+        localOfficialOverride: officialOverride,
+      };
+
+      return (
+        <UnofficialRunContext.Provider value={unofficial}>
+          <InferenceContextsProvider
+            data={inference}
+            filters={inference}
+            display={inference}
+            actions={inference}
+          >
+            <button data-testid="change-delayed-chart-scope" onClick={() => setSecondScope(true)}>
+              Change scope
+            </button>
+            <button
+              data-testid="load-delayed-chart-scope"
+              onClick={() => {
+                setOfficialOverride(new Set(officialKeys));
+                setSecondScopeLoaded(true);
+              }}
+            >
+              Load official data
+            </button>
+            <output data-testid="official-preview-override">
+              {officialOverride === null ? 'none' : [...officialOverride].join(',')}
+            </output>
+            <div style={{ width: 800, height: 600 }}>
+              <ScatterGraph
+                chartId="test-scatter-delayed-official-scope"
+                modelLabel={model}
+                data={officialRows}
+                xLabel="Concurrency"
+                yLabel="Throughput / Chip (tok/s)"
+                chartDefinition={chartDefinition}
+                overlayData={overlayData}
+              />
+            </div>
+          </InferenceContextsProvider>
+        </UnofficialRunContext.Provider>
+      );
+    }
+
+    mountWithProviders(<DelayedOfficialScopeHarness />);
+    cy.get('[data-testid="change-delayed-chart-scope"]').click();
+    cy.get('[data-testid="official-preview-override"]').should('have.text', 'h100_sglang');
+
+    cy.get('[data-testid="load-delayed-chart-scope"]').click();
+    cy.get(
+      '#test-scatter-delayed-official-scope svg .roofline-path[data-hw-key="b200_sglang"]',
+    ).should('have.css', 'opacity', '1');
+    cy.get(
+      '#test-scatter-delayed-official-scope svg .roofline-path[data-hw-key="h100_vllm"]',
+    ).should('have.css', 'opacity', '1');
+  });
+
+  it('aligns the desktop legend with the top guideline without changing the mobile gap', () => {
+    cy.viewport(1440, 900);
+    const chartId = 'test-scatter-legend';
+    const data = [
+      createMockInferenceData({ hwKey: 'b200_trt', x: 64, y: 320, precision: Precision.FP4 }),
+      createMockInferenceData({ hwKey: 'h100', x: 32, y: 210, precision: Precision.FP4 }),
+    ];
+
+    mountWithProviders(
+      <div style={{ width: 800, height: 600 }}>
+        <ScatterGraph
+          chartId={chartId}
+          modelLabel="DeepSeek R1"
+          data={data}
+          xLabel="Concurrency"
+          yLabel="Throughput / Chip (tok/s)"
+          chartDefinition={defaultChartDef}
+        />
+      </div>,
+      {
+        inference: {
+          hardwareConfig: hwConfig,
+          activeHwTypes: new Set(['b200_trt', 'h100']),
+          hwTypesWithData: new Set(['b200_trt', 'h100']),
+          selectedPrecisions: [Precision.FP4],
+        },
+        unofficial: {},
+      },
+    );
+
+    cy.get('.sidebar-legend').should('exist');
+    cy.get('.sidebar-legend label').should('have.length.greaterThan', 0);
+
+    const assertDesktopAlignment = () => {
+      cy.get(`#${chartId}`).should(($chart) => {
+        const legend = $chart[0].querySelector('.sidebar-legend')!.getBoundingClientRect();
+        const guideline = $chart[0].querySelector('.border-top')!.getBoundingClientRect();
+        expect(legend.top - guideline.top, 'legend level with top guideline').to.be.closeTo(0, 0.1);
+      });
+    };
+    assertDesktopAlignment();
+
+    cy.viewport(375, 812);
+    cy.get('[data-slot="chart-legend-wrapper"]').should(($legend) => {
+      expect(getComputedStyle($legend[0]).marginTop, 'unchanged mobile gap').to.equal('12px');
+      const svg = $legend[0].parentElement!.querySelector('svg')!;
+      expect($legend[0].getBoundingClientRect().top).to.be.at.least(
+        svg.getBoundingClientRect().bottom,
+      );
+    });
+    cy.viewport(1440, 900);
+    assertDesktopAlignment();
+  });
+
+  it('keeps pinned details inside the plot-height legend slot and scrolls them', () => {
+    cy.viewport(1440, 900);
+    const chartId = 'test-scatter-details-scroll';
+    const rich = {
+      precision: Precision.FP4,
+      benchmark_type: 'agentic_traces',
+      framework: 'sglang',
+      disagg: true,
+      is_multinode: true,
+      physicalChips: 64,
+      conc: 384,
+      prefill_tp: 8,
+      prefill_ep: 8,
+      prefill_num_workers: 3,
+      num_prefill_gpu: 24,
+      decode_tp: 32,
+      decode_ep: 32,
+      decode_dp_attention: true,
+      decode_num_workers: 1,
+      num_decode_gpu: 32,
+      kv_offloading: 'dram',
+      kv_offload_backend: 'hicache',
+      server_gpu_cache_hit_rate: 0.067,
+      server_cpu_cache_hit_rate: 0.903,
+      theoretical_cache_hit_rate: 0.969,
+      total_prompt_tokens: 566443844,
+      total_generation_tokens: 4180360,
+    };
+    const data = [
+      createMockInferenceData({ hwKey: 'b200_trt', x: 64, y: 320, ...rich }),
+      createMockInferenceData({ hwKey: 'h100', x: 32, y: 210, ...rich }),
+    ];
+
+    mountWithProviders(
+      <div style={{ width: 1200 }}>
+        <ScatterGraph
+          chartId={chartId}
+          modelLabel="DeepSeek R1"
+          data={data}
+          xLabel="Interactivity"
+          yLabel="Throughput / Chip (tok/s)"
+          chartDefinition={defaultChartDef}
+          transitionDuration={0}
+        />
+      </div>,
+      {
+        inference: {
+          hardwareConfig: hwConfig,
+          activeHwTypes: new Set(['b200_trt', 'h100']),
+          hwTypesWithData: new Set(['b200_trt', 'h100']),
+          selectedPrecisions: [Precision.FP4],
+        },
+        unofficial: {},
+      },
+    );
+
+    cy.get('.sidebar-legend').should('exist');
+    let legendWidth = 0;
+    cy.get(`#${chartId} [data-slot="chart-legend-wrapper"]`).then(($slot) => {
+      legendWidth = $slot[0].getBoundingClientRect().width;
+    });
+    let rowHeight = 0;
+    cy.get(`#${chartId} [data-slot="chart-legend-wrapper"]`).then(($slot) => {
+      rowHeight = $slot[0].parentElement!.getBoundingClientRect().height;
+    });
+    cy.scatterPoints(`#${chartId}`).then((points) => clickScatterPoint(points[0]));
+    cy.get(`#${chartId} [data-testid="point-details-panel"]`).should(($panel) => {
+      const panel = $panel[0];
+      const slot = panel.closest('[data-slot="chart-legend-wrapper"]')!;
+      const row = slot.parentElement!;
+      const svg = row.querySelector('svg')!.getBoundingClientRect();
+      expect(row.getBoundingClientRect().height, 'row does not grow').to.be.closeTo(rowHeight, 1);
+      expect(slot.getBoundingClientRect().width, 'slot keeps legend width').to.be.closeTo(
+        legendWidth,
+        1,
+      );
+      expect(panel.getBoundingClientRect().bottom, 'panel ends within the plot row').to.be.at.most(
+        Math.max(svg.bottom, row.getBoundingClientRect().bottom) + 1,
+      );
+      const body = panel.querySelector<HTMLElement>('[data-slot="point-details-body"]')!;
+      expect(body.scrollHeight, 'details overflow').to.be.greaterThan(body.clientHeight);
+      expect(getComputedStyle(body).overflowY).to.equal('auto');
+      expect(panel.scrollHeight, 'panel itself does not scroll').to.equal(panel.clientHeight);
+    });
+    cy.get(`#${chartId} [data-slot="point-details-body"]`).scrollTo('bottom');
+    cy.get(`#${chartId} [data-testid="point-details-close"]`).should('be.visible').click();
+    cy.get(`#${chartId} [data-testid="point-details-panel"]`).should('not.exist');
+  });
+
+  it('renders line labels for both official and overlay (unofficial) rooflines', () => {
+    const interactivityChartDef = createMockChartDefinition({
+      chartType: 'interactivity',
+      y_tpPerGpu_roofline: 'upper_left',
+    });
+    const runId = 32177976542;
+    const runBranch = 'qwen3.5-fp4-gb200-dynamo-sglang-agentic-mtp-pareto-refresh';
+    const runUrl = `https://github.com/SemiAnalysisAI/InferenceX/actions/runs/${runId}`;
+    const officialData = [
+      createMockInferenceData({ hwKey: 'h100', x: 8, y: 240, precision: Precision.FP4 }),
+      createMockInferenceData({ hwKey: 'h100', x: 16, y: 200, precision: Precision.FP4 }),
+      createMockInferenceData({ hwKey: 'h100', x: 32, y: 150, precision: Precision.FP4 }),
+    ];
+    const overlayData = {
+      data: [
+        createMockInferenceData({
+          hwKey: 'b200_trt',
+          x: 8,
+          y: 320,
+          precision: Precision.FP4,
+          run_url: runUrl,
+        }),
+        createMockInferenceData({
+          hwKey: 'b200_trt',
+          x: 16,
+          y: 280,
+          precision: Precision.FP4,
+          run_url: runUrl,
+        }),
+        createMockInferenceData({
+          hwKey: 'b200_trt',
+          x: 32,
+          y: 220,
+          precision: Precision.FP4,
+          run_url: runUrl,
+        }),
+      ],
+      hardwareConfig: hwConfig,
+      label: runBranch,
+      runUrl,
+    };
+
+    mountWithProviders(
+      <div style={{ width: 800, height: 600 }}>
+        <ScatterGraph
+          chartId="test-scatter-overlay-labels"
+          modelLabel="DeepSeek R1"
+          data={officialData}
+          xLabel="Concurrency"
+          yLabel="Throughput / Chip (tok/s)"
+          chartDefinition={interactivityChartDef}
+          overlayData={overlayData}
+        />
+      </div>,
+      {
+        inference: {
+          hardwareConfig: hwConfig,
+          activeHwTypes: new Set(['h100']),
+          hwTypesWithData: new Set(['h100']),
+          selectedPrecisions: [Precision.FP4],
+          showLineLabels: true,
+        },
+        unofficial: {
+          activeOverlayHwTypes: new Set(['b200_trt']),
+          allOverlayHwTypes: new Set(['b200_trt']),
+          runIndexByUrl: { [runUrl]: 0, [String(runId)]: 0 },
+          unofficialRunInfos: [
+            {
+              id: runId,
+              name: 'CI run',
+              branch: runBranch,
+              sha: '7a4a06b',
+              createdAt: '2026-08-18T19:40:51Z',
+              url: runUrl,
+              conclusion: 'success',
+              status: 'completed',
+              isNonMainBranch: true,
+            },
+          ],
+        },
+      },
+    );
+
+    cy.get('#test-scatter-overlay-labels svg .roofline-path').should('have.length.greaterThan', 0);
+    cy.get('#test-scatter-overlay-labels svg .overlay-roofline-path').should(
+      'have.length.greaterThan',
+      0,
+    );
+    cy.get('#test-scatter-overlay-labels svg .line-label').should('have.length.greaterThan', 0);
+    cy.get('#test-scatter-overlay-labels svg .line-label')
+      .filter('[data-line-key^="overlay-"]')
+      .should('have.length.greaterThan', 0);
+    cy.get('#test-scatter-overlay-labels svg .line-label')
+      .filter('[data-line-key]:not([data-line-key^="overlay-"])')
+      .should('have.length.greaterThan', 0);
+    cy.get('#test-scatter-overlay-labels svg .line-label[data-line-key^="overlay-"] .ll-text')
+      .should('have.text', 'B200 (TRTLLM)')
+      .and('not.contain.text', runBranch);
+    cy.get(
+      '#test-scatter-overlay-labels svg .line-label[data-line-key^="overlay-"] .ll-gpu',
+    ).should('have.text', 'B200');
+    cy.get('#test-scatter-overlay-labels svg .line-label[data-line-key^="overlay-"]')
+      .should('have.attr', 'data-visible', '1')
+      .and('have.css', 'opacity', '1');
+    cy.get('#test-scatter-overlay-labels [data-testid="chart-legend"]').should(
+      'contain.text',
+      runBranch,
+    );
+  });
+
+  it('places precision between the GPU and engine in multi-precision labels', () => {
+    const runUrl = 'https://github.com/x/y/actions/runs/precision-order';
+    const chartDefinition = createMockChartDefinition({
+      chartType: 'interactivity',
+      y_tpPerGpu_roofline: 'upper_left',
+    });
+    const data = [Precision.FP4, Precision.FP8].flatMap((precision, precisionIndex) =>
+      [8, 16].map((x, index) =>
+        createMockInferenceData({
+          hwKey: 'b200_trt',
+          x,
+          y: 320 - precisionIndex * 20 - index * 40,
+          precision,
+        }),
+      ),
+    );
+    const overlayData = {
+      data: [Precision.FP4, Precision.FP8].flatMap((precision, precisionIndex) =>
+        [8, 16].map((x, index) =>
+          createMockInferenceData({
+            hwKey: 'h100_vllm',
+            x,
+            y: 260 - precisionIndex * 20 - index * 40,
+            precision,
+            run_url: runUrl,
+          }),
+        ),
+      ),
+      hardwareConfig: hwConfig,
+      label: '',
+      runUrl,
+    };
+
+    mountWithProviders(
+      <div style={{ width: 800, height: 600 }}>
+        <ScatterGraph
+          chartId="test-scatter-precision-order"
+          modelLabel="DeepSeek R1"
+          data={data}
+          xLabel="Concurrency"
+          yLabel="Throughput / Chip (tok/s)"
+          chartDefinition={chartDefinition}
+          overlayData={overlayData}
+        />
+      </div>,
+      {
+        inference: {
+          hardwareConfig: hwConfig,
+          activeHwTypes: new Set(['b200_trt']),
+          hwTypesWithData: new Set(['b200_trt']),
+          selectedPrecisions: [Precision.FP4, Precision.FP8],
+          showLineLabels: true,
+        },
+        unofficial: {
+          activeOverlayHwTypes: new Set(['h100_vllm']),
+          allOverlayHwTypes: new Set(['h100_vllm']),
+          runIndexByUrl: { [runUrl]: 0, 'precision-order': 0 },
+          unofficialRunInfos: [],
+        },
+      },
+    );
+
+    cy.get('#test-scatter-precision-order svg .line-label[data-hw-key="b200_trt"] .ll-text')
+      .should('have.length', 2)
+      .then(($labels) => {
+        expect($labels.toArray().map((label) => label.textContent)).to.have.members([
+          'B200 FP4 (TRTLLM)',
+          'B200 FP8 (TRTLLM)',
+        ]);
+        for (const label of $labels) {
+          expect(
+            [...label.querySelectorAll('tspan')].map((segment) => segment.className.baseVal),
+          ).to.deep.equal(['ll-gpu', 'll-precision', 'll-engine']);
+        }
+      });
+    cy.get('#test-scatter-precision-order svg .line-label[data-line-key^="overlay-"] .ll-text')
+      .should('have.length', 2)
+      .then(($labels) => {
+        expect($labels.toArray().map((label) => label.textContent)).to.have.members([
+          'H100 FP4 (vLLM)',
+          'H100 FP8 (vLLM)',
+        ]);
+      });
+  });
+
+  it('renders a line label for a singleton unofficial overlay series', () => {
+    const runUrl = 'https://github.com/x/y/actions/runs/31266452885';
+    const interactivityChartDef = createMockChartDefinition({
+      chartType: 'interactivity',
+      y_tpPerGpu_roofline: 'upper_left',
+    });
+    const overlayData = {
+      data: [
+        createMockInferenceData({
+          hwKey: 'b200_trt',
+          x: 24,
+          y: 310,
+          precision: Precision.FP4,
+          run_url: runUrl,
+        }),
+      ],
+      hardwareConfig: hwConfig,
+      label: 'tileRT',
+      runUrl,
+    };
+
+    mountWithProviders(
+      <div style={{ width: 800, height: 600 }}>
+        <ScatterGraph
+          chartId="test-scatter-singleton-overlay-label"
+          modelLabel="DeepSeek R1"
+          data={[]}
+          xLabel="Concurrency"
+          yLabel="Throughput / Chip (tok/s)"
+          chartDefinition={interactivityChartDef}
+          overlayData={overlayData}
+        />
+      </div>,
+      {
+        inference: {
+          hardwareConfig: hwConfig,
+          activeHwTypes: new Set(),
+          hwTypesWithData: new Set(),
+          selectedPrecisions: [Precision.FP4],
+          showLineLabels: true,
+        },
+        unofficial: {
+          activeOverlayHwTypes: new Set(['b200_trt']),
+          allOverlayHwTypes: new Set(['b200_trt']),
+          runIndexByUrl: { [runUrl]: 0, '31266452885': 0 },
+          unofficialRunInfos: [
+            {
+              id: 31266452885,
+              name: 'CI run',
+              branch: 'tileRT',
+              sha: 'abc123',
+              createdAt: '2026-08-09T00:00:00Z',
+              url: runUrl,
+              conclusion: 'success',
+              status: 'completed',
+              isNonMainBranch: true,
+            },
+          ],
+        },
+      },
+    );
+
+    cy.get('#test-scatter-singleton-overlay-label svg .unofficial-overlay-pt').should(
+      'have.length',
+      1,
+    );
+    cy.get('#test-scatter-singleton-overlay-label svg .line-label[data-line-key^="overlay-"]')
+      .should('have.length', 1)
+      .find('text')
+      .should('have.text', 'B200 (TRTLLM)');
+
+    cy.get('#test-scatter-singleton-overlay-label svg').then(($svg) => {
+      const svg = $svg[0];
+      const bounds = svg.getBoundingClientRect();
+      svg.dispatchEvent(
+        new WheelEvent('wheel', {
+          deltaY: -240,
+          clientX: bounds.x + bounds.width / 2,
+          clientY: bounds.y + bounds.height / 2,
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    });
+
+    cy.get(
+      '#test-scatter-singleton-overlay-label svg .line-label[data-line-key^="overlay-"]',
+    ).should('have.css', 'opacity', '1');
+  });
+
+  it('renders a line label for a singleton ingested hardware series', () => {
+    const interactivityChartDef = createMockChartDefinition({
+      chartType: 'interactivity',
+      y_tpPerGpu_roofline: 'upper_left',
+    });
+    const data = [
+      createMockInferenceData({
+        hwKey: 'b200_tilert_mtp',
+        x: 340,
+        y: 150,
+        precision: Precision.FP8,
+      }),
+      createMockInferenceData({ hwKey: 'h100', x: 300, y: 190, precision: Precision.FP8 }),
+      createMockInferenceData({ hwKey: 'h100', x: 340, y: 150, precision: Precision.FP8 }),
+    ];
+    const baseInference = createMockInferenceContextValues();
+
+    function IngestedSingletonLabelHarness() {
+      const [showLineLabels, setShowLineLabels] = useState(true);
+      const inference = {
+        ...baseInference,
+        hardwareConfig: hwConfig,
+        activeHwTypes: new Set(['b200_tilert_mtp', 'h100']),
+        hwTypesWithData: new Set(['b200_tilert_mtp', 'h100']),
+        selectedPrecisions: [Precision.FP8],
+        showLineLabels,
+        setShowLineLabels,
+      };
+      return (
+        <InferenceContextsProvider
+          data={inference}
+          filters={inference}
+          display={inference}
+          actions={inference}
+        >
+          <div style={{ width: 800, height: 600 }}>
+            <ScatterGraph
+              chartId="test-scatter-ingested-singleton-label"
+              modelLabel="GLM5/5.1 744B"
+              data={data}
+              xLabel="Interactivity (tok/s/user)"
+              yLabel="Token Throughput per GPU"
+              chartDefinition={interactivityChartDef}
+            />
+          </div>
+        </InferenceContextsProvider>
+      );
+    }
+
+    mountWithProviders(<IngestedSingletonLabelHarness />, { unofficial: {} });
+
+    cy.get('#test-scatter-ingested-singleton-label svg .unofficial-overlay-pt').should('not.exist');
+    cy.get('#test-scatter-ingested-singleton-label svg .line-label[data-hw-key="b200_tilert_mtp"]')
+      .should('have.css', 'opacity', '1')
+      .find('text')
+      .should('have.text', 'B200 (TileRT, MTP)');
+    cy.get(
+      '#test-scatter-ingested-singleton-label svg .line-label[data-hw-key="b200_tilert_mtp"] .ll-gpu',
+    )
+      .should('have.text', 'B200')
+      .and('have.attr', 'font-weight', '700');
+    cy.get(
+      '#test-scatter-ingested-singleton-label svg .line-label[data-hw-key="b200_tilert_mtp"] .ll-engine',
+    )
+      .should('have.text', ' (TileRT, MTP)')
+      .and('have.attr', 'fill', 'white')
+      .and('have.attr', 'font-weight', '400');
+
+    expandLegendAdvanced();
+    cy.get('#scatter-line-labels').click();
+    cy.get('#test-scatter-ingested-singleton-label svg .line-label').should('not.exist');
+    cy.get('#scatter-line-labels').click();
+    cy.get('#test-scatter-ingested-singleton-label svg .line-label[data-hw-key="b200_tilert_mtp"]')
+      .should('have.css', 'opacity', '1')
+      .find('text')
+      .should('have.text', 'B200 (TileRT, MTP)');
+  });
+
+  it('renders cross-engine official and unofficial AgentX STP series together in preview mode', () => {
+    const chartDefinition = createMockChartDefinition({
+      chartType: 'interactivity',
+      y_tpPerGpu_roofline: 'upper_left',
+    });
+    const officialData = ['b200_sglang', 'h100_vllm'].flatMap((hwKey, hwIndex) =>
+      [8, 16, 32].map((x, index) =>
+        createMockInferenceData({
+          hwKey,
+          x,
+          y: 320 - hwIndex * 20 - index * 40,
+          precision: Precision.FP4,
+        }),
+      ),
+    );
+    const runUrl = 'https://github.com/x/y/actions/runs/agentx-vllm';
+    const overlayData = {
+      data: [8, 16, 32].map((x, index) =>
+        createMockInferenceData({
+          hwKey: 'h100_vllm',
+          x,
+          y: 260 - index * 40,
+          precision: Precision.FP4,
+          run_url: runUrl,
+        }),
+      ),
+      hardwareConfig: hwConfig,
+      label: 'agentx-vllm',
+      runUrl,
+    };
+    const exclusion = buildExclusion([
+      {
+        suffix: null,
+        stripPrefixes: ['dynamo-', 'mori-', 'llmd-', 'mooncake-'],
+        scope: 'hardware',
+      },
+    ]);
+    const namespacedExclusion = {
+      familyOf: (key: string) =>
+        exclusion.familyOf(key.startsWith('overlay:') ? key.slice('overlay:'.length) : key),
+      groupOf: (key: string) =>
+        exclusion.groupOf(key.startsWith('overlay:') ? key.slice('overlay:'.length) : key),
+      scopesOf: (key: string) =>
+        exclusion.scopesOf(key.startsWith('overlay:') ? key.slice('overlay:'.length) : key),
+    };
+    const blockedToggle = cy.stub().as('blockedComparisonToggle').returns(null);
+
+    mountWithProviders(
+      <div style={{ width: 800, height: 600 }}>
+        <ScatterGraph
+          chartId="test-scatter-agentx-engine-guard"
+          modelLabel="DeepSeek V4 Pro"
+          data={officialData}
+          xLabel="Concurrency"
+          yLabel="Throughput / Chip (tok/s)"
+          chartDefinition={chartDefinition}
+          overlayData={overlayData}
+        />
+      </div>,
+      {
+        inference: {
+          hardwareConfig: hwConfig,
+          activeHwTypes: new Set(['b200_sglang']),
+          hwTypesWithData: new Set(['b200_sglang', 'h100_vllm']),
+          selectedModel: Model.DeepSeek_V4_Pro,
+          selectedSequence: Sequence.AgenticTraces,
+          selectedPrecisions: [Precision.FP4],
+          showLineLabels: true,
+          resolveComparisonSelection: (proposed, prev = new Set()) =>
+            resolveExclusionGroups(proposed, prev, namespacedExclusion, 'keep-sticky'),
+          toggleComparisonSelection: blockedToggle,
+        },
+        unofficial: {
+          activeOverlayHwTypes: new Set(['h100_vllm']),
+          allOverlayHwTypes: new Set(['h100_vllm']),
+        },
+      },
+    );
+
+    cy.get('#test-scatter-agentx-engine-guard svg .overlay-roofline-path').should('exist');
+    cy.get(
+      '#test-scatter-agentx-engine-guard svg .roofline-path[data-hw-key="b200_sglang"]',
+    ).should('have.css', 'opacity', '1');
+    cy.get('@setUnifiedOverlaySelection').should('not.have.been.called');
+
+    cy.get('label[for="checkbox-h100_vllm"]').click();
+    cy.get('@blockedComparisonToggle').should('not.have.been.called');
+    cy.get('@setUnifiedOverlaySelection').should((setSelection) => {
+      const official = setSelection.lastCall.args[0] as Set<string>;
+      expect([...official]).to.have.members(['b200_sglang', 'h100_vllm']);
+    });
+  });
+
+  it('keeps the unofficial overlay active when soloing an official hardware series', () => {
+    const chartDefinition = createMockChartDefinition({
+      chartType: 'interactivity',
+      y_tpPerGpu_roofline: 'upper_left',
+    });
+    const officialData = ['b200_sglang', 'h100_vllm'].flatMap((hwKey, hwIndex) =>
+      [8, 16, 32].map((x, index) =>
+        createMockInferenceData({
+          hwKey,
+          x,
+          y: 320 - hwIndex * 20 - index * 40,
+          precision: Precision.FP4,
+        }),
+      ),
+    );
+    const runUrl = 'https://github.com/x/y/actions/runs/official-solo';
+    const overlayData = {
+      data: [8, 16, 32].map((x, index) =>
+        createMockInferenceData({
+          hwKey: 'h100_vllm',
+          x,
+          y: 260 - index * 40,
+          precision: Precision.FP4,
+          run_url: runUrl,
+        }),
+      ),
+      hardwareConfig: hwConfig,
+      label: 'official-solo',
+      runUrl,
+    };
+
+    mountWithProviders(
+      <div style={{ width: 800, height: 600 }}>
+        <ScatterGraph
+          chartId="test-scatter-official-solo"
+          modelLabel="DeepSeek V4 Pro"
+          data={officialData}
+          xLabel="Concurrency"
+          yLabel="Throughput / Chip (tok/s)"
+          chartDefinition={chartDefinition}
+          overlayData={overlayData}
+        />
+      </div>,
+      {
+        inference: {
+          hardwareConfig: hwConfig,
+          activeHwTypes: new Set(['b200_sglang', 'h100_vllm']),
+          hwTypesWithData: new Set(['b200_sglang', 'h100_vllm']),
+          selectedModel: Model.DeepSeek_V4_Pro,
+          selectedSequence: Sequence.AgenticTraces,
+          selectedPrecisions: [Precision.FP4],
+        },
+        unofficial: {
+          activeOverlayHwTypes: new Set(['h100_vllm']),
+          allOverlayHwTypes: new Set(['h100_vllm']),
+        },
+      },
+    );
+
+    cy.get('#test-scatter-official-solo svg .overlay-roofline-path').should('exist');
+    cy.get('label[for="checkbox-h100_vllm"]').click();
+    cy.get('@setUnifiedOverlaySelection').should((setSelection) => {
+      const official = setSelection.lastCall.args[0] as Set<string>;
+      const overlay = setSelection.lastCall.args[1] as Set<string>;
+      expect([...official]).to.deep.equal(['h100_vllm']);
+      expect([...overlay]).to.deep.equal(['h100_vllm']);
+    });
+  });
+
+  it('renders both official and overlay AgentX STP series from the same engine family', () => {
+    const chartDefinition = createMockChartDefinition({
+      chartType: 'interactivity',
+      y_tpPerGpu_roofline: 'upper_left',
+    });
+    const officialData = [8, 16, 32].map((x, index) =>
+      createMockInferenceData({
+        hwKey: 'b200_vllm',
+        x,
+        y: 320 - index * 40,
+        precision: Precision.FP4,
+      }),
+    );
+    const runUrl = 'https://github.com/x/y/actions/runs/agentx-vllm-same-family';
+    const overlayData = {
+      data: [8, 16, 32].map((x, index) =>
+        createMockInferenceData({
+          hwKey: 'h100_vllm',
+          x,
+          y: 260 - index * 40,
+          precision: Precision.FP4,
+          run_url: runUrl,
+        }),
+      ),
+      hardwareConfig: hwConfig,
+      label: 'agentx-vllm-same-family',
+      runUrl,
+    };
+    const exclusion = buildExclusion([
+      {
+        suffix: null,
+        stripPrefixes: ['dynamo-', 'mori-', 'llmd-', 'mooncake-'],
+        scope: 'hardware',
+      },
+    ]);
+    const namespacedExclusion = {
+      familyOf: (key: string) =>
+        exclusion.familyOf(key.startsWith('overlay:') ? key.slice('overlay:'.length) : key),
+      groupOf: (key: string) =>
+        exclusion.groupOf(key.startsWith('overlay:') ? key.slice('overlay:'.length) : key),
+      scopesOf: (key: string) =>
+        exclusion.scopesOf(key.startsWith('overlay:') ? key.slice('overlay:'.length) : key),
+    };
+
+    mountWithProviders(
+      <div style={{ width: 800, height: 600 }}>
+        <ScatterGraph
+          chartId="test-scatter-agentx-same-family"
+          modelLabel="DeepSeek V4 Pro"
+          data={officialData}
+          xLabel="Concurrency"
+          yLabel="Throughput / Chip (tok/s)"
+          chartDefinition={chartDefinition}
+          overlayData={overlayData}
+        />
+      </div>,
+      {
+        inference: {
+          hardwareConfig: hwConfig,
+          activeHwTypes: new Set(['b200_vllm']),
+          hwTypesWithData: new Set(['b200_vllm']),
+          selectedModel: Model.DeepSeek_V4_Pro,
+          selectedSequence: Sequence.AgenticTraces,
+          selectedPrecisions: [Precision.FP4],
+          showLineLabels: true,
+          resolveComparisonSelection: (proposed, prev = new Set()) =>
+            resolveExclusionGroups(proposed, prev, namespacedExclusion, 'keep-sticky'),
+        },
+        unofficial: {
+          activeOverlayHwTypes: new Set(['h100_vllm']),
+          allOverlayHwTypes: new Set(['h100_vllm']),
+        },
+      },
+    );
+
+    cy.get('#test-scatter-agentx-same-family svg .overlay-roofline-path').should('exist');
+    cy.get('#test-scatter-agentx-same-family svg .roofline-path').should(
+      'have.css',
+      'opacity',
+      '1',
+    );
+  });
+
+  it('removes unofficial marks when the last preview run is dismissed', () => {
+    const chartDefinition = createMockChartDefinition({
+      chartType: 'interactivity',
+      y_tpPerGpu_roofline: 'upper_left',
+    });
+    const officialData = [8, 16, 32].map((x, index) =>
+      createMockInferenceData({
+        hwKey: 'b200_sglang',
+        x,
+        y: 320 - index * 40,
+        precision: Precision.FP4,
+      }),
+    );
+    const runUrl = 'https://github.com/x/y/actions/runs/dismissed-preview';
+    const overlayData = {
+      data: [8, 16, 32].map((x, index) =>
+        createMockInferenceData({
+          hwKey: 'h100_vllm',
+          x,
+          y: 260 - index * 40,
+          precision: Precision.FP4,
+          run_url: runUrl,
+        }),
+      ),
+      hardwareConfig: hwConfig,
+      label: 'dismissed-preview',
+      runUrl,
+    };
+
+    function DismissOverlayHarness() {
+      const [showOverlay, setShowOverlay] = useState(true);
+      return (
+        <div style={{ width: 800, height: 600 }}>
+          <button data-testid="dismiss-preview" onClick={() => setShowOverlay(false)}>
+            Dismiss preview
+          </button>
+          <ScatterGraph
+            chartId="test-scatter-dismiss-preview"
+            modelLabel="DeepSeek V4 Pro"
+            data={officialData}
+            xLabel="Concurrency"
+            yLabel="Throughput / Chip (tok/s)"
+            chartDefinition={chartDefinition}
+            overlayData={showOverlay ? overlayData : undefined}
+          />
+        </div>
+      );
+    }
+
+    mountWithProviders(<DismissOverlayHarness />, {
+      inference: {
+        hardwareConfig: hwConfig,
+        activeHwTypes: new Set(['b200_sglang']),
+        hwTypesWithData: new Set(['b200_sglang']),
+        selectedModel: Model.DeepSeek_V4_Pro,
+        selectedSequence: Sequence.AgenticTraces,
+        selectedPrecisions: [Precision.FP4],
+      },
+      unofficial: {
+        isUnofficialRun: true,
+        activeOverlayHwTypes: new Set(['h100_vllm']),
+        allOverlayHwTypes: new Set(['h100_vllm']),
+      },
+    });
+
+    cy.get('#test-scatter-dismiss-preview svg .unofficial-overlay-pt').should('have.length', 3);
+    cy.get('#test-scatter-dismiss-preview svg .overlay-roofline-path').should('exist');
+
+    cy.get('[data-testid="dismiss-preview"]').click();
+    cy.get('#test-scatter-dismiss-preview svg .unofficial-overlay-pt').should('not.exist');
+    cy.get('#test-scatter-dismiss-preview svg .overlay-roofline-path').should('not.exist');
+  });
+
+  it('clears perf rulers when the y-axis or x-axis metric changes', () => {
+    const chartId = 'test-scatter-perf-ruler-axis-reset';
+    const officialData = ['b200_sglang', 'h100_vllm'].flatMap((hwKey, hwIndex) =>
+      [8, 16, 32].map((x, index) =>
+        createMockInferenceData({
+          hwKey,
+          x,
+          y: 320 - hwIndex * 120 - index * 40,
+          conc: x,
+          precision: Precision.FP4,
+        }),
+      ),
+    );
+    const baseInference = createMockInferenceContextValues();
+
+    function AxisMetricHarness() {
+      const [yMetric, setYMetric] = useState('y_tpPerGpu');
+      const [xField, setXField] = useState('p90_e2el');
+      const chartDefinition = createMockChartDefinition({
+        chartType: 'interactivity',
+        x_scale_field: xField,
+        y_tpPerGpu_roofline: 'upper_left',
+        y_totalTokensPerDollarTco_roofline: 'upper_left',
+      });
+      const inference = {
+        ...baseInference,
+        hardwareConfig: hwConfig,
+        activeHwTypes: new Set(['b200_sglang', 'h100_vllm']),
+        hwTypesWithData: new Set(['b200_sglang', 'h100_vllm']),
+        selectedModel: Model.DeepSeek_V4_Pro,
+        selectedSequence: Sequence.AgenticTraces,
+        selectedPrecisions: [Precision.FP4],
+        selectedYAxisMetric: yMetric,
+      };
+
+      return (
+        <InferenceContextsProvider
+          data={inference}
+          filters={inference}
+          display={inference}
+          actions={inference}
+        >
+          <button
+            data-testid="change-y-metric"
+            onClick={() => setYMetric('y_totalTokensPerDollarTco')}
+          >
+            Change y metric
+          </button>
+          <button data-testid="change-x-metric" onClick={() => setXField('p90_ttft')}>
+            Change x metric
+          </button>
+          <div style={{ width: 800, height: 600 }}>
+            <ScatterGraph
+              chartId={chartId}
+              modelLabel={Model.DeepSeek_V4_Pro}
+              data={officialData}
+              xLabel="P90 End-to-end Latency (s)"
+              yLabel="Throughput / Chip (tok/s)"
+              chartDefinition={chartDefinition}
+            />
+          </div>
+        </InferenceContextsProvider>
+      );
+    }
+
+    mountWithProviders(<AxisMetricHarness />, { unofficial: {} });
+
+    const placeRuler = () => {
+      cy.get(`#${chartId} svg .perf-ruler-hit`).should('have.length', 2);
+      cy.get(`#${chartId} svg .perf-ruler-hit`).eq(0).click({ force: true });
+      cy.get(`#${chartId} svg .perf-ruler-hit`).eq(1).click({ force: true });
+      cy.get(`#${chartId} svg .perf-ruler`).should('have.length', 1);
+    };
+
+    const expectCurvesIntact = () => {
+      cy.get(`#${chartId} svg .roofline-path`)
+        .should('have.length', 2)
+        .each(($path) => {
+          expect($path.attr('d')).to.match(/C/);
+        });
+    };
+
+    expectCurvesIntact();
+    expandLegendAdvanced();
+    cy.get('#scatter-perf-ruler').click({ force: true });
+    placeRuler();
+
+    cy.get('[data-testid="change-y-metric"]').click();
+    cy.get(`#${chartId} svg .perf-ruler`).should('not.exist');
+    cy.get('#scatter-perf-ruler').should('have.attr', 'aria-checked', 'true');
+    expectCurvesIntact();
+    placeRuler();
+
+    cy.get('[data-testid="change-x-metric"]').click();
+    cy.get(`#${chartId} svg .perf-ruler`).should('not.exist');
+    cy.get('#scatter-perf-ruler').should('have.attr', 'aria-checked', 'true');
+    expectCurvesIntact();
+    placeRuler();
+  });
+});
+
+describe('ChartDisplay modeled power disclosures', () => {
+  for (const locale of ['en', 'zh'] as const) {
+    it(`states the chassis and NVL72 PUEs and the NVL72 Grace input without overflow (${locale})`, () => {
+      const point = createMockInferenceData({
+        hwKey: 'gb200',
+        hw: 'NVIDIA GB200',
+        model: Model.Qwen3_5,
+        y: 1000,
+        utilityModeledWatts: { y: 1000, roof: false },
+      });
+      mountWithProviders(
+        <PathnameContext.Provider
+          value={locale === 'zh' ? '/zh/infx/inference' : '/infx/inference'}
+        >
+          <div className="p-4">
+            <ChartDisplay />
+          </div>
+        </PathnameContext.Provider>,
+        {
+          inference: {
+            selectedModel: Model.Qwen3_5,
+            selectedYAxisMetric: 'y_utilityModeledWatts',
+            activeHwTypes: new Set(['gb200']),
+            hwTypesWithData: new Set(['gb200']),
+            hardwareConfig: { gb200: { name: 'gb200', label: 'GB200', suffix: '', gpu: 'GB200' } },
+            graphs: [
+              {
+                model: Model.Qwen3_5,
+                sequence: Sequence.EightK_OneK,
+                chartDefinition: chartDefinitions[0],
+                data: [point],
+              },
+            ],
+          },
+          globalFilters: { selectedModel: Model.Qwen3_5 },
+          unofficial: {},
+        },
+      );
+      for (const width of [1280, 390]) {
+        cy.viewport(width, 900);
+        cy.get('[data-testid="power-basis-assumptions"]')
+          .should('be.visible')
+          .and('contain.text', 'PUE 1.3')
+          .and('contain.text', 'PUE 1.1')
+          .and(
+            'contain.text',
+            locale === 'en'
+              ? 'measured Grace-socket power replaces the modeled CPU and memory when the run has validated socket telemetry'
+              : '以实测功耗代替 CPU 和内存的估算值（否则二者均按模型估算）',
+          )
+          .should(($note) => {
+            expect($note[0].scrollWidth).to.be.at.most($note[0].clientWidth);
+          });
+        cy.scatterPoints().should((points) => expect(visiblePoints(points)).to.not.be.empty);
+      }
+    });
+  }
+});
+
+describe('ChartDisplay responsive status notes', () => {
+  const atomDisclaimer =
+    '1 The ATOM engine is promising, however it has yet to serve production tokens. It is still in its infant stage.';
+
+  function assertAtomPngExport(ratio: 'auto' | '16:9' | '1:1') {
+    let exportedPng = '';
+    let exportedNote:
+      | {
+          text: string | null;
+          excluded: boolean;
+          bounds: DOMRect;
+          plotBottom: number;
+          rootBottom: number;
+          removedNotes: number;
+        }
+      | undefined;
+    cy.window().then((win) => {
+      cy.stub(win.HTMLAnchorElement.prototype, 'click').callsFake(function (
+        this: HTMLAnchorElement,
+      ) {
+        if (!this.download.endsWith('.png')) return;
+        exportedPng = this.href;
+        const root = win.document.querySelector('#chart-0-export')!;
+        const note = root.querySelector<HTMLElement>('[data-testid="atom-engine-footnote"]');
+        if (!note) return;
+        exportedNote = {
+          text: note.textContent,
+          excluded: Boolean(note.closest('.no-export')),
+          bounds: note.getBoundingClientRect(),
+          plotBottom: root.querySelector('svg[data-testid="d3-chart-svg"]')!.getBoundingClientRect()
+            .bottom,
+          rootBottom: root.getBoundingClientRect().bottom,
+          removedNotes: root.querySelectorAll(
+            '[data-testid="agentic-optimization-note"], [data-testid="cache-reuse-link"]',
+          ).length,
+        };
+      });
+    });
+    cy.get('[data-testid="export-button"]').first().click();
+    cy.get('[data-testid="png-aspect-ratio"]').select(ratio);
+    cy.get('[data-testid="export-png-button"]').click();
+    cy.window().should(() => {
+      expect(exportedPng).to.match(/^data:image\/png;base64,/u);
+      expect(exportedNote, 'ATOM disclaimer captured with the PNG').not.to.equal(undefined);
+      expect(exportedNote!.text).to.equal(atomDisclaimer);
+      expect(exportedNote!.excluded).to.equal(false);
+      expect(exportedNote!.bounds.top).to.be.at.least(exportedNote!.plotBottom);
+      expect(exportedNote!.bounds.bottom).to.be.at.most(exportedNote!.rootBottom);
+      expect(exportedNote!.bounds.height).to.be.greaterThan(0);
+      expect(exportedNote!.removedNotes).to.equal(0);
+    });
+    cy.window().then(async (win) => {
+      const image = new win.Image();
+      image.src = exportedPng;
+      await image.decode();
+      expect(image.naturalWidth).to.be.greaterThan(0);
+      if (ratio !== 'auto') {
+        expect(image.naturalWidth / image.naturalHeight).to.be.closeTo(
+          ratio === '16:9' ? 16 / 9 : 1,
+          0.001,
+        );
+      }
+    });
+  }
+
+  for (const locale of ['en', 'zh'] as const) {
+    for (const width of [390, 1440]) {
+      it(`uses available width and preserves complete notices (${locale}, ${width}px)`, () => {
+        cy.viewport(width, 900);
+        const point = createMockInferenceData({ framework: 'atom', offload_mode: 'on' });
+        mountWithProviders(
+          <PathnameContext.Provider
+            value={locale === 'zh' ? '/zh/infx/inference' : '/infx/inference'}
+          >
+            <div className="p-4">
+              <ChartDisplay />
+            </div>
+          </PathnameContext.Provider>,
+          {
+            inference: {
+              selectedSequence: Sequence.AgenticTraces,
+              graphs: [
+                {
+                  model: Model.DeepSeek_R1,
+                  sequence: Sequence.AgenticTraces,
+                  chartDefinition: defaultChartDef,
+                  data: [point],
+                },
+              ],
+            },
+            globalFilters: {
+              selectedSequence: Sequence.AgenticTraces,
+              effectiveSequence: Sequence.AgenticTraces,
+            },
+            unofficial: {},
+          },
+        );
+        cy.get('[data-testid="result-context-markers"]').should(($notes) => {
+          const notes = $notes[0];
+          const bounds = notes.getBoundingClientRect();
+          const offload = notes
+            .querySelector('[data-testid="offload-halo-key"]')!
+            .getBoundingClientRect();
+          expect(offload.left).to.be.at.least(bounds.left);
+          expect(offload.right).to.be.at.most(bounds.right + 1);
+          expect(notes.scrollWidth).to.be.at.most(notes.clientWidth);
+        });
+        cy.get('[data-testid="offload-halo-key"]').should(
+          'contain.text',
+          locale === 'zh' ? 'KV offload 已开启' : 'KV offload on',
+        );
+        cy.get('#chart-0 [data-slot="chart-footer"] [data-testid="atom-engine-footnote"]').should(
+          'have.text',
+          locale === 'zh'
+            ? '1 ATOM 引擎前景可期，但尚未用于生产环境 token 服务，仍处于早期阶段。'
+            : '1 The ATOM engine is promising, however it has yet to serve production tokens. It is still in its infant stage.',
+        );
+        cy.get('[data-testid="atom-engine-footnote"]').should(($note) => {
+          expect($note[0].scrollWidth).to.be.at.most($note[0].clientWidth);
+        });
+        cy.get('[data-testid="agentic-optimization-note"]').should('not.exist');
+        cy.get('[data-testid="chart-figure"] [data-testid="cache-reuse-link"]').should('not.exist');
+      });
+    }
+  }
+
+  it('includes offload and ATOM notices when only the unofficial overlay uses them', () => {
+    const runUrl = 'https://github.com/x/y/actions/runs/707';
+    const runInfo = {
+      id: 707,
+      name: 'footer-overlay',
+      branch: 'footer-overlay',
+      sha: 'abc707',
+      createdAt: '2026-08-09T00:00:00Z',
+      url: runUrl,
+      conclusion: 'success',
+      status: 'completed',
+      isNonMainBranch: true,
+    };
+    mountWithProviders(<ChartDisplay />, {
+      inference: {},
+      globalFilters: {},
+      unofficial: {
+        isUnofficialRun: true,
+        unofficialRunInfo: runInfo,
+        unofficialRunInfos: [runInfo],
+        runIndexByUrl: { [runUrl]: 0, '707': 0 },
+        getOverlayData: () => ({
+          data: [
+            createMockInferenceData({ framework: 'atom', offload_mode: 'on', run_url: runUrl }),
+          ],
+          hardwareConfig: hwConfig,
+        }),
+        activeOverlayHwTypes: new Set(['b200_trt']),
+        allOverlayHwTypes: new Set(['b200_trt']),
+      },
+    });
+    cy.get('[data-testid="result-context-markers"] [data-testid="offload-halo-key"]').should(
+      'contain.text',
+      'KV offload on',
+    );
+    cy.get('#chart-0 [data-testid="atom-engine-footnote"]').should(
+      'contain.text',
+      'has yet to serve production tokens',
+    );
+    assertAtomPngExport('16:9');
+  });
+
+  it('includes the complete selected ATOM disclaimer in auto PNG exports', () => {
+    mountWithProviders(<ChartDisplay />, {
+      inference: {
+        graphs: [
+          {
+            model: Model.DeepSeek_R1,
+            sequence: Sequence.AgenticTraces,
+            chartDefinition: defaultChartDef,
+            data: [createMockInferenceData({ framework: 'atom' })],
+          },
+        ],
+      },
+      globalFilters: {},
+      unofficial: {},
+    });
+    cy.get('#chart-0 [data-testid="atom-engine-footnote"]').should('have.text', atomDisclaimer);
+    assertAtomPngExport('auto');
+  });
+
+  it('omits the ATOM disclaimer when its series is not selected', () => {
+    mountWithProviders(<ChartDisplay />, {
+      inference: {
+        graphs: [
+          {
+            model: Model.DeepSeek_R1,
+            sequence: Sequence.AgenticTraces,
+            chartDefinition: defaultChartDef,
+            data: [
+              createMockInferenceData(),
+              createMockInferenceData({ hwKey: 'mi355x_atom', framework: 'atom' }),
+            ],
+          },
+        ],
+        activeHwTypes: new Set(['b200_trt']),
+      },
+      globalFilters: {},
+      unofficial: {},
+    });
+    cy.scatterPoints('#chart-0').should((points) => expect(points).to.not.be.empty);
+    cy.get('[data-testid="atom-engine-footnote"]').should('not.exist');
+  });
+
+  for (const history of [false, true]) {
+    it(`shows one ATOM disclaimer in PowerX Where ${history ? 'history' : 'chip'} comparison`, () => {
+      mountWithProviders(
+        <PowerXSurfaceProvider>
+          <ChartDisplay />
+        </PowerXSurfaceProvider>,
+        {
+          inference: {
+            selectedYAxisMetric: 'y_measuredAvgPower',
+            powerCompare: 'breakdown',
+            selectedGPUs: history ? ['b200_trt'] : [],
+            selectedDates: history ? ['2025-03-01'] : [],
+            activeDates: new Set(['2025-03-01_b200_trt']),
+            graphs: [
+              {
+                model: Model.DeepSeek_R1,
+                sequence: Sequence.AgenticTraces,
+                chartDefinition: defaultChartDef,
+                data: [createMockInferenceData({ framework: 'atom' })],
+              },
+            ],
+          },
+          globalFilters: {},
+          unofficial: {},
+        },
+      );
+      cy.get('[data-testid="powerx-where-controls"]').should('be.visible');
+      cy.get('[data-testid="atom-engine-footnote"]')
+        .should('have.length', 1)
+        .and('have.text', atomDisclaimer)
+        .and('be.visible');
+      if (history) {
+        cy.get('#chart-0 [data-slot="chart-footer"] [data-testid="atom-engine-footnote"]').should(
+          'have.length',
+          1,
+        );
+        assertAtomPngExport('16:9');
+      } else {
+        cy.get('[data-testid="chart-figure"]').should(($figure) => {
+          const panels = $figure[0].querySelector('[data-testid="power-analysis-panels"]')!;
+          const note = $figure[0].querySelector('[data-testid="atom-engine-footnote"]')!;
+          expect(note.getBoundingClientRect().top).to.be.at.least(
+            panels.getBoundingClientRect().bottom,
+          );
+        });
+      }
+    });
+  }
+});
+
+describe('ChartDisplay engine comparison guard', () => {
+  it('includes explicitly clipped official and unofficial points in table mode', () => {
+    const chartDefinition = createMockChartDefinition({
+      chartType: 'interactivity',
+      x: 'median_intvty',
+      x_label: 'Interactivity (tok/s/user)',
+      y_costhOutput: 'costhOutput.y',
+      y_costhOutput_label: 'Cost per Million Output Tokens ($)',
+      y_costhOutput_roofline: 'lower_right',
+      y_cost_limit: 5,
+    });
+    const officialVisible = createMockInferenceData({
+      hwKey: 'b200_sglang',
+      precision: Precision.FP4,
+      tp: 4,
+      median_intvty: 134.7,
+      costhOutput: { y: 4, roof: true },
+    });
+    const officialClipped = createMockInferenceData({
+      hwKey: 'b200_sglang',
+      precision: Precision.FP4,
+      tp: 8,
+      median_intvty: 142.1,
+      costhOutput: { y: 7.016, roof: true },
+    });
+    const runUrl = 'https://github.com/x/y/actions/runs/707';
+    const overlayVisible = createMockInferenceData({
+      hwKey: 'h100_vllm',
+      precision: Precision.FP4,
+      tp: 4,
+      median_intvty: 130,
+      costhOutput: { y: 4.5, roof: true },
+      run_url: runUrl,
+    });
+    const overlayClipped = createMockInferenceData({
+      hwKey: 'h100_vllm',
+      precision: Precision.FP4,
+      tp: 8,
+      median_intvty: 145,
+      costhOutput: { y: 7.5, roof: true },
+      run_url: runUrl,
+    });
+    const runInfo = {
+      id: 707,
+      name: 'clipped-table-overlay',
+      branch: 'clipped-table-overlay',
+      sha: 'abc707',
+      createdAt: '2026-08-09T00:00:00Z',
+      url: runUrl,
+      conclusion: 'success',
+      status: 'completed',
+      isNonMainBranch: true,
+    };
+
+    mountWithProviders(<ChartDisplay />, {
+      inference: {
+        graphs: [
+          {
+            model: Model.DeepSeek_R1,
+            sequence: Sequence.EightK_OneK,
+            chartDefinition,
+            data: [officialVisible],
+            clippedData: [{ point: officialClipped, reasons: ['cost'] }],
+          },
+        ],
+        selectedYAxisMetric: 'y_costhOutput',
+        selectedXAxisMode: 'interactivity',
+        activeHwTypes: new Set(['b200_sglang']),
+        hwTypesWithData: new Set(['b200_sglang']),
+      },
+      globalFilters: {
+        selectedModel: Model.DeepSeek_R1,
+        selectedSequence: Sequence.EightK_OneK,
+        effectiveSequence: Sequence.EightK_OneK,
+      },
+      unofficial: {
+        isUnofficialRun: true,
+        unofficialRunInfo: runInfo,
+        unofficialRunInfos: [runInfo],
+        runIndexByUrl: { [runUrl]: 0, '707': 0 },
+        getOverlayData: () => ({
+          data: [overlayVisible, overlayClipped],
+          hardwareConfig: hwConfig,
+        }),
+        activeOverlayHwTypes: new Set(['h100_vllm']),
+        allOverlayHwTypes: new Set(['h100_vllm']),
+      },
+    });
+
+    cy.get('[data-testid="inference-table-view-btn"]').click();
+    cy.get('[data-testid="inference-results-table"] tbody tr').should('have.length', 4);
+    cy.get('[data-testid="data-table-preset-all"]').click();
+    cy.get('[data-testid="inference-results-table"] tbody')
+      .contains('tr', '7.0')
+      .should('contain.text', 'SGLang')
+      .find('td')
+      .eq(2)
+      .should('have.text', '8');
+    cy.get('[data-testid="inference-results-table"] tbody')
+      .contains('tr', '7.5')
+      .should('contain.text', 'vLLM')
+      .find('td')
+      .eq(2)
+      .should('have.text', '8');
+  });
+
+  it('keeps official table rows synchronized with legend state after a scope change', () => {
+    const chartDefinition = createMockChartDefinition({ chartType: 'interactivity' });
+    const baseInference = createMockInferenceContextValues();
+    const { selection: baseGlobalFilters, actions: globalFilterActions } =
+      createMockGlobalFilterContexts();
+
+    function OfficialRowsScopeHarness() {
+      const [secondScope, setSecondScope] = useState(false);
+      const [activeKeys, setActiveKeys] = useState(new Set(['b200_sglang']));
+      const model = secondScope ? Model.DeepSeek_R1 : Model.DeepSeek_V4_Pro;
+      const rows = (secondScope ? ['b200_sglang', 'h100_vllm'] : ['b200_sglang']).map((hwKey) =>
+        createMockInferenceData({
+          hwKey,
+          model,
+          precision: Precision.FP4,
+        }),
+      );
+      const inference = {
+        ...baseInference,
+        graphs: [
+          {
+            model,
+            sequence: Sequence.AgenticTraces,
+            chartDefinition,
+            data: rows,
+          },
+        ],
+        selectedModel: model,
+        selectedSequence: Sequence.AgenticTraces,
+        selectedXAxisMode: 'interactivity' as const,
+        activeHwTypes: activeKeys,
+        hwTypesWithData: new Set(rows.map((row) => String(row.hwKey))),
+      };
+      const globalFilters = {
+        ...baseGlobalFilters,
+        selectedModel: model,
+        selectedSequence: Sequence.AgenticTraces,
+        effectiveSequence: Sequence.AgenticTraces,
+      };
+
+      return (
+        <GlobalFilterSelectionContext.Provider value={globalFilters}>
+          <GlobalFilterActionsContext.Provider value={globalFilterActions}>
+            <InferenceContextsProvider
+              data={inference}
+              filters={inference}
+              display={inference}
+              actions={inference}
+            >
+              <button
+                data-testid="change-official-table-scope"
+                onClick={() => setSecondScope(true)}
+              >
+                Change scope
+              </button>
+              <button
+                data-testid="select-official-vllm"
+                onClick={() => setActiveKeys(new Set(['h100_vllm']))}
+              >
+                Select vLLM
+              </button>
+              <ChartDisplay />
+            </InferenceContextsProvider>
+          </GlobalFilterActionsContext.Provider>
+        </GlobalFilterSelectionContext.Provider>
+      );
+    }
+
+    mountWithProviders(<OfficialRowsScopeHarness />, { unofficial: {} });
+    cy.get('[data-testid="inference-table-view-btn"]').click();
+    cy.get('[data-testid="inference-results-table"] tbody tr').should('have.length', 1);
+
+    cy.get('[data-testid="change-official-table-scope"]').click();
+    cy.get('[data-testid="inference-results-table"] tbody tr').should('have.length', 1);
+    cy.get('[data-testid="inference-results-table"] tbody').contains('SGLang').should('exist');
+
+    cy.get('[data-testid="select-official-vllm"]').click();
+    cy.get('[data-testid="inference-results-table"] tbody tr').should('have.length', 1);
+    cy.get('[data-testid="inference-results-table"] tbody').contains('vLLM').should('exist');
+    cy.get('[data-testid="inference-results-table"] tbody').contains('SGLang').should('not.exist');
+    cy.get('@setUnifiedOverlaySelection').should('not.have.been.called');
+  });
+
+  it('renders the table columns without the median interactivity or TTFT columns', () => {
+    const chartDefinition = createMockChartDefinition({
+      chartType: 'interactivity',
+      x: 'median_intvty',
+      x_label: 'Interactivity (tok/s/user)',
+    });
+    const row = createMockInferenceData({
+      hwKey: 'b200_sglang',
+      hw: 'Official SGLang',
+      model: Model.DeepSeek_V4_Pro,
+      precision: Precision.FP4,
+    });
+
+    mountWithProviders(<ChartDisplay />, {
+      inference: {
+        graphs: [
+          {
+            model: Model.DeepSeek_V4_Pro,
+            sequence: Sequence.AgenticTraces,
+            chartDefinition,
+            data: [row],
+          },
+        ],
+        selectedModel: Model.DeepSeek_V4_Pro,
+        selectedSequence: Sequence.AgenticTraces,
+        selectedXAxisMode: 'interactivity',
+        activeHwTypes: new Set(['b200_sglang']),
+        hwTypesWithData: new Set(['b200_sglang']),
+      },
+      globalFilters: {
+        selectedModel: Model.DeepSeek_V4_Pro,
+        selectedSequence: Sequence.AgenticTraces,
+        effectiveSequence: Sequence.AgenticTraces,
+      },
+      unofficial: {},
+    });
+
+    cy.get('[data-testid="inference-table-view-btn"]').click();
+    cy.get('[data-testid="inference-results-table"] thead th').then(($headers) => {
+      const headers = [...$headers].map((th) => (th.textContent ?? '').trim());
+      expect(headers).to.not.include('Median Interactivity (tok/s)');
+      expect(headers.filter((h) => h.toLowerCase().includes('interactivity'))).to.have.length(1);
+      expect(headers).to.not.include('Median TTFT (ms)');
+      expect(headers.filter((h) => h.toLowerCase().includes('ttft'))).to.have.length(0);
+    });
+  });
+
+  it('keeps same-hardware cross-engine AgentX STP rows out of table mode', () => {
+    const chartDefinition = createMockChartDefinition({ chartType: 'interactivity' });
+    const sglangRow = createMockInferenceData({
+      hwKey: 'b200_sglang',
+      hw: 'Official SGLang',
+      model: Model.DeepSeek_V4_Pro,
+      precision: Precision.FP4,
+    });
+    const vllmRow = createMockInferenceData({
+      hwKey: 'b200_vllm',
+      hw: 'Official vLLM',
+      model: Model.DeepSeek_V4_Pro,
+      precision: Precision.FP4,
+    });
+    const exclusion = buildExclusion([
+      {
+        suffix: null,
+        stripPrefixes: ['dynamo-', 'mori-', 'llmd-', 'mooncake-'],
+        scope: 'hardware',
+      },
+    ]);
+    const resolveSelection = (proposed: Set<string>, prev = new Set<string>()) =>
+      resolveExclusionGroups(proposed, prev, exclusion, 'keep-sticky');
+
+    mountWithProviders(<ChartDisplay />, {
+      inference: {
+        graphs: [
+          {
+            model: Model.DeepSeek_V4_Pro,
+            sequence: Sequence.AgenticTraces,
+            chartDefinition,
+            data: [sglangRow, vllmRow],
+          },
+        ],
+        selectedModel: Model.DeepSeek_V4_Pro,
+        selectedSequence: Sequence.AgenticTraces,
+        selectedXAxisMode: 'interactivity',
+        activeHwTypes: new Set(['b200_sglang']),
+        hwTypesWithData: new Set(['b200_sglang', 'b200_vllm']),
+        resolveComparisonSelection: resolveSelection,
+      },
+      globalFilters: {
+        selectedModel: Model.DeepSeek_V4_Pro,
+        selectedSequence: Sequence.AgenticTraces,
+        effectiveSequence: Sequence.AgenticTraces,
+      },
+      unofficial: {},
+    });
+
+    cy.get('[data-testid="inference-table-view-btn"]').click();
+    cy.get('[data-testid="inference-results-table"] tbody tr').should('have.length', 1);
+  });
+
+  it('keeps cross-engine official and unofficial rows together in preview table mode', () => {
+    const chartDefinition = createMockChartDefinition({ chartType: 'interactivity' });
+    const sglangRow = createMockInferenceData({
+      hwKey: 'b200_sglang',
+      hw: 'Official SGLang',
+      model: Model.DeepSeek_V4_Pro,
+      precision: Precision.FP4,
+    });
+    const runUrl = 'https://github.com/x/y/actions/runs/456';
+    const overlayRow = createMockInferenceData({
+      hwKey: 'h100_vllm',
+      hw: 'Unofficial vLLM',
+      model: Model.DeepSeek_V4_Pro,
+      precision: Precision.FP4,
+      run_url: runUrl,
+    });
+    const exclusion = buildExclusion([
+      {
+        suffix: null,
+        stripPrefixes: ['dynamo-', 'mori-', 'llmd-', 'mooncake-'],
+        scope: 'hardware',
+      },
+    ]);
+    const namespacedExclusion = {
+      familyOf: (key: string) =>
+        exclusion.familyOf(key.startsWith('overlay:') ? key.slice('overlay:'.length) : key),
+      groupOf: (key: string) =>
+        exclusion.groupOf(key.startsWith('overlay:') ? key.slice('overlay:'.length) : key),
+      scopesOf: (key: string) =>
+        exclusion.scopesOf(key.startsWith('overlay:') ? key.slice('overlay:'.length) : key),
+    };
+    const resolveSelection = (proposed: Set<string>, prev = new Set<string>()) =>
+      resolveExclusionGroups(proposed, prev, namespacedExclusion, 'keep-sticky');
+    const runInfo = {
+      id: 456,
+      name: 'agentx-vllm-overlay',
+      branch: 'agentx-vllm-overlay',
+      sha: 'def456',
+      createdAt: '2026-07-10T00:00:00Z',
+      url: runUrl,
+      conclusion: 'success',
+      status: 'completed',
+      isNonMainBranch: true,
+    };
+
+    mountWithProviders(<ChartDisplay />, {
+      inference: {
+        graphs: [
+          {
+            model: Model.DeepSeek_V4_Pro,
+            sequence: Sequence.AgenticTraces,
+            chartDefinition,
+            data: [sglangRow],
+          },
+        ],
+        selectedModel: Model.DeepSeek_V4_Pro,
+        selectedSequence: Sequence.AgenticTraces,
+        selectedXAxisMode: 'interactivity',
+        activeHwTypes: new Set(['b200_sglang']),
+        hwTypesWithData: new Set(['b200_sglang']),
+        resolveComparisonSelection: resolveSelection,
+      },
+      globalFilters: {
+        selectedModel: Model.DeepSeek_V4_Pro,
+        selectedSequence: Sequence.AgenticTraces,
+        effectiveSequence: Sequence.AgenticTraces,
+      },
+      unofficial: {
+        isUnofficialRun: true,
+        unofficialRunInfo: runInfo,
+        unofficialRunInfos: [runInfo],
+        runIndexByUrl: { [runUrl]: 0, '456': 0 },
+        getOverlayData: () => ({ data: [overlayRow], hardwareConfig: hwConfig }),
+        activeOverlayHwTypes: new Set(['h100_vllm']),
+        allOverlayHwTypes: new Set(['h100_vllm']),
+      },
+    });
+
+    cy.get('[data-testid="inference-table-view-btn"]').click();
+    cy.get('[data-testid="inference-results-table"] tbody tr').should('have.length', 2);
+    cy.get('[data-testid="inference-results-table"] tbody').contains('vLLM').should('exist');
+    cy.get('[data-testid="inference-results-table"] tbody').contains('SGLang').should('exist');
+    cy.get('@reconcileOverlayScope').should((reconcile) => {
+      const scope = reconcile.lastCall.args[0] as { overlayHwTypes: Set<string> };
+      expect([...scope.overlayHwTypes]).to.have.members(['h100_vllm']);
+    });
+  });
+
+  it('keeps an explicitly empty official legend out of table mode', () => {
+    const chartDefinition = createMockChartDefinition({ chartType: 'interactivity' });
+    const row = createMockInferenceData({
+      hwKey: 'b200_sglang',
+      model: Model.DeepSeek_V4_Pro,
+      precision: Precision.FP4,
+    });
+
+    mountWithProviders(<ChartDisplay />, {
+      inference: {
+        graphs: [
+          {
+            model: Model.DeepSeek_V4_Pro,
+            sequence: Sequence.AgenticTraces,
+            chartDefinition,
+            data: [row],
+          },
+        ],
+        selectedModel: Model.DeepSeek_V4_Pro,
+        selectedSequence: Sequence.AgenticTraces,
+        selectedXAxisMode: 'interactivity',
+        activeHwTypes: new Set(['b200_sglang']),
+        hwTypesWithData: new Set(['b200_sglang']),
+      },
+      globalFilters: {
+        selectedModel: Model.DeepSeek_V4_Pro,
+        selectedSequence: Sequence.AgenticTraces,
+        effectiveSequence: Sequence.AgenticTraces,
+      },
+      unofficial: { isUnofficialRun: true, localOfficialOverride: new Set() },
+    });
+
+    cy.get('[data-testid="inference-table-view-btn"]').click();
+    cy.contains('No data available for the current filters').should('be.visible');
+    cy.get('[data-testid="inference-results-table"]').should('not.exist');
+  });
+
+  it('commits a new table overlay scope and preserves an explicit empty selection', () => {
+    const chartDefinition = createMockChartDefinition({ chartType: 'interactivity' });
+    const exclusion = buildExclusion([
+      {
+        suffix: null,
+        stripPrefixes: ['dynamo-', 'mori-', 'llmd-', 'mooncake-'],
+        scope: 'hardware',
+      },
+    ]);
+    const namespacedExclusion = {
+      familyOf: (key: string) =>
+        exclusion.familyOf(key.startsWith('overlay:') ? key.slice('overlay:'.length) : key),
+      groupOf: (key: string) =>
+        exclusion.groupOf(key.startsWith('overlay:') ? key.slice('overlay:'.length) : key),
+      scopesOf: (key: string) =>
+        exclusion.scopesOf(key.startsWith('overlay:') ? key.slice('overlay:'.length) : key),
+    };
+    const resolveSelection = (proposed: Set<string>, prev = new Set<string>()) =>
+      resolveExclusionGroups(proposed, prev, namespacedExclusion, 'keep-sticky');
+    const runInfo = {
+      id: 123,
+      name: 'agentx-scope-test',
+      branch: 'agentx-scope-test',
+      sha: 'abc123',
+      createdAt: '2026-07-10T00:00:00Z',
+      url: 'https://github.com/x/y/actions/runs/123',
+      conclusion: 'success',
+      status: 'completed',
+      isNonMainBranch: true,
+    };
+    const baseInference = createMockInferenceContextValues();
+    const { selection: baseGlobalFilters, actions: globalFilterActions } =
+      createMockGlobalFilterContexts();
+    const baseUnofficial = createMockUnofficialRunContext();
+
+    function OverlayScopeHarness() {
+      const [secondScope, setSecondScope] = useState(false);
+      const [secondScopeLoaded, setSecondScopeLoaded] = useState(false);
+      const [selection, dispatchSelection] = useReducer(overlaySelectionReducer, {
+        availabilityKey: String(runInfo.id),
+        activeOverlayHwTypes: new Set(['h100_sglang']),
+        availableOverlayHwTypes: new Set(['h100_sglang', 'h200_sglang', 'b200_vllm']),
+        localOfficialOverride: null,
+        scopeKey: `${Model.DeepSeek_V4_Pro}|${Sequence.AgenticTraces}|${Precision.FP4}|${runInfo.url}|official:b200_sglang|overlay:h100_sglang,h200_sglang`,
+        scopeOverlayHwTypes: new Set(['h100_sglang', 'h200_sglang']),
+        scopeReady: true,
+        bestSelectionKey: '',
+        bestPerSku: false,
+      });
+      const [, setRenderVersion] = useState(0);
+      const model = secondScope ? Model.DeepSeek_R1 : Model.DeepSeek_V4_Pro;
+      const officialKeys = secondScope ? ['h100_vllm', 'b200_sglang'] : ['b200_sglang'];
+      const overlayKeys = secondScope
+        ? ['b200_vllm', 'h200_sglang']
+        : ['h100_sglang', 'h200_sglang'];
+      const officialRows =
+        secondScope && !secondScopeLoaded
+          ? []
+          : officialKeys.map((hwKey) =>
+              createMockInferenceData({
+                hwKey,
+                model,
+                precision: Precision.FP4,
+              }),
+            );
+      const overlayRows = overlayKeys.map((hwKey, index) =>
+        createMockInferenceData({
+          hwKey,
+          model,
+          precision: Precision.FP4,
+          x: 8 + index * 8,
+          run_url: runInfo.url,
+        }),
+      );
+      const inference = {
+        ...baseInference,
+        graphs: [
+          {
+            model,
+            sequence: Sequence.AgenticTraces,
+            chartDefinition,
+            data: officialRows,
+          },
+        ],
+        loading: secondScope && !secondScopeLoaded,
+        selectedModel: model,
+        selectedSequence: Sequence.AgenticTraces,
+        selectedXAxisMode: 'interactivity' as const,
+        selectedXAxisMetric: 'p90_ttft',
+        bestPerSku: false,
+        activeHwTypes: new Set([officialKeys[0]]),
+        hwTypesWithData: new Set(officialKeys),
+        resolveComparisonSelection: resolveSelection,
+      };
+      const globalFilters = {
+        ...baseGlobalFilters,
+        selectedModel: model,
+        selectedSequence: Sequence.AgenticTraces,
+        effectiveSequence: Sequence.AgenticTraces,
+      };
+      const unofficial = {
+        ...baseUnofficial,
+        isUnofficialRun: true,
+        unofficialRunInfo: runInfo,
+        unofficialRunInfos: [runInfo],
+        runIndexByUrl: { [runInfo.url]: 0, [String(runInfo.id)]: 0 },
+        getOverlayData: () => ({ data: overlayRows, hardwareConfig: hwConfig }),
+        activeOverlayHwTypes: selection.activeOverlayHwTypes,
+        reconcileOverlayScope: (
+          input: Parameters<typeof baseUnofficial.reconcileOverlayScope>[0],
+        ) => dispatchSelection({ type: 'scope', input }),
+        setUnifiedOverlaySelection: (official: Set<string>, overlay: Set<string>) =>
+          dispatchSelection({ type: 'selection', official, overlay }),
+        allOverlayHwTypes: selection.availableOverlayHwTypes,
+        localOfficialOverride: selection.localOfficialOverride,
+      };
+
+      return (
+        <GlobalFilterSelectionContext.Provider value={globalFilters}>
+          <GlobalFilterActionsContext.Provider value={globalFilterActions}>
+            <UnofficialRunContext.Provider value={unofficial}>
+              <InferenceContextsProvider
+                data={inference}
+                filters={inference}
+                display={inference}
+                actions={inference}
+              >
+                <button data-testid="change-overlay-scope" onClick={() => setSecondScope(true)}>
+                  Change scope
+                </button>
+                <button
+                  data-testid="load-official-scope"
+                  onClick={() => setSecondScopeLoaded(true)}
+                >
+                  Load official scope
+                </button>
+                <button
+                  data-testid="clear-overlay-scope"
+                  onClick={() =>
+                    dispatchSelection({
+                      type: 'selection',
+                      official: selection.localOfficialOverride ?? new Set(officialKeys),
+                      overlay: new Set(),
+                    })
+                  }
+                >
+                  Clear overlays
+                </button>
+                <button
+                  data-testid="rerender-overlay-scope"
+                  onClick={() => setRenderVersion((version) => version + 1)}
+                >
+                  Rerender
+                </button>
+                <ChartDisplay />
+              </InferenceContextsProvider>
+            </UnofficialRunContext.Provider>
+          </GlobalFilterActionsContext.Provider>
+        </GlobalFilterSelectionContext.Provider>
+      );
+    }
+
+    mountWithProviders(<OverlayScopeHarness />);
+    cy.get('[data-testid="inference-table-view-btn"]').click();
+    cy.get('[data-testid="inference-results-table"] tbody tr').should('have.length', 2);
+
+    cy.get('[data-testid="change-overlay-scope"]').click();
+    cy.get('[data-testid="inference-results-table"] tbody tr').should('have.length', 2);
+    cy.get('[data-testid="load-official-scope"]').click();
+    cy.get('[data-testid="inference-results-table"] tbody tr').should('have.length', 4);
+    cy.get('[data-testid="rerender-overlay-scope"]').click();
+    cy.get('[data-testid="inference-results-table"] tbody tr').should('have.length', 4);
+
+    cy.get('[data-testid="clear-overlay-scope"]').click();
+    cy.get('[data-testid="inference-results-table"] tbody tr').should('have.length', 2);
+    cy.get('[data-testid="rerender-overlay-scope"]').click();
+    cy.get('[data-testid="inference-results-table"] tbody tr').should('have.length', 2);
+    cy.get('[data-testid="inference-chart-view-btn"]').click();
+    cy.get('#chart-0 svg .unofficial-overlay-pt').should('not.exist');
+  });
+});
+
+describe('Power envelopes', () => {
+  const powerMetrics = [
+    ['y_measuredAvgPower', 'Watts'],
+    ['y_measuredP75Power', 'P75'],
+    ['y_measuredP90Power', 'P90'],
+    ['y_measuredPrefillAvgPower', 'Prefill'],
+    ['y_measuredDecodeAvgPower', 'Decode'],
+    ['y_measuredPowerPercentTdp', 'Percent TDP'],
+  ] as const;
+
+  for (const optimal of [false, true]) {
+    it(`suppresses power-envelope clipping continuations with Optimal Only ${optimal ? 'on' : 'off'}`, () => {
+      const runUrl = 'https://github.com/SemiAnalysisAI/InferenceX/actions/runs/102';
+      const visible = createMockInferenceData({
+        hwKey: 'b200_trt',
+        tp: 4,
+        conc: 1,
+        x: 100,
+        y: 600,
+        run_url: runUrl,
+      });
+      const clipped = { ...visible, tp: 8, conc: 8, x: 1500, y: 300 };
+      mountWithProviders(
+        <div style={{ width: 1000, height: 600 }}>
+          <ScatterGraph
+            chartId="power-clipped"
+            modelLabel="Qwen3.5 397B"
+            data={[visible]}
+            clippedData={[{ point: clipped, reasons: ['latency'] }]}
+            xLabel="TTFT"
+            yLabel="Power"
+            chartDefinition={createMockChartDefinition({
+              y_measuredAvgPower_roofline: 'lower_left',
+              y_latency_limit: 1000,
+            })}
+            overlayData={{
+              data: [visible],
+              clippedData: [{ point: clipped, reasons: ['latency'] }],
+              hardwareConfig: hwConfig,
+              label: 'Power replay',
+              runUrl,
+            }}
+            transitionDuration={0}
+          />
+        </div>,
+        {
+          inference: {
+            selectedYAxisMetric: 'y_measuredAvgPower',
+            hideNonOptimal: optimal,
+            selectedPrecisions: [Precision.FP4],
+            hardwareConfig: hwConfig,
+            activeHwTypes: new Set(['b200_trt']),
+            hwTypesWithData: new Set(['b200_trt']),
+          },
+          unofficial: {
+            activeOverlayHwTypes: new Set(['b200_trt']),
+            allOverlayHwTypes: new Set(['b200_trt']),
+            runIndexByUrl: { [runUrl]: 0, '102': 0 },
+          },
+        },
+      );
+      cy.scatterPoints('#power-clipped').should('have.length', 1);
+      cy.get('#power-clipped .overflow-continuation').should('not.exist');
+    });
+  }
+
+  function PowerHarness({
+    singleConfiguration = false,
+    normalized = false,
+  }: {
+    singleConfiguration?: boolean;
+    normalized?: boolean;
+  }) {
+    const [optimal, setOptimal] = useState(true);
+    const [gradientLabels, setGradientLabels] = useState(false);
+    const [metric, setMetric] = useState('y_measuredAvgPower');
+    const power = metric !== 'y_measuredJPerOutputToken';
+    const powerScale = metric === 'y_measuredPowerPercentTdp' ? 0.1 : 1;
+    const rows = [1, 8, 32].map((conc, i) =>
+      createMockInferenceData({
+        hwKey: 'b200_trt',
+        tp: singleConfiguration || i === 0 ? 2 : 4,
+        conc,
+        x: 100 - i * 30,
+        y: power ? (400 + i * 200) * powerScale : 4 - i,
+        measuredAvgPower: { y: 400 + i * 200, roof: false },
+        measuredPowerPercentTdp: { y: 40 + i * 20, roof: false },
+        measuredJPerOutputToken: { y: 4 - i, roof: false },
+        run_url: 'https://github.com/SemiAnalysisAI/InferenceX/actions/runs/100',
+        power_tier: i === 1 ? 'legacy' : 'certified',
+      }),
+    );
+    rows.push(
+      createMockInferenceData({
+        hwKey: 'b200_trt',
+        tp: 8,
+        conc: 16,
+        x: 60,
+        y: power ? 500 * powerScale : 3.5,
+        measuredAvgPower: { y: 500, roof: false },
+        measuredPowerPercentTdp: { y: 50, roof: false },
+        measuredJPerOutputToken: { y: 3.5, roof: false },
+        power_tier: 'legacy',
+      }),
+    );
+    const value = createMockInferenceContextValues({
+      selectedYAxisMetric: metric,
+      hideNonOptimal: optimal,
+      setHideNonOptimal: setOptimal,
+      showGradientLabels: gradientLabels,
+      setShowGradientLabels: setGradientLabels,
+      selectedPrecisions: [Precision.FP4],
+      hardwareConfig: hwConfig,
+      activeHwTypes: new Set(['b200_trt']),
+      hwTypesWithData: new Set(['b200_trt']),
+    });
+    const definition = createMockChartDefinition({
+      chartType: normalized ? 'e2e' : 'interactivity',
+      [`${metric}_roofline`]: 'lower_right',
+    });
+    return (
+      <InferenceContextsProvider data={value} filters={value} display={value} actions={value}>
+        {powerMetrics.map(([key, label]) => (
+          <button key={key} onClick={() => setMetric(key)}>
+            {label}
+          </button>
+        ))}
+        <button onClick={() => setMetric('y_measuredJPerOutputToken')}>Energy</button>
+        <div style={{ width: 1000, height: 600 }}>
+          <ScatterGraph
+            chartId="power-sweep"
+            modelLabel="Qwen3.5 397B"
+            data={rows}
+            xLabel="Interactivity"
+            yLabel="Power"
+            chartDefinition={definition}
+            transitionDuration={0}
+          />
+        </div>
+      </InferenceContextsProvider>
+    );
+  }
+
+  it('measures displayed power boundaries across official and dated overlay runs', () => {
+    const runUrls = [101, 102].map(
+      (id) => `https://github.com/SemiAnalysisAI/InferenceX/actions/runs/${id}`,
+    );
+    const samples = [
+      [100, 400],
+      [70, 600],
+      [40, 800],
+      [60, 100],
+    ];
+    const official = samples.map(([x, y], index) =>
+      createMockInferenceData({ hwKey: 'h100', x, y, conc: index + 1 }),
+    );
+    const overlay = runUrls.flatMap((runUrl, run) =>
+      official.map((point) => ({
+        ...point,
+        y: point.conc === 4 ? 75 : point.y / (run === 0 ? 2 : 4),
+        date: `2026-09-${10 + run}`,
+        run_url: runUrl,
+      })),
+    );
+    function PowerRulerHarness() {
+      const [optimal, setOptimal] = useState(false);
+      const [visible, setVisible] = useState(true);
+      const [dismissed, setDismissed] = useState(false);
+      const value = createMockInferenceContextValues({
+        selectedYAxisMetric: 'y_measuredAvgPower',
+        hideNonOptimal: optimal,
+        setHideNonOptimal: setOptimal,
+        selectedPrecisions: [Precision.FP4],
+        hardwareConfig: hwConfig,
+        activeHwTypes: new Set(['h100']),
+        hwTypesWithData: new Set(['h100']),
+      });
+      const unofficial = createMockUnofficialRunContext({
+        activeOverlayHwTypes: new Set(visible ? ['h100'] : []),
+        allOverlayHwTypes: new Set(['h100']),
+        runIndexByUrl: { [runUrls[0]]: 0, '101': 0, [runUrls[1]]: 1, '102': 1 },
+      });
+      return (
+        <InferenceContextsProvider data={value} filters={value} display={value} actions={value}>
+          <UnofficialRunContext.Provider value={unofficial}>
+            <button onClick={() => setVisible((current) => !current)}>Toggle overlay</button>
+            <button onClick={() => setDismissed(true)}>Dismiss overlay</button>
+            <div style={{ width: 1000, height: 600 }}>
+              <ScatterGraph
+                chartId="power-ruler"
+                modelLabel="Qwen3.5 397B"
+                data={official}
+                xLabel="Interactivity"
+                yLabel="Power"
+                chartDefinition={createMockChartDefinition({
+                  chartType: 'interactivity',
+                  y_measuredAvgPower_roofline: 'lower_right',
+                })}
+                overlayData={
+                  dismissed
+                    ? undefined
+                    : {
+                        data: overlay,
+                        hardwareConfig: hwConfig,
+                        label: 'Power replay',
+                        runUrl: runUrls[0],
+                      }
+                }
+                transitionDuration={0}
+              />
+            </div>
+          </UnofficialRunContext.Provider>
+        </InferenceContextsProvider>
+      );
+    }
+    mountWithProviders(<PowerRulerHarness />);
+    expandLegendAdvanced();
+    cy.get('#scatter-perf-ruler').click({ force: true });
+    cy.get('#power-ruler .perf-ruler-hit').should('have.length', 3);
+    cy.scatterPoints('#power-ruler')
+      .should((points) => expect(points).to.not.be.empty)
+      .then((points) => clickScatterPoint(points.at(-1)!));
+    cy.get('#power-ruler .unofficial-overlay-pt').eq(3).click({ force: true });
+
+    const chartId = 'power-ruler';
+    const expectBoundaryRuler = () => {
+      cy.get(`#${chartId} .perf-ruler .pr-text-ratio`).should('have.text', '2.00x');
+      cy.get<SVGSVGElement>('#power-ruler svg').should(($svg) => {
+        const svg = $svg[0];
+        const line = svg.querySelector<SVGLineElement>('.pr-line')!;
+        const endpoints = [Number(line.getAttribute('y1')), Number(line.getAttribute('y2'))];
+        const x = Number(line.getAttribute('x1'));
+        const paths = [
+          svg.querySelector<SVGPathElement>('.roofline-path')!,
+          svg.querySelector<SVGPathElement>('.overlay-roofline-path')!,
+        ];
+        for (const [index, path] of paths.entries()) {
+          const length = path.getTotalLength();
+          const distance = Math.min(
+            ...Array.from({ length: 1001 }, (_, step) => {
+              const point = path.getPointAtLength((length * step) / 1000);
+              return Math.hypot(point.x - x, point.y - endpoints[index]);
+            }),
+          );
+          expect(distance, 'ruler endpoint lies on the drawn upper boundary').to.be.lessThan(2);
+        }
+      });
+    };
+    expectBoundaryRuler();
+    cy.get('#power-ruler .roofline-path, #power-ruler .overlay-roofline-path').then(($paths) => {
+      const geometry = [...$paths].map((path) => path.getAttribute('d'));
+      cy.get('#scatter-hide-non-optimal').click({ force: true });
+      cy.get('#power-ruler .roofline-path, #power-ruler .overlay-roofline-path').should(
+        ($current) => {
+          expect([...$current].map((path) => path.getAttribute('d'))).to.deep.equal(geometry);
+        },
+      );
+      expectBoundaryRuler();
+    });
+    cy.get('#power-ruler .roofline-path')
+      .invoke('attr', 'd')
+      .then((before) => {
+        cy.get('#power-ruler svg').then(($svg) => {
+          const bounds = $svg[0].getBoundingClientRect();
+          $svg[0].dispatchEvent(
+            new WheelEvent('wheel', {
+              deltaY: -120,
+              clientX: bounds.x + bounds.width / 2,
+              clientY: bounds.y + bounds.height / 2,
+              shiftKey: true,
+              bubbles: true,
+              cancelable: true,
+            }),
+          );
+        });
+        cy.get('#power-ruler .roofline-path').invoke('attr', 'd').should('not.equal', before);
+      });
+    expectBoundaryRuler();
+    cy.get('#scatter-perf-ruler').click({ force: true });
+    cy.get('#power-ruler .perf-ruler').should('not.exist');
+    cy.get('#scatter-perf-ruler').click({ force: true });
+    cy.get('#power-ruler .perf-ruler-hit').eq(0).click({ force: true });
+    cy.get('#power-ruler .perf-ruler-hit').eq(2).click({ force: true });
+    cy.get(`#${chartId} .perf-ruler .pr-text-ratio`).should('have.text', '4.00x');
+    cy.contains('button', 'Toggle overlay').click();
+    cy.get('#power-ruler .perf-ruler-hit').should('have.length', 1);
+    cy.get('#power-ruler .perf-ruler').should('not.exist');
+    cy.contains('button', 'Toggle overlay').click();
+    cy.get('#power-ruler .perf-ruler-hit').should('have.length', 3);
+    cy.get('#power-ruler .perf-ruler').should('not.exist');
+    cy.get('#power-ruler .perf-ruler-hit').eq(0).click({ force: true });
+    cy.get('#power-ruler .perf-ruler-hit').eq(2).click({ force: true });
+    cy.get(`#${chartId} .perf-ruler .pr-text-ratio`).should('have.text', '4.00x');
+    cy.contains('button', 'Dismiss overlay').click();
+    cy.get('#power-ruler .perf-ruler-hit').should('have.length', 1);
+    cy.get('#power-ruler .perf-ruler').should('not.exist');
+  });
+
+  it('colors measured-power boundaries by configuration without changing their geometry', () => {
+    mountWithProviders(<PowerHarness />, { unofficial: {} });
+    cy.get('#scatter-gradient-labels').should('have.attr', 'data-state', 'unchecked');
+    cy.get('#power-sweep .roofline-path')
+      .invoke('attr', 'd')
+      .then((boundary) => {
+        cy.get('#scatter-gradient-labels').click({ force: true });
+        cy.get('#power-sweep .roofline-path')
+          .should('have.attr', 'd', boundary)
+          .and('have.attr', 'stroke')
+          .and('match', /^url\(#roofline-gradient-/u);
+        expectVisiblePointCount('#power-sweep', 3);
+        cy.get('#power-sweep .parallelism-label .pl-text').should(($labels) => {
+          expect([...$labels].map((label) => label.textContent)).to.have.members(['TP2', 'TP4']);
+        });
+        cy.get('#power-sweep linearGradient[id^="roofline-gradient-"] stop').should(($stops) => {
+          expect(new Set([...$stops].map((stop) => stop.getAttribute('stop-color'))).size).to.equal(
+            2,
+          );
+        });
+        cy.get('#scatter-hide-non-optimal').click({ force: true });
+        expectVisiblePointCount('#power-sweep', 4);
+        cy.get('#power-sweep .roofline-path').should('have.attr', 'd', boundary);
+        cy.get('#power-sweep .parallelism-label').should('not.contain.text', 'TP8');
+        cy.get('#scatter-hide-non-optimal').click({ force: true });
+        expectVisiblePointCount('#power-sweep', 3);
+        cy.get('#power-sweep .roofline-path').should('have.attr', 'd', boundary);
+        cy.get('#scatter-gradient-labels').click({ force: true });
+        cy.get('#power-sweep .roofline-path')
+          .should('have.attr', 'd', boundary)
+          .and('have.attr', 'stroke')
+          .and('not.match', /^url\(/u);
+        cy.get('#power-sweep .parallelism-label').should('not.exist');
+        expectVisiblePointCount('#power-sweep', 3);
+      });
+    cy.get('#scatter-gradient-labels').click({ force: true });
+    for (const [, label] of powerMetrics) {
+      cy.contains('button', label).click();
+      cy.get('#scatter-gradient-labels').should('have.attr', 'data-state', 'checked');
+      cy.get('#power-sweep .roofline-path[data-curve-kind="power-envelope"]')
+        .should('have.attr', 'stroke')
+        .and('match', /^url\(#roofline-gradient-/u);
+      cy.get('#power-sweep .parallelism-label .pl-text').should(($labels) => {
+        expect([...$labels].map((node) => node.textContent)).to.have.members(['TP2', 'TP4']);
+      });
+    }
+    cy.get('#power-sweep svg').then(($svg) => {
+      const svg = $svg[0];
+      const beforePath = svg.querySelector('.roofline-path')!.getAttribute('d');
+      const beforeLabels = [...svg.querySelectorAll('.parallelism-label')].map((node) =>
+        node.getAttribute('transform'),
+      );
+      const bounds = svg.getBoundingClientRect();
+      svg.dispatchEvent(
+        new WheelEvent('wheel', {
+          deltaY: -240,
+          clientX: bounds.x + bounds.width / 2,
+          clientY: bounds.y + bounds.height / 2,
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      cy.get('#power-sweep .roofline-path')
+        .should('not.have.attr', 'd', beforePath)
+        .and('have.attr', 'stroke')
+        .and('match', /^url\(#roofline-gradient-/u);
+      cy.get('#power-sweep .parallelism-label')
+        .should(($labels) => {
+          expect([...$labels].map((node) => node.getAttribute('transform'))).not.to.deep.equal(
+            beforeLabels,
+          );
+        })
+        .then(($labels) => {
+          const zoomedLabels = [...$labels].map((node) => node.getAttribute('transform'));
+          cy.get('#power-sweep .roofline-path')
+            .invoke('attr', 'd')
+            .then((zoomedPath) => {
+              cy.get('#scatter-gradient-labels').click({ force: true });
+              cy.get('#power-sweep .parallelism-label').should('not.exist');
+              cy.get('#power-sweep .roofline-path').should('have.attr', 'd', zoomedPath);
+              cy.get('#scatter-gradient-labels').click({ force: true });
+              cy.get('#power-sweep .roofline-path')
+                .should('have.attr', 'd', zoomedPath)
+                .and('have.attr', 'stroke')
+                .and('match', /^url\(#roofline-gradient-/u);
+              cy.get('#power-sweep .parallelism-label').should(($restored) => {
+                expect([...$restored].map((node) => node.getAttribute('transform'))).to.deep.equal(
+                  zoomedLabels,
+                );
+              });
+            });
+        });
+    });
+    cy.contains('button', 'Energy').click();
+    cy.get('#power-sweep .roofline-path[data-curve-kind="pareto"]')
+      .should('have.attr', 'stroke')
+      .and('match', /^url\(#roofline-gradient-/u);
+    cy.get('#power-sweep .parallelism-label').should('not.contain.text', 'TP8');
+  });
+
+  it('keeps a single-configuration power boundary solid with its configuration label', () => {
+    mountWithProviders(<PowerHarness singleConfiguration />, { unofficial: {} });
+    cy.get('#scatter-gradient-labels').click({ force: true });
+    cy.get('#power-sweep .roofline-path')
+      .should('have.attr', 'stroke')
+      .and('not.match', /^url\(/u);
+    cy.get('#power-sweep linearGradient[id^="roofline-gradient-"]').should('not.exist');
+    cy.get('#power-sweep .parallelism-label .pl-text')
+      .should('have.length', 1)
+      .and('have.text', 'TP2');
+  });
+
+  it('starts the power boundary at the high E2E Normalized Interactivity end', () => {
+    mountWithProviders(<PowerHarness normalized />, { unofficial: {} });
+    expectVisiblePointCount('#power-sweep', 3);
+  });
+
+  it('keeps a fixed measured-power boundary while Optimal Only changes measurement visibility', () => {
+    mountWithProviders(<PowerHarness />, { unofficial: {} });
+    cy.get('#power-sweep .roofline-path[data-curve-kind="power-envelope"]').should(
+      'have.length',
+      1,
+    );
+    expectVisiblePointCount('#power-sweep', 3);
+    cy.get('#power-sweep .roofline-path[data-curve-kind="power-envelope"]')
+      .should('have.length', 1)
+      .invoke('attr', 'd')
+      .should('match', /^M[^C]+C/u);
+    cy.scatterPoints('#power-sweep').should((points) => {
+      const shown = visiblePoints(points);
+      expect(shown).to.have.length(3);
+      for (const point of shown) expect(point.opacity, point.key).to.equal(1);
+      const hidden = points.filter((point) => point.opacity === 0);
+      expect(hidden).to.have.length.greaterThan(0);
+      for (const point of hidden) expect(point.interactive, point.key).to.equal(false);
+    });
+    cy.get('#power-sweep .roofline-path')
+      .invoke('attr', 'd')
+      .then((boundary) => {
+        cy.get('#scatter-hide-non-optimal').click({ force: true });
+        cy.scatterPoints('#power-sweep').should((points) => {
+          expect(points).to.have.length(4);
+          for (const point of points) expect(point.opacity, point.key).to.equal(1);
+        });
+        cy.get('#power-sweep .roofline-path').should('have.attr', 'd', boundary);
+        cy.get('#scatter-hide-non-optimal').click({ force: true });
+        expectVisiblePointCount('#power-sweep', 3);
+        cy.get('#power-sweep .roofline-path').should('have.attr', 'd', boundary);
+      });
+    for (const [, label] of powerMetrics) {
+      cy.contains('button', label).click();
+      cy.get('#scatter-hide-non-optimal').should('have.attr', 'data-state', 'checked');
+      cy.get('#power-sweep .roofline-path[data-curve-kind="power-envelope"]')
+        .should('have.length', 1)
+        .invoke('attr', 'd')
+        .should('match', /^M[^C]+C/u);
+      expectVisiblePointCount('#power-sweep', 3);
+    }
+    cy.contains('button', 'Energy').click();
+    cy.get('#scatter-hide-non-optimal').should('have.attr', 'data-state', 'checked');
+    cy.get('#power-sweep .roofline-path[data-curve-kind="pareto"]').should('have.length', 1);
+  });
+
+  for (const metric of ['measuredAvgPower', 'measuredP75Power'] as const) {
+    it(`smooths ${metric} across configurations and preserves overlay runs through zoom`, () => {
+      const runUrl = 'https://github.com/SemiAnalysisAI/InferenceX/actions/runs/101';
+      const secondRunUrl = 'https://github.com/SemiAnalysisAI/InferenceX/actions/runs/102';
+      const rows = [
+        [16, 62.737, 399.728, 8],
+        [32, 55.742, 448.775, 8],
+        [64, 20.506, 344.948, 8],
+        [128, 25.686, 502.536, 8],
+        [256, 4.645, 372.904, 8],
+        [1, 172.488, 252.217, 1],
+        [2, 149.322, 291.378, 1],
+        [4, 121.477, 318.845, 1],
+        [8, 65.346, 283.477, 1],
+      ].map(([conc, x, y, ep]) =>
+        createMockInferenceData({
+          hwKey: 'h100',
+          model: Model.Qwen3_5,
+          precision: Precision.FP8,
+          date: '2026-07-05',
+          ep,
+          conc,
+          x,
+          y,
+          [metric]: { y, roof: false },
+          run_url: runUrl,
+        }),
+      );
+      const secondRunRows = [1, 8, 32].map((conc, i) =>
+        createMockInferenceData({
+          hwKey: 'h100',
+          model: Model.Qwen3_5,
+          precision: Precision.FP8,
+          date: '2026-07-05',
+          conc,
+          x: 100 - i * 30,
+          y: 400 + i * 200,
+          [metric]: { y: 400 + i * 200, roof: false },
+          run_url: secondRunUrl,
+        }),
+      );
+      function OverlayPowerHarness() {
+        const [optimal, setOptimal] = useState(true);
+        const value = createMockInferenceContextValues({
+          selectedYAxisMetric: `y_${metric}`,
+          hideNonOptimal: optimal,
+          setHideNonOptimal: setOptimal,
+          selectedModel: Model.Qwen3_5,
+          selectedSequence: Sequence.EightK_OneK,
+          selectedPrecisions: [Precision.FP8],
+          hardwareConfig: hwConfig,
+          activeHwTypes: new Set(['h100']),
+          hwTypesWithData: new Set(['h100']),
+        });
+        return (
+          <InferenceContextsProvider data={value} filters={value} display={value} actions={value}>
+            <div style={{ width: 1000, height: 600 }}>
+              <ScatterGraph
+                chartId="power-overlay"
+                modelLabel="Qwen3.5 397B"
+                data={rows}
+                xLabel="Interactivity"
+                yLabel="Power"
+                chartDefinition={createMockChartDefinition({
+                  chartType: 'interactivity',
+                  [`y_${metric}_roofline`]: 'lower_right',
+                })}
+                overlayData={{
+                  data: [...rows, ...secondRunRows],
+                  hardwareConfig: hwConfig,
+                  label: 'Power replay',
+                  runUrl,
+                }}
+                transitionDuration={0}
+              />
+            </div>
+          </InferenceContextsProvider>
+        );
+      }
+      mountWithProviders(<OverlayPowerHarness />, {
+        unofficial: {
+          activeOverlayHwTypes: new Set(['h100']),
+          allOverlayHwTypes: new Set(['h100']),
+          runIndexByUrl: { [runUrl]: 0, '101': 0, [secondRunUrl]: 1, '102': 1 },
+        },
+      });
+      const officialSelector = '#power-overlay .roofline-path[data-curve-kind="power-envelope"]';
+      const overlaySelector =
+        '#power-overlay .overlay-roofline-path[data-curve-kind="power-envelope"]';
+      function assertEnvelopes() {
+        cy.get<SVGPathElement>(`${officialSelector}, ${overlaySelector}`)
+          .should('have.length', 3)
+          .should(($paths) => {
+            const segmentCounts = [...$paths].map((path) => {
+              const segments = path.getAttribute('d')!.match(/C/gu) ?? [];
+              const length = path.getTotalLength();
+              let previous = path.getPointAtLength(0);
+              for (let step = 1; step <= 20; step++) {
+                const point = path.getPointAtLength((length * step) / 20);
+                expect(point.x, 'interactivity never reverses').to.be.at.least(previous.x);
+                expect(point.y, 'upper boundary never turns back').to.be.at.least(previous.y);
+                previous = point;
+              }
+              return segments.length;
+            });
+            expect(segmentCounts).to.have.members([5, 5, 2]);
+          });
+      }
+      cy.get(officialSelector).should('have.length', 1);
+      cy.get(overlaySelector).should('have.length', 2);
+      cy.scatterPoints('#power-overlay').should('have.length', 9);
+      cy.get('#power-overlay .unofficial-overlay-pt').should('have.length', 12);
+      expectVisiblePointCount('#power-overlay', 6);
+      cy.get('#power-overlay .unofficial-overlay-pt')
+        .filter((_, element) => element.style.opacity !== '0')
+        .should('have.length', 9);
+      assertEnvelopes();
+      cy.get(`${officialSelector}, ${overlaySelector}`).then(($paths) => {
+        const geometry = [...$paths].map((path) => path.getAttribute('d'));
+        cy.get('#scatter-hide-non-optimal').click({ force: true });
+        expectVisiblePointCount('#power-overlay', 9);
+        cy.get('#power-overlay .unofficial-overlay-pt')
+          .filter((_, element) => element.style.opacity !== '0')
+          .should('have.length', 12);
+        cy.get(`${officialSelector}, ${overlaySelector}`).should(($current) => {
+          expect([...$current].map((path) => path.getAttribute('d'))).to.deep.equal(geometry);
+        });
+        cy.get('#scatter-hide-non-optimal').click({ force: true });
+        expectVisiblePointCount('#power-overlay', 6);
+        cy.get('#power-overlay .unofficial-overlay-pt')
+          .filter((_, element) => element.style.opacity !== '0')
+          .should('have.length', 9);
+        cy.get(`${officialSelector}, ${overlaySelector}`).should(($current) => {
+          expect([...$current].map((path) => path.getAttribute('d'))).to.deep.equal(geometry);
+        });
+      });
+      cy.get(officialSelector)
+        .invoke('attr', 'd')
+        .then((beforeZoom) => {
+          cy.get('#power-overlay svg').then(($svg) => {
+            const svg = $svg[0];
+            const bounds = svg.getBoundingClientRect();
+            svg.dispatchEvent(
+              new WheelEvent('wheel', {
+                deltaY: -240,
+                clientX: bounds.x + bounds.width / 2,
+                clientY: bounds.y + bounds.height / 2,
+                shiftKey: true,
+                bubbles: true,
+                cancelable: true,
+              }),
+            );
+          });
+          cy.get(officialSelector).invoke('attr', 'd').should('not.equal', beforeZoom);
+        });
+      assertEnvelopes();
+    });
+  }
+});

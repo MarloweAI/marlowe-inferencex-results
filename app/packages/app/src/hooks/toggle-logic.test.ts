@@ -1,0 +1,139 @@
+import { describe, it, expect } from 'vitest';
+
+import { computeToggle } from '@/hooks/useTogglableSet';
+
+const ALL = new Set(['a', 'b', 'c']);
+
+describe('computeToggle', () => {
+  describe('when all items are active (solo behavior)', () => {
+    it('solos the toggled item when all are active', () => {
+      const prev = new Set(['a', 'b', 'c']);
+      const result = computeToggle(prev, 'b', ALL);
+      expect(result).toEqual(new Set(['b']));
+    });
+  });
+
+  describe('when only one item is active (restore all behavior)', () => {
+    it('restores all items when the solo item is toggled again', () => {
+      const prev = new Set(['b']);
+      const result = computeToggle(prev, 'b', ALL);
+      expect(result).toEqual(ALL);
+    });
+  });
+
+  describe('when some (but not all/one) items are active', () => {
+    it('solos the clicked active item', () => {
+      const prev = new Set(['a', 'b']);
+      const result = computeToggle(prev, 'a', ALL);
+      expect(result).toEqual(new Set(['a']));
+    });
+
+    it('does not mutate the input set', () => {
+      const prev = new Set(['a', 'b']);
+      computeToggle(prev, 'a', ALL);
+      expect(prev).toEqual(new Set(['a', 'b']));
+    });
+  });
+
+  describe('when adding an inactive item', () => {
+    it('adds an inactive item to the set', () => {
+      const prev = new Set(['a']);
+      const result = computeToggle(prev, 'b', ALL);
+      expect(result).toEqual(new Set(['a', 'b']));
+    });
+
+    it('adds to an empty set', () => {
+      const prev = new Set<string>();
+      const result = computeToggle(prev, 'a', ALL);
+      expect(result).toEqual(new Set(['a']));
+    });
+
+    it('completing the set (adding last missing item)', () => {
+      const prev = new Set(['a', 'b']);
+      const result = computeToggle(prev, 'c', ALL);
+      expect(result).toEqual(new Set(['a', 'b', 'c']));
+    });
+  });
+
+  describe('edge cases', () => {
+    it('handles single-item allItems set: toggle on → solo = same, toggle off → restore = same', () => {
+      const singleAll = new Set(['x']);
+      const result1 = computeToggle(new Set(['x']), 'x', singleAll);
+      expect(result1).toEqual(new Set(['x']));
+    });
+
+    it('handles two-item allItems set: solo then restore', () => {
+      const twoAll = new Set(['a', 'b']);
+      const step1 = computeToggle(new Set(['a', 'b']), 'a', twoAll);
+      expect(step1).toEqual(new Set(['a']));
+      const step2 = computeToggle(step1, 'a', twoAll);
+      expect(step2).toEqual(twoAll);
+    });
+
+    it('does not mutate the previous set', () => {
+      const prev = new Set(['a', 'b']);
+      computeToggle(prev, 'c', ALL);
+      expect(prev).toEqual(new Set(['a', 'b']));
+    });
+
+    it('does not mutate the allItems set', () => {
+      const allCopy = new Set(ALL);
+      computeToggle(new Set(['a']), 'a', ALL);
+      expect(ALL).toEqual(allCopy);
+    });
+
+    it('full cycle: all → solo → add → re-solo → restore', () => {
+      const s1 = computeToggle(new Set(['a', 'b', 'c']), 'a', ALL);
+      expect(s1).toEqual(new Set(['a']));
+      const s2 = computeToggle(s1, 'b', ALL);
+      expect(s2).toEqual(new Set(['a', 'b']));
+      const s3 = computeToggle(s2, 'a', ALL);
+      expect(s3).toEqual(new Set(['a']));
+      const s4 = computeToggle(s3, 'a', ALL);
+      expect(s4).toEqual(ALL);
+    });
+  });
+
+  describe('empty allItems', () => {
+    it('adds item to empty prev when allItems is empty', () => {
+      const result = computeToggle(new Set(), 'a', new Set());
+      expect(result).toEqual(new Set(['a']));
+    });
+
+    it('returns allItems (empty) when prev has one item and that item is toggled off with empty allItems', () => {
+      const result = computeToggle(new Set(['a']), 'a', new Set());
+      expect(result).toEqual(new Set());
+    });
+  });
+
+  describe('item not in allItems', () => {
+    it('solos when prev equals allItems size, even if toggled item is not in allItems', () => {
+      const allItems = new Set(['a', 'b']);
+      const prev = new Set(['a', 'x']);
+      const result = computeToggle(prev, 'x', allItems);
+      expect(result).toEqual(new Set(['x']));
+    });
+
+    it('adds an unknown item when prev is a subset', () => {
+      const allItems = new Set(['a', 'b', 'c']);
+      const prev = new Set(['a']);
+      const result = computeToggle(prev, 'z', allItems);
+      expect(result).toEqual(new Set(['a', 'z']));
+    });
+  });
+
+  describe('return type guarantees', () => {
+    it('always returns a new Set instance (never the same reference as prev)', () => {
+      const allItems = new Set(['a', 'b', 'c']);
+
+      const prev1 = new Set(['a', 'b', 'c']);
+      expect(computeToggle(prev1, 'a', allItems)).not.toBe(prev1);
+
+      const prev2 = new Set(['a']);
+      expect(computeToggle(prev2, 'b', allItems)).not.toBe(prev2);
+
+      const prev3 = new Set(['a', 'b']);
+      expect(computeToggle(prev3, 'a', allItems)).not.toBe(prev3);
+    });
+  });
+});

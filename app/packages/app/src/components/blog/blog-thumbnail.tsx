@@ -1,0 +1,136 @@
+'use client';
+
+import type { CSSProperties } from 'react';
+
+import { ThemedFigureImage } from '@/components/blog/themed-figure-image';
+import { Badge } from '@/components/ui/badge';
+import type { PostThumbnail } from '@/lib/blog/blog';
+import { optimizedThumbnailSrc, THUMBNAIL_WIDTHS } from '@/lib/blog/blog-thumbnail-src';
+import { cn } from '@/lib/shared/utils';
+
+export interface BlogThumbnailProps {
+  thumbnail: PostThumbnail | null;
+  tag?: string;
+  readingLabel?: string;
+  priority?: boolean;
+  variant?: 'tile' | 'card';
+  className?: string;
+}
+
+const TILE_SIZES = '(min-width: 1024px) 33vw, (min-width: 640px) 50vw, 100vw';
+const CARD_SIZES = '(min-width: 1024px) 50vw, 100vw';
+
+const IMG_CLASS =
+  'block h-full w-full rounded-md border border-border/30 bg-card object-cover object-top';
+
+const TILE_MASK =
+  'linear-gradient(115deg, rgba(0, 0, 0, 0.9), rgba(0, 0, 0, 0.4) 55%, rgba(0, 0, 0, 0.08) 90%)';
+const CARD_MASK =
+  'linear-gradient(90deg, rgba(0, 0, 0, 0.7), rgba(0, 0, 0, 0.2) 55%, transparent 85%)';
+
+const DOTS_STYLE: CSSProperties = {
+  backgroundImage: 'radial-gradient(circle at center, currentColor 1px, transparent 1.2px)',
+  backgroundSize: '20px 20px',
+};
+
+const LINES_STYLE: CSSProperties = {
+  backgroundImage:
+    'linear-gradient(currentColor 1px, transparent 1px), linear-gradient(90deg, currentColor 1px, transparent 1px)',
+  backgroundSize: '80px 80px, 80px 80px',
+};
+
+interface GridTextureProps {
+  variant: 'tile' | 'card';
+  className?: string;
+}
+
+export function BlogGridTexture({ variant, className }: GridTextureProps) {
+  const mask = variant === 'tile' ? TILE_MASK : CARD_MASK;
+  const maskStyle: CSSProperties = { maskImage: mask, WebkitMaskImage: mask };
+  return (
+    <div aria-hidden="true" className={cn('pointer-events-none absolute inset-0', className)}>
+      <div
+        className={cn(
+          'absolute inset-0',
+          variant === 'tile' ? 'text-foreground/25' : 'text-foreground/15',
+        )}
+        style={{ ...DOTS_STYLE, ...maskStyle }}
+      />
+      <div
+        className={cn(
+          'absolute inset-0',
+          variant === 'tile' ? 'text-foreground/8' : 'text-foreground/5',
+        )}
+        style={{ ...LINES_STYLE, ...maskStyle }}
+      />
+    </div>
+  );
+}
+
+export function BlogThumbnail({
+  thumbnail,
+  tag,
+  readingLabel,
+  priority = false,
+  variant = 'tile',
+  className,
+}: BlogThumbnailProps) {
+  const loading = priority ? 'eager' : 'lazy';
+  const width = variant === 'card' ? THUMBNAIL_WIDTHS.card : THUMBNAIL_WIDTHS.tile;
+  if (!thumbnail) {
+    return (
+      <div
+        className={cn('relative aspect-[3/1] w-full overflow-hidden bg-background', className)}
+        data-testid="blog-thumbnail-tile"
+      >
+        <BlogGridTexture variant="tile" />
+        {readingLabel && (
+          <span
+            aria-hidden="true"
+            className="absolute top-3 right-3 font-mono text-xs text-muted-foreground tabular-nums"
+          >
+            {readingLabel}
+          </span>
+        )}
+        {tag && (
+          <Badge
+            variant="outline"
+            aria-hidden="true"
+            className="absolute bottom-3 left-3 bg-card text-muted-foreground"
+          >
+            {tag}
+          </Badge>
+        )}
+      </div>
+    );
+  }
+  const single = thumbnail.dark ?? thumbnail.light;
+  return (
+    <div
+      className={cn('relative aspect-[1200/630] w-full overflow-hidden bg-muted/50 p-3', className)}
+      data-testid="blog-thumbnail-figure"
+    >
+      {thumbnail.light && thumbnail.dark && thumbnail.light !== thumbnail.dark ? (
+        <ThemedFigureImage
+          srcLight={optimizedThumbnailSrc(thumbnail.light, width)}
+          srcDark={optimizedThumbnailSrc(thumbnail.dark, width)}
+          alt=""
+          loading={loading}
+          className={IMG_CLASS}
+        />
+      ) : single ? (
+        <img
+          src={optimizedThumbnailSrc(single, width)}
+          srcSet={`${optimizedThumbnailSrc(single, THUMBNAIL_WIDTHS.tile)} ${THUMBNAIL_WIDTHS.tile}w, ${optimizedThumbnailSrc(single, THUMBNAIL_WIDTHS.card)} ${THUMBNAIL_WIDTHS.card}w`}
+          sizes={variant === 'card' ? CARD_SIZES : TILE_SIZES}
+          alt=""
+          width={1200}
+          height={630}
+          loading={loading}
+          decoding="async"
+          className={IMG_CLASS}
+        />
+      ) : null}
+    </div>
+  );
+}

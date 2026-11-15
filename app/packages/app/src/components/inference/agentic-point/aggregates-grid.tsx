@@ -1,0 +1,116 @@
+'use client';
+
+import type { AgenticAggregateMap, MetricPercentiles } from '@/hooks/api/use-agentic-aggregates';
+import type { BenchmarkSibling } from '@/hooks/api/use-benchmark-siblings';
+import { EmptyState } from '@/components/ui/empty-state';
+
+import { AggregateChart, type AggregatePoint, type PercentileKey } from './aggregate-chart';
+import { ExpandableChart } from './expandable-chart';
+import { chipLabel } from './sibling-nav';
+import { useLocale } from '@/lib/i18n/use-locale';
+
+function toAggPoint(
+  sibling: { id: number; label: string },
+  pct: MetricPercentiles | null | undefined,
+): AggregatePoint {
+  const values: Partial<Record<PercentileKey, number>> = {};
+  if (pct) {
+    values.mean = pct.mean;
+    values.p50 = pct.p50;
+    values.p75 = pct.p75;
+    values.p90 = pct.p90;
+    values.p95 = pct.p95;
+    values.p99 = pct.p99;
+  }
+  return { id: sibling.id, label: sibling.label, values };
+}
+
+export function AggregatesGrid({
+  siblings,
+  aggregates,
+  isLoading,
+}: {
+  siblings: BenchmarkSibling[];
+  aggregates: AgenticAggregateMap | undefined;
+  isLoading: boolean;
+}) {
+  const locale = useLocale();
+  const t =
+    locale === 'zh'
+      ? {
+          missing: '尚未加载同一 SKU 下的数据点。请先打开任一数据点。',
+          loading: (count: number) => `正在解析 trace 数据，并汇总 ${count} 个配置……`,
+          isl: '各配置的 ISL 分布',
+          osl: '各配置的 OSL 分布',
+          kv: '各配置的 KV cache 利用率',
+          prefix: '各配置的 Prefix cache 命中率',
+        }
+      : {
+          missing: 'SKU sibling list not loaded yet — open a point to populate.',
+          loading: (count: number) =>
+            `Computing aggregates across ${count} configs… (parsing trace blobs)`,
+          isl: 'ISL distribution (across configs)',
+          osl: 'OSL distribution (across configs)',
+          kv: 'KV cache utilization (across configs)',
+          prefix: 'Prefix cache hit rate (across configs)',
+        };
+  if (siblings.length === 0) {
+    return <EmptyState>{t.missing}</EmptyState>;
+  }
+  if (isLoading && !aggregates) {
+    return <EmptyState>{t.loading(siblings.length)}</EmptyState>;
+  }
+  const labeled = siblings.map((s) => ({ id: s.id, label: chipLabel(s) }));
+  const islPoints = labeled.map((s) => toAggPoint(s, aggregates?.[s.id]?.isl));
+  const oslPoints = labeled.map((s) => toAggPoint(s, aggregates?.[s.id]?.osl));
+  const kvPoints = labeled.map((s) => toAggPoint(s, aggregates?.[s.id]?.kvCacheUtil));
+  const prefixPoints = labeled.map((s) => toAggPoint(s, aggregates?.[s.id]?.prefixCacheHitRate));
+  return (
+    <div className="grid grid-cols-1 gap-x-8 gap-y-10 lg:grid-cols-2">
+      <ExpandableChart
+        title={t.isl}
+        render={(size) => (
+          <AggregateChart
+            points={islPoints}
+            unit={locale === 'zh' ? 'token' : 'tokens'}
+            {...size}
+          />
+        )}
+      />
+      <ExpandableChart
+        title={t.osl}
+        render={(size) => (
+          <AggregateChart
+            points={oslPoints}
+            unit={locale === 'zh' ? 'token' : 'tokens'}
+            {...size}
+          />
+        )}
+      />
+      <ExpandableChart
+        title={t.kv}
+        render={(size) => (
+          <AggregateChart
+            points={kvPoints}
+            unit="%"
+            yMax={1}
+            yFmt={(v) => `${(v * 100).toFixed(0)}%`}
+            {...size}
+          />
+        )}
+      />
+      <ExpandableChart
+        title={t.prefix}
+        render={(size) => (
+          <AggregateChart
+            points={prefixPoints}
+            unit="%"
+            yMax={1}
+            yFmt={(v) => `${(v * 100).toFixed(0)}%`}
+            {...size}
+          />
+        )}
+      />
+    </div>
+  );
+}

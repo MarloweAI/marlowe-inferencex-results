@@ -1,0 +1,17 @@
+import { renderToStaticMarkup } from 'react-dom/server';
+import { describe, expect, it } from 'vitest';
+
+import type { TocHeading } from '@/lib/blog/blog';
+import { BlogToc } from './blog-toc';
+
+const headings = [{ id: 'results', text: 'Results', level: 2 }] satisfies TocHeading[];
+
+describe('shared Blog localization chrome', () => {
+  it('renders the equivalent Chinese table of contents without English fallback copy', () => {
+    const toc = renderToStaticMarkup(<BlogToc headings={headings} locale="zh" />);
+
+    expect(toc).toContain('aria-label="本页目录"');
+    expect(toc).not.toContain('Table of contents');
+    expect(toc).not.toContain('On this page');
+  });
+});

@@ -1,0 +1,502 @@
+// @vitest-environment jsdom
+import { act } from 'react';
+import { describe, expect, it, vi } from 'vitest';
+
+import type { InferenceData } from '@/components/inference/types';
+import chartDefinitions from '@/components/inference/metric-registry';
+
+import {
+  type ScatterGraph,
+  HARDWARE_CONFIG,
+  baseInferenceState,
+  baseOverlayState,
+  inferenceState,
+  legendState,
+  mountChart,
+  overlayState,
+  point,
+  rebuildCount,
+  scatterPoints,
+} from './ScatterGraph.test-harness';
+
+vi.mock('@/lib/d3-chart/dynamic-margins', async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  measureTextWidth: (text: string, font: string) =>
+    text.length * Number.parseFloat(font.split(' ')[1]) * 0.58,
+}));
+
+const measurements = (offset: number, runUrl?: string): InferenceData[] => [
+  { ...point('h100', 'fp8', 10, 900 + offset, 1), power_tier: 'legacy', run_url: runUrl },
+  { ...point('h100', 'fp8', 20, 200 + offset, 2), power_tier: 'legacy', run_url: runUrl },
+  { ...point('h100', 'fp8', 30, 700 + offset, 4), power_tier: 'certified', run_url: runUrl },
+];
+
+describe('ScatterGraph unofficial overlays', () => {
+  it('hides framework text for official and unofficial line labels without rebuilding points', () => {
+    const hwKey = 'b200_trt';
+    const points = [point(hwKey, 'fp8', 10, 300, 1), point(hwKey, 'fp8', 20, 200, 2)];
+    const runUrl = 'https://github.com/o/r/actions/runs/123';
+    inferenceState.current = {
+      ...baseInferenceState(),
+      activeHwTypes: new Set([hwKey]),
+      hwTypesWithData: new Set([hwKey]),
+      showLineLabels: true,
+      showFrameworkLabel: true,
+    };
+    overlayState.current = {
+      ...baseOverlayState(),
+      isUnofficialRun: true,
+      activeOverlayHwTypes: new Set([hwKey]),
+      allOverlayHwTypes: new Set([hwKey]),
+      runIndexByUrl: { [runUrl]: 0 },
+      unofficialRunInfos: [{ id: '123', branch: 'framework-toggle', url: runUrl }],
+    };
+    const { container, rerender, unmount } = mountChart({
+      data: points,
+      overlayData: {
+        data: points.map((p) => ({ ...p, y: p.y + 100, run_url: runUrl })),
+        hardwareConfig: {},
+        label: 'framework-toggle',
+      },
+    });
+    const labels = () =>
+      [...container.querySelectorAll('.line-label .ll-text')].map((n) => n.textContent);
+    expect(labels().filter((label) => label?.includes('TRTLLM'))).toHaveLength(2);
+    const pointLayer = container.querySelector('.canvas-point-layer');
+    const overlay = container.querySelector('.overlay-roofline-path');
+    const color = overlay?.getAttribute('stroke');
+    const builds = rebuildCount();
+    inferenceState.current = { ...inferenceState.current, showFrameworkLabel: false };
+    rerender();
+    expect(labels()).toEqual(['B200', 'B200']);
+    expect(container.querySelector('.canvas-point-layer')).toBe(pointLayer);
+    expect(container.querySelector('.overlay-roofline-path')).toBe(overlay);
+    expect(overlay?.getAttribute('stroke')).toBe(color);
+    expect(rebuildCount()).toBe(builds);
+    inferenceState.current = { ...inferenceState.current, showFrameworkLabel: true };
+    rerender();
+    expect(labels().filter((label) => label?.includes('TRTLLM'))).toHaveLength(2);
+    unmount();
+  });
+
+  it('labels measured overlay boundary configurations in run colors without labeling off-boundary samples', () => {
+    const runUrls = [
+      'https://github.com/o/r/actions/runs/123',
+      'https://github.com/o/r/actions/runs/456',
+    ];
+    const runInfos = runUrls.map((url, index) => ({
+      id: index === 0 ? '123' : '456',
+      branch: `power-${index}`,
+      url,
+    }));
+    const overlayPoints = runUrls.flatMap((runUrl, index) =>
+      [
+        point('h100', 'fp8', 10, 900, 1),
+        point('h100', 'fp8', 15, 850, 1),
+        point('h100', 'fp8', 20, 200, 8),
+        point('h100', 'fp8', 25, 750, 4),
+        point('h100', 'fp8', 30, 700, 4),
+      ].map((datum) => ({ ...datum, y: datum.y + index * 100, run_url: runUrl })),
+    );
+    inferenceState.current = {
+      ...baseInferenceState(),
+      selectedYAxisMetric: 'y_measuredAvgPower',
+      hideNonOptimal: false,
+      showPointLabels: false,
+      showGradientLabels: false,
+    };
+    const initialOverlayState = {
+      ...baseOverlayState(),
+      isUnofficialRun: true,
+      activeOverlayHwTypes: new Set(['h100']),
+      allOverlayHwTypes: new Set(['h100']),
+      runIndexByUrl: { [runUrls[0]]: 0, [runUrls[1]]: 1 },
+      unofficialRunInfos: runInfos,
+    };
+    overlayState.current = initialOverlayState;
+    const props = {
+      chartDefinition: chartDefinitions[0],
+      data: measurements(0),
+      overlayData: {
+        data: overlayPoints,
+        hardwareConfig: { h100: { ...HARDWARE_CONFIG.h100, suffix: '' } },
+        label: 'power comparison',
+      },
+    };
+    const { container, rerender, unmount } = mountChart(props);
+    const buildsAfterMount = rebuildCount();
+    const visibleLabels = () =>
+      [
+        ...container.querySelectorAll<SVGTextElement>('.unofficial-overlay-pt .overlay-label'),
+      ].filter((label) => label.style.display !== 'none' && label.style.opacity !== '0');
+    const curves = () =>
+      [...container.querySelectorAll('.overlay-roofline-path')].map((curve) => ({
+        path: curve.getAttribute('d'),
+        color: curve.getAttribute('stroke'),
+        dash: curve.getAttribute('stroke-dasharray'),
+      }));
+    const initialCurves = curves();
+    expect(initialCurves).toHaveLength(2);
+    expect(initialCurves.every((curve) => curve.path)).toBe(true);
+    expect(visibleLabels()).toHaveLength(0);
+
+    for (const showGradientLabels of [true, false, true]) {
+      inferenceState.current = { ...inferenceState.current, showGradientLabels };
+      rerender();
+      const labels = visibleLabels();
+      expect(labels).toHaveLength(showGradientLabels ? 4 : 0);
+      for (const [index, run] of runInfos.entries()) {
+        const runLabels = labels.filter((label) => {
+          const group = label.closest('.unofficial-overlay-pt') as SVGGElement & {
+            __data__: InferenceData;
+          };
+          expect(group.style.opacity).toBe('1');
+          expect(group.__data__.tp).not.toBe(8);
+          return group.__data__.run_url === run.url;
+        });
+        expect(runLabels.map((label) => label.textContent).sort()).toEqual(
+          showGradientLabels ? ['TP1', 'TP4'] : [],
+        );
+        const legendItem = legendState.current!.legendItems.find(
+          (item: { hw: string }) => item.hw === `overlay-run-${run.id}`,
+        );
+        expect(legendItem.color).toBe(initialCurves[index].color);
+        for (const label of runLabels) expect(label.style.fill).toBe(legendItem.color);
+      }
+      expect(curves()).toEqual(initialCurves);
+      expect(rebuildCount()).toBe(buildsAfterMount);
+      const offBoundaryPoints = [
+        ...container.querySelectorAll<SVGGElement>('.unofficial-overlay-pt'),
+      ].filter((group) => (group as SVGGElement & { __data__: InferenceData }).__data__.tp === 8);
+      expect(offBoundaryPoints).toHaveLength(2);
+      for (const group of offBoundaryPoints) {
+        expect(group.style.opacity).toBe('1');
+        expect(group.querySelector<SVGTextElement>('.overlay-label')!.style.display).toBe('none');
+      }
+    }
+
+    overlayState.current = { ...initialOverlayState, activeOverlayHwTypes: new Set<string>() };
+    rerender();
+    expect(visibleLabels()).toHaveLength(0);
+    expect(container.querySelectorAll('.overlay-roofline-path')).toHaveLength(0);
+
+    overlayState.current = initialOverlayState;
+    rerender();
+    expect(visibleLabels()).toHaveLength(4);
+    expect(curves()).toEqual(initialCurves);
+
+    props.overlayData = {
+      ...props.overlayData,
+      data: overlayPoints.filter((datum) => datum.run_url === runUrls[0]),
+    };
+    overlayState.current = {
+      ...initialOverlayState,
+      runIndexByUrl: { [runUrls[0]]: 0 },
+      unofficialRunInfos: [runInfos[0]],
+    };
+    rerender();
+    expect(
+      visibleLabels()
+        .map((label) => label.textContent)
+        .sort(),
+    ).toEqual(['TP1', 'TP4']);
+    expect(curves()).toHaveLength(1);
+    expect(curves()[0].color).toBe(initialCurves[0].color);
+    for (const group of container.querySelectorAll<SVGGElement>('.unofficial-overlay-pt')) {
+      expect((group as SVGGElement & { __data__: InferenceData }).__data__.run_url).toBe(
+        runUrls[0],
+      );
+    }
+    expect(
+      legendState.current!.legendItems.some(
+        (item: { hw: string }) => item.hw === 'overlay-run-456',
+      ),
+    ).toBe(false);
+    unmount();
+  });
+
+  it('uses Optimal Only for official and overlay power markers without moving boundaries', () => {
+    const runUrls = [
+      'https://github.com/o/r/actions/runs/123',
+      'https://github.com/o/r/actions/runs/456',
+    ];
+    inferenceState.current = {
+      ...baseInferenceState(),
+      selectedYAxisMetric: 'y_measuredAvgPower',
+      hideNonOptimal: true,
+    };
+    overlayState.current = {
+      ...baseOverlayState(),
+      isUnofficialRun: true,
+      activeOverlayHwTypes: new Set(['h100']),
+      allOverlayHwTypes: new Set(['h100']),
+      runIndexByUrl: { [runUrls[0]]: 0, [runUrls[1]]: 1 },
+      unofficialRunInfos: runUrls.map((url, index) => ({
+        id: index === 0 ? '123' : '456',
+        branch: `power-${index}`,
+        url,
+      })),
+    };
+
+    const { container, rerender, unmount } = mountChart({
+      chartDefinition: chartDefinitions[0],
+      data: measurements(0),
+      overlayData: {
+        data: [...measurements(-100, runUrls[0]), ...measurements(100, runUrls[1])],
+        hardwareConfig: { h100: { ...HARDWARE_CONFIG.h100, suffix: '' } },
+        label: 'power comparison',
+      },
+    });
+    const buildsAfterMount = rebuildCount();
+    const official = () => scatterPoints(container);
+    const overlayGroups = [...container.querySelectorAll<SVGGElement>('.unofficial-overlay-pt')];
+    const curves = [...container.querySelectorAll('.roofline-path, .overlay-roofline-path')];
+    const paths = curves.map((curve) => curve.getAttribute('d'));
+    const axes = [...container.querySelectorAll('.x-axis, .y-axis')];
+    const axisGeometry = axes.map((axis) => axis.innerHTML);
+    const officialPositions = official().map((entry) => [entry.x, entry.y]);
+    const overlayPositions = overlayGroups.map((group) => group.getAttribute('transform'));
+    expect(official().length + overlayGroups.length).toBe(9);
+    expect(curves).toHaveLength(3);
+    expect(paths.every(Boolean)).toBe(true);
+
+    for (const showAllMeasurements of [false, true, false]) {
+      inferenceState.current = { ...inferenceState.current, hideNonOptimal: !showAllMeasurements };
+      rerender();
+      for (const entry of official()) {
+        const visible = showAllMeasurements || (entry.datum as InferenceData).x !== 20;
+        expect(entry.opacity).toBe(visible ? 1 : 0);
+        expect(entry.interactive).toBe(visible);
+      }
+      for (const group of overlayGroups) {
+        const datum = (group as SVGGElement & { __data__: InferenceData }).__data__;
+        const visible = showAllMeasurements || datum.x !== 20;
+        expect(group.style.opacity).toBe(visible ? '1' : '0');
+        expect(group.style.pointerEvents).toBe(visible ? 'auto' : 'none');
+      }
+      expect(curves.map((curve) => curve.getAttribute('d'))).toEqual(paths);
+      expect(axes.map((axis) => axis.innerHTML)).toEqual(axisGeometry);
+      expect(official().map((entry) => [entry.x, entry.y])).toEqual(officialPositions);
+      expect(overlayGroups.map((group) => group.getAttribute('transform'))).toEqual(
+        overlayPositions,
+      );
+      expect(rebuildCount()).toBe(buildsAfterMount);
+    }
+    unmount();
+  });
+
+  it('keeps unofficial-run overlay markers rendered through official toggles', () => {
+    const overlayPoints = [point('h100', 'fp8', 30, 300, 2), point('h100', 'fp8', 35, 350, 4)].map(
+      (p) => ({ ...p, run_url: 'https://github.com/o/r/actions/runs/123' }),
+    );
+    overlayState.current = {
+      ...baseOverlayState(),
+      isUnofficialRun: true,
+      activeOverlayHwTypes: new Set(['h100']),
+      allOverlayHwTypes: new Set(['h100']),
+      runIndexByUrl: { 'https://github.com/o/r/actions/runs/123': 0 },
+      unofficialRunInfos: [
+        { id: '123', branch: 'test-branch', url: 'https://github.com/o/r/actions/runs/123' },
+      ],
+    };
+    const { container, rerender, unmount } = mountChart({
+      overlayData: {
+        data: overlayPoints,
+        hardwareConfig: HARDWARE_CONFIG,
+      } as unknown as Parameters<typeof ScatterGraph>[0]['overlayData'],
+    });
+    const buildsAfterMount = rebuildCount();
+
+    expect(container.querySelectorAll('.unofficial-overlay-pt')).toHaveLength(2);
+    expect(container.querySelectorAll('.overlay-roofline-path').length).toBeGreaterThan(0);
+
+    inferenceState.current = {
+      ...inferenceState.current,
+      activeHwTypes: new Set(['h100']),
+    };
+    rerender();
+
+    expect(container.querySelectorAll('.unofficial-overlay-pt')).toHaveLength(2);
+    expect(rebuildCount()).toBe(buildsAfterMount);
+    unmount();
+  });
+
+  it('toggles official and overlay point labels through the selective display phase', () => {
+    const runUrl = 'https://github.com/o/r/actions/runs/123';
+    const overlayPoints = [
+      { ...point('h100', 'fp8', 30, 300, 2), run_url: runUrl },
+      { ...point('h100', 'fp8', 35, 350, 4), run_url: runUrl },
+    ];
+    inferenceState.current = {
+      ...baseInferenceState(),
+      showPointLabels: false,
+    };
+    overlayState.current = {
+      ...baseOverlayState(),
+      isUnofficialRun: true,
+      activeOverlayHwTypes: new Set(['h100']),
+      allOverlayHwTypes: new Set(['h100']),
+      runIndexByUrl: { [runUrl]: 0 },
+      unofficialRunInfos: [{ id: '123', branch: 'test-branch', url: runUrl }],
+    };
+    const { container, rerender, unmount } = mountChart({
+      overlayData: {
+        data: overlayPoints,
+        hardwareConfig: HARDWARE_CONFIG,
+      } as unknown as Parameters<typeof ScatterGraph>[0]['overlayData'],
+    });
+    const buildsAfterMount = rebuildCount();
+    const officialLabel = () =>
+      container.querySelector<SVGTextElement>('.point-label-anchor .point-label');
+    const overlayLabel = container.querySelector<SVGTextElement>(
+      '.unofficial-overlay-pt .overlay-label',
+    );
+
+    expect(officialLabel()).toBeNull();
+    expect(overlayLabel).not.toBeNull();
+    expect(overlayLabel!.style.display).toBe('none');
+    const mutationRecords: MutationRecord[] = [];
+    const observer = new MutationObserver((records) => mutationRecords.push(...records));
+    observer.observe(container.querySelector('svg')!, { attributes: true, subtree: true });
+
+    inferenceState.current = {
+      ...inferenceState.current,
+      showPointLabels: true,
+    };
+    rerender();
+
+    expect(officialLabel()!.style.display).toBe('');
+    expect(overlayLabel!.style.display).toBe('');
+    mutationRecords.push(...observer.takeRecords());
+    observer.disconnect();
+    expect(mutationRecords.length).toBeGreaterThan(0);
+    expect(
+      mutationRecords.every(
+        ({ target }) =>
+          target instanceof Element && target.closest('.point-label, .overlay-label') !== null,
+      ),
+    ).toBe(true);
+    expect(rebuildCount()).toBe(buildsAfterMount);
+    unmount();
+  });
+
+  it('disables Best per SKU for overlay edits without applying a context selection', () => {
+    const setBestPerSku = vi.fn();
+    const runUrl = 'https://github.com/o/r/actions/runs/123';
+    const overlayPoints = [
+      { ...point('h100', 'fp8', 30, 300, 2), run_url: runUrl },
+      { ...point('h100', 'fp8', 35, 350, 4), run_url: runUrl },
+    ];
+    inferenceState.current = {
+      ...baseInferenceState(),
+      bestPerSku: true,
+      setBestPerSku,
+    };
+    overlayState.current = {
+      ...baseOverlayState(),
+      isUnofficialRun: true,
+      activeOverlayHwTypes: new Set(['h100']),
+      allOverlayHwTypes: new Set(['h100']),
+      runIndexByUrl: { [runUrl]: 0 },
+      unofficialRunInfos: [{ id: '123', branch: 'test-branch', url: runUrl }],
+    };
+
+    const { unmount } = mountChart({
+      overlayData: {
+        data: overlayPoints,
+        hardwareConfig: HARDWARE_CONFIG,
+      } as unknown as Parameters<typeof ScatterGraph>[0]['overlayData'],
+    });
+    const officialItem = legendState.current!.legendItems.find(
+      (item: { hw: string }) => item.hw === 'h100',
+    );
+
+    act(() => officialItem.onClick());
+    expect(setBestPerSku).toHaveBeenLastCalledWith(false, { applySelection: false });
+
+    act(() => legendState.current!.onItemRemove('h100'));
+    expect(setBestPerSku).toHaveBeenLastCalledWith(false, { applySelection: false });
+    unmount();
+  });
+
+  it('keeps speculative decoding out of unofficial-run point decorations', () => {
+    const runUrl = 'https://github.com/o/r/actions/runs/123';
+    const overlayPoints = [
+      {
+        ...point('h100', 'fp8', 30, 300, 2),
+        benchmark_type: 'agentic_traces',
+        spec_decoding: 'mtp',
+        offload_mode: 'on',
+        run_url: runUrl,
+      } as InferenceData,
+      {
+        ...point('h100', 'fp8', 35, 350, 4),
+        benchmark_type: 'agentic_traces',
+        spec_decoding: 'none',
+        offload_mode: 'off',
+        run_url: runUrl,
+      } as InferenceData,
+    ];
+    overlayState.current = {
+      ...baseOverlayState(),
+      isUnofficialRun: true,
+      activeOverlayHwTypes: new Set(['h100']),
+      allOverlayHwTypes: new Set(['h100']),
+      runIndexByUrl: { [runUrl]: 0 },
+      unofficialRunInfos: [{ id: '123', branch: 'test-branch', url: runUrl }],
+    };
+
+    const { container, rerender, unmount } = mountChart({
+      overlayData: {
+        data: overlayPoints,
+        hardwareConfig: HARDWARE_CONFIG,
+      } as unknown as Parameters<typeof ScatterGraph>[0]['overlayData'],
+    });
+    const groups = [...container.querySelectorAll<SVGGElement>('.unofficial-overlay-pt')];
+
+    expect(groups[0].querySelector('.spec-decode-marker')).toBeNull();
+    expect(groups[0].querySelector('.offload-halo')).not.toBeNull();
+    expect(groups[1].querySelector('.spec-decode-marker')).toBeNull();
+    expect(groups[1].querySelector('.offload-halo')).toBeNull();
+    const haloColor = groups[0].querySelector('.offload-halo')!.getAttribute('stroke');
+    const positions = groups.map((group) => group.getAttribute('transform'));
+    inferenceState.current = { ...inferenceState.current, showOffloadingLabel: false };
+    rerender();
+    expect(container.querySelector('.offload-halo')).toBeNull();
+    expect([...container.querySelectorAll('.unofficial-overlay-pt')]).toEqual(groups);
+    expect(groups.map((group) => group.getAttribute('transform'))).toEqual(positions);
+    inferenceState.current = { ...inferenceState.current, showOffloadingLabel: true };
+    rerender();
+    expect(groups[0].querySelector('.offload-halo')!.getAttribute('stroke')).toBe(haloColor);
+    unmount();
+  });
+
+  it('applies quick filters to unofficial-run overlay markers', () => {
+    const overlayPoints = [point('h100', 'fp8', 30, 300, 2), point('h100', 'fp8', 35, 350, 4)].map(
+      (p) => ({ ...p, run_url: 'https://github.com/o/r/actions/runs/123' }),
+    );
+    overlayState.current = {
+      ...baseOverlayState(),
+      isUnofficialRun: true,
+      activeOverlayHwTypes: new Set(['h100']),
+      allOverlayHwTypes: new Set(['h100']),
+      runIndexByUrl: { 'https://github.com/o/r/actions/runs/123': 0 },
+      unofficialRunInfos: [
+        { id: '123', branch: 'test-branch', url: 'https://github.com/o/r/actions/runs/123' },
+      ],
+    };
+    inferenceState.current = {
+      ...baseInferenceState(),
+      quickFilters: { vendors: ['AMD'], frameworks: [], deployment: [], spec: [], power: [] },
+    };
+    const { container, unmount } = mountChart({
+      overlayData: {
+        data: overlayPoints,
+        hardwareConfig: HARDWARE_CONFIG,
+      } as unknown as Parameters<typeof ScatterGraph>[0]['overlayData'],
+    });
+
+    expect(container.querySelectorAll('.unofficial-overlay-pt')).toHaveLength(0);
+    unmount();
+  });
+});

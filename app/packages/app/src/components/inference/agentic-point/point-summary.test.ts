@@ -1,0 +1,163 @@
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { describe, expect, it, vi } from 'vitest';
+
+const localeState = vi.hoisted(() => ({ pathname: '/infx/inference/agentic/206885' }));
+vi.mock('next/navigation', () => ({
+  usePathname: () => localeState.pathname,
+}));
+
+import type { PointMeta } from '@/hooks/api/use-trace-server-metrics';
+
+import { PointSummary } from './point-summary';
+
+function meta(overrides: Partial<PointMeta> = {}): PointMeta {
+  return {
+    id: 206885,
+    hardware: 'gb200',
+    framework: 'dynamo-vllm',
+    model: 'deepseek-r1-0528',
+    precision: 'fp8',
+    spec_method: 'none',
+    disagg: true,
+    is_multinode: true,
+    prefill_tp: 4,
+    prefill_ep: 1,
+    prefill_dp_attention: false,
+    prefill_num_workers: 2,
+    decode_tp: 16,
+    decode_ep: 16,
+    decode_dp_attention: true,
+    decode_num_workers: 4,
+    num_prefill_gpu: 8,
+    num_decode_gpu: 64,
+    recipe_fingerprint: null,
+    conc: 128,
+    offload_mode: 'off',
+    kv_offloading: null,
+    kv_offload_backend: null,
+    kv_offload_backend_version: null,
+    kv_p2p_transfer: null,
+    router_name: null,
+    router_version: null,
+    isl: null,
+    osl: null,
+    benchmark_type: 'agentic_traces',
+    date: '2026-06-23',
+    run_url: null,
+    server_gpu_cache_hit_rate: 0.5,
+    server_cpu_cache_hit_rate: 0.42,
+    ...overrides,
+  };
+}
+
+describe('PointSummary', () => {
+  it('identifies multinode aggregate without calling it disaggregated', () => {
+    const html = renderToStaticMarkup(
+      createElement(PointSummary, {
+        meta: meta({ disagg: false, is_multinode: true }),
+      }),
+    );
+
+    expect(html).toContain('multi-node aggregate');
+    expect(html).not.toContain(' · disagg');
+  });
+
+  it('hides a stale CPU cache hit rate when offload is disabled', () => {
+    const html = renderToStaticMarkup(createElement(PointSummary, { meta: meta() }));
+
+    expect(html).toContain('Chip cache hit');
+    expect(html).not.toContain('CPU cache hit');
+  });
+
+  it('shows the CPU cache hit rate when offload is enabled', () => {
+    const html = renderToStaticMarkup(
+      createElement(PointSummary, { meta: meta({ offload_mode: 'on' }) }),
+    );
+
+    expect(html).toContain('CPU cache hit');
+    expect(html).toContain('42.00%');
+  });
+
+  it('labels TRTLLM offload cache hits as combined instead of showing an empty CPU rate', () => {
+    const html = renderToStaticMarkup(
+      createElement(PointSummary, {
+        meta: meta({
+          framework: 'dynamo-trt',
+          kv_offloading: 'dram',
+          server_gpu_cache_hit_rate: 0.978,
+          server_cpu_cache_hit_rate: null,
+        }),
+      }),
+    );
+
+    expect(html).toContain('Combined chip + CPU cache hit');
+    expect(html).toContain('97.80%');
+    expect(html).not.toContain('>CPU cache hit<');
+  });
+
+  it('shows runtime component names and independently reported versions', () => {
+    const html = renderToStaticMarkup(
+      createElement(PointSummary, {
+        meta: meta({
+          offload_mode: 'on',
+          kv_offloading: 'dram',
+          kv_offload_backend: 'lmcache',
+          kv_offload_backend_version: '0.5.1',
+          kv_p2p_transfer: 'mooncake',
+          router_name: 'vllm-router',
+          router_version: '0.1.14',
+        }),
+      }),
+    );
+
+    expect(html).toContain('Offload type');
+    expect(html).toContain('DRAM');
+    expect(html).toContain('KV offload engine');
+    expect(html).toContain('LMCache 0.5.1');
+    expect(html).toContain('KV transfer engine');
+    expect(html).toContain('Mooncake');
+    expect(html).toContain('Router');
+    expect(html).toContain('vLLM Router 0.1.14');
+  });
+
+  it('links an agentic point to its configuration on the Prefix Cache Reuse tab', () => {
+    const html = renderToStaticMarkup(
+      createElement(PointSummary, { meta: meta({ model: 'dsr1', disagg: false }) }),
+    );
+
+    expect(html).toContain('Prefix cache reuse for this config');
+    expect(html).toContain(
+      'href="/infx/cache-reuse?g_model=DeepSeek-R1-0528&amp;i_seq=agentic-traces&amp;i_prec=fp8&amp;c_cfg=gb200_dynamo-vllm&amp;c_recipe=agg%7Cmn%7Cp2x4%2F1%2F-%7Cd4x16%2F16%2Fdpa%7Cg8%2B64%7Cspec-none%7Coffload-off%7C&amp;g_rundate=2026-06-23"',
+    );
+  });
+
+  it('offers no cache-reuse link for a fixed-sequence point', () => {
+    const html = renderToStaticMarkup(
+      createElement(PointSummary, { meta: meta({ benchmark_type: 'single_turn' }) }),
+    );
+
+    expect(html).not.toContain('cache-reuse-link');
+  });
+
+  it('renders runtime metadata labels in Simplified Chinese on /zh', () => {
+    localeState.pathname = '/zh/infx/inference/agentic/206885';
+    const html = renderToStaticMarkup(
+      createElement(PointSummary, {
+        meta: meta({
+          kv_offloading: 'dram',
+          kv_offload_backend: 'hicache',
+          router_name: 'sglang-router',
+          router_version: '0.3.2',
+        }),
+      }),
+    );
+    localeState.pathname = '/infx/inference/agentic/206885';
+
+    expect(html).toContain('offload 类型');
+    expect(html).toContain('KV offload 引擎');
+    expect(html).toContain('HiCache');
+    expect(html).toContain('路由器');
+    expect(html).toContain('SGLang Router 0.3.2');
+  });
+});

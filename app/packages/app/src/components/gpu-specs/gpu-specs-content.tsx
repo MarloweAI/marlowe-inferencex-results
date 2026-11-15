@@ -1,0 +1,482 @@
+'use client';
+
+import { useMemo, useRef, useState } from 'react';
+import { track } from '@/lib/analytics/analytics';
+import { BarChart3, Radar, Table2 } from 'lucide-react';
+
+import { Card } from '@/components/ui/card';
+import { ChartShareActions } from '@/components/ui/chart-display-helpers';
+import { DashboardSectionHeader } from '@/components/ui/dashboard-section-header';
+import { Heading } from '@/components/ui/heading';
+import { SegmentedToggle, type SegmentedToggleOption } from '@/components/ui/segmented-toggle';
+import { VendorDot } from '@/components/ui/vendor-dot';
+import {
+  formatScaleOutTopology,
+  formatScaleUpTopology,
+  formatTflops,
+  getScaleUpDomainMemory,
+  getScaleUpDomainMemoryBw,
+  GPU_CHART_METRICS,
+  GPU_SPECS,
+} from '@/lib/catalog/gpu-specs';
+import {
+  TopologyDiagram,
+  type TopologyDiagramHandle,
+} from '@/components/gpu-specs/topology-diagram';
+import {
+  ScaleUpTopologyDiagram,
+  type ScaleUpTopologyDiagramHandle,
+} from '@/components/gpu-specs/scale-up-topology-diagram';
+import { GpuSpecsBarChart } from '@/components/gpu-specs/gpu-specs-bar-chart';
+import { GpuSpecsRadarChart } from '@/components/gpu-specs/gpu-specs-radar-chart';
+import { useLocale } from '@/lib/i18n/use-locale';
+
+function SpecCell({
+  children,
+  align = 'left',
+  header = false,
+  sticky = false,
+  className = '',
+}: {
+  children: React.ReactNode;
+  align?: 'left' | 'right';
+  header?: boolean;
+  sticky?: boolean;
+  className?: string;
+}) {
+  const Tag = header ? 'th' : 'td';
+  return (
+    <Tag
+      className={`px-3 py-2.5 ${header ? 'whitespace-normal' : 'whitespace-nowrap'} ${
+        align === 'right' ? 'text-right' : 'text-left'
+      } ${header ? 'text-xs font-medium text-muted-foreground' : 'text-sm tabular-nums'} ${sticky ? 'sticky left-0 z-10 bg-card after:absolute after:right-0 after:top-0 after:bottom-0 after:w-px after:bg-border/30' : ''} ${className}`}
+    >
+      {children}
+    </Tag>
+  );
+}
+
+const STRINGS = {
+  en: {
+    heading: 'Chip specifications',
+    description:
+      'Hardware specifications for chips used in InferenceX™ benchmarks, including compute performance, memory bandwidth, and interconnect details.',
+    viewTable: 'Table',
+    viewChart: 'Chart',
+    viewRadar: 'Radar',
+    viewMode: 'View mode',
+    colGpu: 'Chip',
+    colMemory: 'Memory',
+    colMemBw: 'Mem BW',
+    colScaleUp: 'Scale-up',
+    colScaleUpBw: 'Scale-up BW',
+    colWorldSize: 'World size',
+    colScaleUpDomainMem: 'Scale-up domain memory',
+    colScaleUpDomainMemBw: 'Scale-up domain mem BW',
+    colScaleUpTopology: 'Scale-up topology',
+    colScaleUpSwitch: 'Scale-up switch',
+    colScaleOutBwPerGpu: 'Scale-out BW per chip',
+    colScaleOutTech: 'Scale-out tech',
+    colScaleOutSwitch: 'Scale-out switch',
+    colScaleOutTopology: 'Scale-out topology',
+    colNic: 'NIC',
+    footnote1: 'Dense tensor core peak TFLOP/s (without sparsity)',
+    footnote2:
+      'NVL72 NIC specifications are shown per GPU; inter-rack switch and topology are not specified here.',
+    scaleOutHeading: 'Scale-out topology diagrams',
+    scaleOutDescription:
+      'Per-server scale-out network topology for each chip SKU, showing chip → NIC → leaf switch connectivity',
+    scaleUpHeading: 'Scale-up topology diagrams',
+    scaleUpDescription:
+      'Intra-node scale-up interconnect topology for each chip SKU, showing chip → NVSwitch or direct chip-to-chip connectivity',
+    tableHint: 'Compare the full hardware matrix. Scroll horizontally on smaller screens.',
+    chartHint: 'Compare one hardware metric at a time across all chip SKUs',
+    radarHint: 'Compare the relative shape of compute, memory and interconnect capabilities',
+  },
+  zh: {
+    heading: '芯片规格',
+    description: 'InferenceX™ 基准测试中使用的芯片硬件规格，包括计算性能、显存带宽和互联详情。',
+    viewTable: '表格',
+    viewChart: '图表',
+    viewRadar: '雷达图',
+    viewMode: '显示模式',
+    colGpu: '芯片',
+    colMemory: '显存',
+    colMemBw: '显存带宽',
+    colScaleUp: '纵向扩展',
+    colScaleUpBw: '纵向扩展带宽',
+    colWorldSize: '域内芯片数',
+    colScaleUpDomainMem: '纵向扩展域显存',
+    colScaleUpDomainMemBw: '纵向扩展域显存带宽',
+    colScaleUpTopology: '纵向扩展拓扑',
+    colScaleUpSwitch: '纵向扩展交换机',
+    colScaleOutBwPerGpu: '每芯片横向扩展带宽',
+    colScaleOutTech: '横向扩展技术',
+    colScaleOutSwitch: '横向扩展交换机',
+    colScaleOutTopology: '横向扩展拓扑',
+    colNic: 'NIC',
+    footnote1: '密集 Tensor Core 峰值 TFLOP/s（不含稀疏加速）',
+    footnote2: 'NVL72 网卡规格按单 GPU 列出；此处未列出机柜间的交换机和网络拓扑。',
+    scaleOutHeading: '横向扩展拓扑图',
+    scaleOutDescription: '每台服务器的横向扩展网络拓扑，展示芯片 → NIC → Leaf 交换机的连接方式',
+    scaleUpHeading: '纵向扩展拓扑图',
+    scaleUpDescription: '节点内纵向扩展互联拓扑，展示芯片 → NVSwitch 或芯片直连方式',
+    tableHint: '比较完整硬件矩阵；在较小屏幕上可横向滚动查看。',
+    chartHint: '逐项比较所有芯片 SKU 的硬件指标',
+    radarHint: '比较计算、显存和互联能力的相对轮廓',
+  },
+} as const;
+
+type GpuSpecsViewMode = 'table' | 'chart' | 'radar';
+
+function GpuSpecsTable({
+  onTopologyClick,
+  onScaleUpTopologyClick,
+}: {
+  onTopologyClick?: (gpuName: string) => void;
+  onScaleUpTopologyClick?: (gpuName: string) => void;
+}) {
+  const locale = useLocale();
+  const t = STRINGS[locale];
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full min-w-350 border-collapse">
+        <thead>
+          <tr className="border-b border-border/30">
+            <SpecCell header align="left" sticky>
+              {t.colGpu}
+            </SpecCell>
+            <SpecCell header align="right">
+              {t.colMemory}
+            </SpecCell>
+            <SpecCell header align="right">
+              {t.colMemBw}
+            </SpecCell>
+            <SpecCell header align="right">
+              FP4{' '}
+              <span className="whitespace-nowrap">
+                TFLOP/s<sup className="text-muted-foreground/70">1</sup>
+              </span>
+            </SpecCell>
+            <SpecCell header align="right">
+              FP8{' '}
+              <span className="whitespace-nowrap">
+                TFLOP/s<sup className="text-muted-foreground/70">1</sup>
+              </span>
+            </SpecCell>
+            <SpecCell header align="right">
+              BF16{' '}
+              <span className="whitespace-nowrap">
+                TFLOP/s<sup className="text-muted-foreground/70">1</sup>
+              </span>
+            </SpecCell>
+            <SpecCell header align="left">
+              {t.colScaleUp}
+            </SpecCell>
+            <SpecCell header align="right">
+              {t.colScaleUpBw}
+            </SpecCell>
+            <SpecCell header align="right" className="whitespace-nowrap">
+              {t.colWorldSize}
+            </SpecCell>
+            <SpecCell header align="right" className="min-w-36">
+              {t.colScaleUpDomainMem}
+            </SpecCell>
+            <SpecCell header align="right" className="min-w-36">
+              {t.colScaleUpDomainMemBw}
+            </SpecCell>
+            <SpecCell header align="left">
+              {t.colScaleUpTopology}
+            </SpecCell>
+            <SpecCell header align="left">
+              {t.colScaleUpSwitch}
+            </SpecCell>
+            <SpecCell header align="right" className="min-w-28">
+              {t.colScaleOutBwPerGpu}
+            </SpecCell>
+            <SpecCell header align="left">
+              {t.colScaleOutTech}
+            </SpecCell>
+            <SpecCell header align="left">
+              {t.colScaleOutSwitch}
+            </SpecCell>
+            <SpecCell header align="left">
+              {t.colScaleOutTopology}
+            </SpecCell>
+            <SpecCell header align="left">
+              {t.colNic}
+            </SpecCell>
+          </tr>
+        </thead>
+        <tbody>
+          {GPU_SPECS.map((spec) => (
+            <tr
+              key={spec.name}
+              className="border-b border-border/30 transition-colors hover:bg-muted/40"
+              onClick={() => track('gpu_specs_row_clicked', { gpu: spec.name })}
+            >
+              <SpecCell align="left" sticky>
+                <div className="flex items-center gap-2">
+                  <VendorDot vendor={spec.vendor} />
+                  <span className="font-medium">{spec.name}</span>
+                </div>
+              </SpecCell>
+              <SpecCell align="right">{spec.memory}</SpecCell>
+              <SpecCell align="right">{spec.memoryBandwidth}</SpecCell>
+              <SpecCell align="right" className={spec.fp4 === null ? 'text-muted-foreground' : ''}>
+                {formatTflops(spec.fp4)}
+              </SpecCell>
+              <SpecCell align="right">{formatTflops(spec.fp8)}</SpecCell>
+              <SpecCell align="right">{formatTflops(spec.bf16)}</SpecCell>
+              <SpecCell align="left">{spec.scaleUpTech}</SpecCell>
+              <SpecCell align="right">{spec.scaleUpBandwidth}</SpecCell>
+              <SpecCell align="right">{spec.scaleUpWorldSize}</SpecCell>
+              <SpecCell align="right">{getScaleUpDomainMemory(spec)}</SpecCell>
+              <SpecCell align="right">{getScaleUpDomainMemoryBw(spec)}</SpecCell>
+              <SpecCell align="left">
+                <button
+                  type="button"
+                  className="cursor-pointer underline decoration-dotted underline-offset-2 transition-colors hover:text-foreground"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onScaleUpTopologyClick?.(spec.name);
+                    track('gpu_specs_scaleup_topology_cell_clicked', { gpu: spec.name });
+                  }}
+                >
+                  {formatScaleUpTopology(spec.scaleUpTopology, locale)}
+                </button>
+              </SpecCell>
+              <SpecCell
+                align="left"
+                className={spec.scaleUpSwitch === null ? 'text-muted-foreground' : ''}
+              >
+                {spec.scaleUpSwitch === null ? '—' : spec.scaleUpSwitch}
+              </SpecCell>
+              <SpecCell
+                align="right"
+                className={spec.scaleOutBandwidth === null ? 'text-muted-foreground' : ''}
+              >
+                {spec.scaleOutBandwidth === null ? (
+                  <>
+                    N/A<sup>2</sup>
+                  </>
+                ) : (
+                  spec.scaleOutBandwidth
+                )}
+              </SpecCell>
+              <SpecCell
+                align="left"
+                className={spec.scaleOutTech === null ? 'text-muted-foreground' : ''}
+              >
+                {spec.scaleOutTech === null ? (
+                  <>
+                    N/A<sup>2</sup>
+                  </>
+                ) : (
+                  spec.scaleOutTech
+                )}
+              </SpecCell>
+              <SpecCell
+                align="left"
+                className={spec.scaleOutSwitch === null ? 'text-muted-foreground' : ''}
+              >
+                {spec.scaleOutSwitch === null ? (
+                  <>
+                    N/A<sup>2</sup>
+                  </>
+                ) : (
+                  spec.scaleOutSwitch
+                )}
+              </SpecCell>
+              <SpecCell
+                align="left"
+                className={spec.scaleOutTopology === null ? 'text-muted-foreground' : ''}
+              >
+                {spec.scaleOutTopology === null ? (
+                  <>
+                    N/A<sup>2</sup>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    className="cursor-pointer underline decoration-dotted underline-offset-2 transition-colors hover:text-foreground"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onTopologyClick?.(spec.name);
+                      track('gpu_specs_topology_cell_clicked', { gpu: spec.name });
+                    }}
+                  >
+                    {formatScaleOutTopology(spec.scaleOutTopology, locale)}
+                  </button>
+                )}
+              </SpecCell>
+              <SpecCell align="left" className={spec.nic === null ? 'text-muted-foreground' : ''}>
+                {spec.nic === null ? (
+                  <>
+                    N/A<sup>2</sup>
+                  </>
+                ) : (
+                  spec.nic
+                )}
+              </SpecCell>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+export function GpuSpecsContent() {
+  const specsWithTopology = GPU_SPECS.filter((spec) => spec.scaleOutTopology !== null);
+  const locale = useLocale();
+  const t = STRINGS[locale];
+
+  const [viewMode, setViewMode] = useState<GpuSpecsViewMode>('table');
+  const [selectedMetric, setSelectedMetric] = useState(GPU_CHART_METRICS[0].key);
+
+  const viewModeOptions = useMemo<SegmentedToggleOption<GpuSpecsViewMode>[]>(
+    () => [
+      {
+        value: 'table',
+        label: t.viewTable,
+        icon: <Table2 className="size-3.5" />,
+        testId: 'gpu-specs-table-view-btn',
+      },
+      {
+        value: 'chart',
+        label: t.viewChart,
+        icon: <BarChart3 className="size-3.5" />,
+        testId: 'gpu-specs-chart-view-btn',
+      },
+      {
+        value: 'radar',
+        label: t.viewRadar,
+        icon: <Radar className="size-3.5" />,
+        testId: 'gpu-specs-radar-view-btn',
+      },
+    ],
+    [t],
+  );
+
+  const diagramRefs = useRef<Record<string, TopologyDiagramHandle | null>>({});
+  const scaleUpDiagramRefs = useRef<Record<string, ScaleUpTopologyDiagramHandle | null>>({});
+
+  const handleTopologyClick = (gpuName: string) => {
+    diagramRefs.current[gpuName]?.openDialog();
+  };
+
+  const handleScaleUpTopologyClick = (gpuName: string) => {
+    scaleUpDiagramRefs.current[gpuName]?.openDialog();
+  };
+
+  const handleViewModeChange = (value: GpuSpecsViewMode) => {
+    setViewMode(value);
+    track('gpu_specs_view_changed', { view: value });
+  };
+
+  return (
+    <div data-testid="gpu-specs-content" className="flex flex-col gap-4">
+      <section>
+        <Card>
+          <DashboardSectionHeader
+            title={t.heading}
+            description={t.description}
+            actions={<ChartShareActions />}
+          />
+        </Card>
+      </section>
+      <section>
+        <Card className="overflow-hidden">
+          <div className="flex flex-col gap-3 pb-4 sm:flex-row sm:items-center sm:justify-between">
+            <p className="min-w-0 text-xs text-muted-foreground">
+              {viewMode === 'table'
+                ? t.tableHint
+                : viewMode === 'chart'
+                  ? t.chartHint
+                  : t.radarHint}
+            </p>
+            <SegmentedToggle
+              value={viewMode}
+              options={viewModeOptions}
+              onValueChange={handleViewModeChange}
+              ariaLabel={t.viewMode}
+              testId="gpu-specs-view-toggle"
+            />
+          </div>
+
+          {viewMode === 'table' && (
+            <>
+              <GpuSpecsTable
+                onTopologyClick={handleTopologyClick}
+                onScaleUpTopologyClick={handleScaleUpTopologyClick}
+              />
+              <div className="pt-4">
+                <p className="text-xs text-muted-foreground">
+                  <sup>1</sup> {t.footnote1}
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  <sup>2</sup> {t.footnote2}
+                </p>
+              </div>
+            </>
+          )}
+          {viewMode === 'chart' && (
+            <GpuSpecsBarChart selectedMetric={selectedMetric} onMetricChange={setSelectedMetric} />
+          )}
+          {viewMode === 'radar' && <GpuSpecsRadarChart />}
+        </Card>
+      </section>
+      <section>
+        <Card>
+          <Heading as="h3" level="card" className="mb-2">
+            {t.scaleOutHeading}
+          </Heading>
+          <p className="text-muted-foreground text-sm mb-6">{t.scaleOutDescription}</p>
+          <div className="grid grid-cols-1 gap-6 md:grid-cols-2 xl:grid-cols-3">
+            {specsWithTopology.map((spec) => (
+              <Card
+                key={spec.name}
+                className="rounded-lg p-4 md:p-4"
+                data-testid={`topology-${spec.name.toLowerCase().replaceAll(/\s+/gu, '-')}`}
+              >
+                <TopologyDiagram
+                  ref={(el) => {
+                    diagramRefs.current[spec.name] = el;
+                  }}
+                  spec={spec}
+                  allSpecs={specsWithTopology}
+                />
+              </Card>
+            ))}
+          </div>
+        </Card>
+      </section>
+      <section>
+        <Card>
+          <Heading as="h3" level="card" className="mb-2">
+            {t.scaleUpHeading}
+          </Heading>
+          <p className="text-muted-foreground text-sm mb-6">{t.scaleUpDescription}</p>
+          <div className="grid grid-cols-1 gap-6 md:grid-cols-2 xl:grid-cols-3">
+            {GPU_SPECS.map((spec) => (
+              <Card
+                key={spec.name}
+                className="rounded-lg p-4 md:p-4"
+                data-testid={`scaleup-topology-${spec.name.toLowerCase().replaceAll(/\s+/gu, '-')}`}
+              >
+                <ScaleUpTopologyDiagram
+                  ref={(el) => {
+                    scaleUpDiagramRefs.current[spec.name] = el;
+                  }}
+                  spec={spec}
+                  allSpecs={GPU_SPECS}
+                />
+              </Card>
+            ))}
+          </div>
+        </Card>
+      </section>
+    </div>
+  );
+}

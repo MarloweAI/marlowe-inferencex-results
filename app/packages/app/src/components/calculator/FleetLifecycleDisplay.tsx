@@ -1,0 +1,617 @@
+'use client';
+
+import { TcoBasisToggle, useShowsTcoBasisSelector } from '@/components/ui/tco-basis-toggle';
+
+import { useCallback, useMemo, useState } from 'react';
+
+import FleetLifecycle from '@/components/calculator/FleetLifecycle';
+import {
+  resolveCalculatorTarget,
+  resolveCalculatorTargetInputValue,
+  resolveCalculatorVisibility,
+  type CalculatorVisibilityIntent,
+} from '@/components/calculator/ThroughputCalculatorDisplay';
+import { CalculatorUrlSeedBoundary } from '@/components/calculator/url-seed-boundary';
+import {
+  GlobalFilterProvider,
+  useGlobalFilterActions,
+  useGlobalFilterAvailability,
+  useGlobalFilterRun,
+  useGlobalFilterSelection,
+} from '@/providers/GlobalFilterContext';
+import { Card } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { ControlPanel } from '@/components/ui/control-panel';
+import { RangeField } from '@/components/ui/range-field';
+import { DashboardSectionHeader } from '@/components/ui/dashboard-section-header';
+import { EmptyState } from '@/components/ui/empty-state';
+import ChartLegendItem from '@/components/ui/chart-legend-item';
+import { ChartShareActions } from '@/components/ui/chart-display-helpers';
+import {
+  ModelSelector,
+  PercentileSelector,
+  PrecisionSelector,
+  ScenarioSelector,
+} from '@/components/ui/chart-selectors';
+import { Label } from '@/components/ui/label';
+import { LabelWithTooltip } from '@/components/ui/label-with-tooltip';
+import { MultiSelect } from '@/components/ui/multi-select';
+import { lockedCostProviderOptions, useLockedTierDialog } from '@/components/ui/tco-model-dialog';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Switch } from '@/components/ui/switch';
+import { TooltipProvider } from '@/components/ui/tooltip';
+import { useThemeColors } from '@/hooks/useThemeColors';
+import { useOpenDropdown } from '@/hooks/useOpenDropdown';
+import { useUrlState } from '@/hooks/useUrlState';
+import { track } from '@/lib/analytics/analytics';
+import { getModelSortIndex } from '@/lib/catalog/constants';
+import { Percentile, Sequence, type Model } from '@/lib/catalog/data-mappings';
+import { DEFAULT_FLEET_MW, readUrlParams, writeUrlParams } from '@/lib/routing/url-state';
+import { useFeatureGate } from '@/lib/runtime/use-feature-gate';
+import { useLocale } from '@/lib/i18n/use-locale';
+import { getDisplayLabel } from '@/lib/shared/utils';
+
+import type { CostProvider, CostType } from './types';
+import { useThroughputData } from './useThroughputData';
+
+const COST_PROVIDER_OPTIONS: {
+  value: CostProvider;
+  label: string;
+  labelZh: string;
+}[] = [
+  {
+    value: 'costh',
+    label: 'Owning at large hyperscaler volume',
+    labelZh: '自有 · 超大规模云厂商批量采购',
+  },
+  { value: 'costr', label: 'Rent – 3-year commit', labelZh: '租赁 - 3 年承诺' },
+];
+
+const COST_TYPE_OPTIONS: { value: CostType; label: string }[] = [
+  { value: 'total', label: 'Total tokens' },
+  { value: 'input', label: 'Input tokens' },
+  { value: 'output', label: 'Output tokens' },
+];
+
+const STRINGS = {
+  en: {
+    title: 'Fleet lifecycle',
+    description:
+      'Pick the model, workload, and target interactivity. The projection below sizes a fixed fleet of each chip against a facility power budget and reads the full run history at this operating point — see the section itself for what the lines mean.',
+    benchmarkGroup: 'Benchmark config',
+    chartGroup: 'Chart config',
+    costProviderLabel: 'Cost provider',
+    costProviderTooltip:
+      'The pricing tier used for the fleet cost line. Owning at large hyperscaler purchasing volume (e.g. AWS/GCP) or renting on a 3-year commit. Locked rental terms (on demand through 2 year commit) are published in the SemiAnalysis AI Cloud TCO Model.',
+    costProviderPlaceholder: 'Cost provider',
+    tokenTypeLabel: 'Token type',
+    tokenTypeTooltip:
+      'Whether the per-chip figures quoted in the table use total tokens, input tokens only, or output tokens only. Revenue always counts both streams.',
+    tokenTypePlaceholder: 'Token type',
+    targetLabel: 'Target interactivity (tok/s/user)',
+    targetTooltip:
+      'The interactivity operating point used for interpolation. Each chip\u2019s fleet serves this speed; every run date is read at it.',
+    targetAgenticLabel: (percentile: string) => `Target ${percentile} interactivity (tok/s/user)`,
+    targetAgenticTooltip: (percentile: string) =>
+      `The ${percentile} interactivity operating point used for agentic workload interpolation. Each chip\u2019s fleet serves this speed; every run date is read at it.`,
+    errorLoading: 'Error loading data. Please try a different selection.',
+    highContrast: 'High contrast',
+    resetFilter: 'Reset filter',
+  },
+  zh: {
+    title: '集群生命周期',
+    description:
+      '选择模型、工作负载和目标交互性。下方会根据设施功率预算，分别确定各款芯片的固定集群规模，并按目标交互性读取历次运行的数据。各条曲线的含义见下方说明。',
+    benchmarkGroup: '基准测试配置',
+    chartGroup: '图表配置',
+    costProviderLabel: '计价方式',
+    costProviderTooltip:
+      '集群成本线采用的定价层级。按超大规模云厂商的大批量采购价格自购（如 AWS/GCP）或 3 年承诺租赁。带锁的租赁期限（按需至 2 年承诺）收录于 SemiAnalysis AI Cloud TCO 模型。',
+    costProviderPlaceholder: '计价方式',
+    tokenTypeLabel: 'Token 类型',
+    tokenTypeTooltip:
+      '表格中每芯片指标按总 token、仅输入 token 还是仅输出 token 计。收入始终同时计入两类 token。',
+    tokenTypePlaceholder: 'Token 类型',
+    targetLabel: '目标交互性 (tok/s/user)',
+    targetTooltip:
+      '用于插值的交互性操作点。每款芯片的集群按此速度提供服务；每个运行日期都在该点读取。',
+    targetAgenticLabel: (percentile: string) => `目标 ${percentile} 交互性 (tok/s/user)`,
+    targetAgenticTooltip: (percentile: string) =>
+      `用于智能体工作负载插值的 ${percentile} 交互性操作点。每款芯片的集群按此速度提供服务；每个运行日期都在该点读取。`,
+    errorLoading: '加载数据出错，请尝试其他选择。',
+    highContrast: '高对比度',
+    resetFilter: '重置筛选',
+  },
+} as const;
+
+const COST_TYPE_LABELS_ZH: Record<CostType, string> = {
+  total: '总 Token',
+  input: '输入 Token',
+  output: '输出 Token',
+};
+
+export default function FleetLifecycleDisplay() {
+  return (
+    <CalculatorUrlSeedBoundary>
+      {(urlSeed) => (
+        <GlobalFilterProvider
+          initialModel={urlSeed.model}
+          initialSequence={urlSeed.sequence}
+          initialPrecisions={urlSeed.precisions}
+          initialRunDate={urlSeed.runDate}
+          initialRunId={urlSeed.runId}
+        >
+          <FleetLifecycleInner initialPercentile={urlSeed.percentile ?? Percentile.P90} />
+        </GlobalFilterProvider>
+      )}
+    </CalculatorUrlSeedBoundary>
+  );
+}
+
+function FleetLifecycleInner({ initialPercentile }: { initialPercentile: Percentile }) {
+  const locale = useLocale();
+  const t = STRINGS[locale];
+  const { setUrlParam } = useUrlState();
+  const { openDropdown, handleDropdownOpenChange } = useOpenDropdown();
+  const { interceptLocked: interceptLockedTier, dialog: tcoModelDialog } =
+    useLockedTierDialog('fleet_cost_provider');
+
+  const {
+    tcoBasis,
+    selectedModel,
+    effectiveSequence: selectedSequence,
+    effectivePrecisions: selectedPrecisions,
+  } = useGlobalFilterSelection();
+  const showsTcoBasis = useShowsTcoBasisSelector();
+  const { setSelectedModel, setSelectedSequence, setSelectedPrecisions } = useGlobalFilterActions();
+  const { selectedRunDate } = useGlobalFilterRun();
+  const { availablePrecisions, availableSequences, availableModels } =
+    useGlobalFilterAvailability();
+  const mode = 'interactivity_to_throughput' as const;
+  const [costProvider, setCostProvider] = useState<CostProvider>('costh');
+  const [costType, setCostType] = useState<CostType>('total');
+  const [requestedTargetValue, setRequestedTargetValue] = useState<number>(35);
+  const [inputValue, setInputValue] = useState<string>('35');
+  const [isTargetInputFocused, setIsTargetInputFocused] = useState(false);
+  const [selectedPercentile, setSelectedPercentile] = useState<Percentile>(initialPercentile);
+  const [mwInput, setMwInput] = useState<string>(() => readUrlParams().c_mw ?? DEFAULT_FLEET_MW);
+  const [visibilityIntent, setVisibilityIntent] = useState<CalculatorVisibilityIntent | null>(null);
+  const [highContrast, setHighContrast] = useState(false);
+
+  const { hardwareConfig, ranges, loading, error, hasData, availableHwKeys } = useThroughputData(
+    selectedModel,
+    selectedSequence,
+    selectedPrecisions,
+    selectedRunDate,
+    undefined,
+    selectedPercentile,
+    undefined,
+    true,
+    costType,
+    tcoBasis,
+  );
+
+  const isAgenticSequence = selectedSequence === Sequence.AgenticTraces;
+  const featureGateUnlocked = useFeatureGate();
+  const percentileLabel = selectedPercentile.toUpperCase();
+
+  const handleMwInputChange = useCallback((raw: string) => {
+    setMwInput(raw);
+    const parsed = parseFloat(raw);
+    writeUrlParams({ c_mw: Number.isFinite(parsed) && parsed > 0 ? raw : '' });
+  }, []);
+
+  const selectionKey = `${selectedModel}|${selectedSequence}|${[...selectedPrecisions]
+    .toSorted()
+    .join(',')}|${selectedRunDate}|${[...availableHwKeys].toSorted().join(',')}`;
+
+  const visibleHwKeys = useMemo(
+    () => resolveCalculatorVisibility(visibilityIntent, selectionKey, availableHwKeys),
+    [visibilityIntent, selectionKey, availableHwKeys],
+  );
+  const visibleKeysArray = useMemo(() => [...visibleHwKeys], [visibleHwKeys]);
+  const { resolveColor } = useThemeColors({
+    highContrast,
+    activeKeys: visibleKeysArray,
+  });
+
+  const targetValue = useMemo(
+    () => resolveCalculatorTarget(requestedTargetValue, hasData, ranges.interactivity),
+    [hasData, ranges.interactivity, requestedTargetValue],
+  );
+  const currentRange = ranges.interactivity;
+
+  const handleSliderChange = useCallback((value: number) => {
+    setRequestedTargetValue(value);
+    setInputValue(String(value));
+  }, []);
+
+  const handleInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    setInputValue(e.target.value);
+    const parsed = parseFloat(e.target.value);
+    if (!isNaN(parsed) && parsed >= 0) {
+      setRequestedTargetValue(parsed);
+    }
+  }, []);
+
+  const handleInputFocus = useCallback(() => {
+    setInputValue(String(targetValue));
+    setIsTargetInputFocused(true);
+  }, [targetValue]);
+
+  const handleInputBlur = useCallback(() => {
+    const parsed = parseFloat(inputValue);
+    if (isNaN(parsed) || parsed < 0) {
+      setInputValue(String(targetValue));
+    } else {
+      const { min, max } = ranges.interactivity;
+      const clamped = Math.max(min, Math.min(max, parsed));
+      setRequestedTargetValue(clamped);
+      setInputValue(String(clamped));
+    }
+    setIsTargetInputFocused(false);
+    track('fleet_target_set', { mode, value: targetValue });
+  }, [inputValue, targetValue, mode, ranges.interactivity]);
+
+  const handleModelChange = useCallback(
+    (value: string) => {
+      setVisibilityIntent(null);
+      setSelectedModel(value as Model);
+      track('fleet_model_selected', { model: value });
+    },
+    [setSelectedModel],
+  );
+
+  const handleSequenceChange = useCallback(
+    (value: string) => {
+      setVisibilityIntent(null);
+      setSelectedSequence(value as Sequence);
+      track('fleet_sequence_selected', { sequence: value });
+    },
+    [setSelectedSequence],
+  );
+
+  const handlePrecisionChange = useCallback(
+    (value: string[]) => {
+      setVisibilityIntent(null);
+      setSelectedPrecisions(value);
+      track('fleet_precision_selected', { precision: value.join(',') });
+    },
+    [setSelectedPrecisions],
+  );
+
+  const handlePercentileChange = useCallback(
+    (value: Percentile) => {
+      setSelectedPercentile(value);
+      setUrlParam('i_pctl', value);
+      track('fleet_percentile_selected', { percentile: value });
+    },
+    [setUrlParam],
+  );
+
+  const toggleGpuVisibility = useCallback(
+    (hwKey: string) => {
+      const visibleLegendKeys = availableHwKeys.filter((key) => visibleHwKeys.has(key));
+      const allVisible = visibleLegendKeys.length === availableHwKeys.length;
+      const isVisible = visibleHwKeys.has(hwKey);
+      let next: Set<string>;
+      if (isVisible && allVisible) {
+        next = new Set([hwKey]);
+      } else if (isVisible && visibleLegendKeys.length === 1) {
+        next = new Set(availableHwKeys);
+      } else {
+        next = new Set(visibleHwKeys);
+        if (isVisible) next.delete(hwKey);
+        else next.add(hwKey);
+      }
+      setVisibilityIntent({
+        scopeKey: selectionKey,
+        visible: next,
+        known: new Set(availableHwKeys),
+      });
+      track('fleet_gpu_toggled', { gpu: hwKey });
+    },
+    [availableHwKeys, visibleHwKeys, selectionKey],
+  );
+
+  const handleResetGpus = useCallback(() => {
+    setVisibilityIntent({
+      scopeKey: selectionKey,
+      visible: new Set(availableHwKeys),
+      known: new Set(availableHwKeys),
+    });
+    track('fleet_gpu_reset', { gpu_count: availableHwKeys.length });
+  }, [availableHwKeys, selectionKey]);
+
+  const legendItems = useMemo(
+    () =>
+      Object.entries(hardwareConfig)
+        .filter(([key]) => availableHwKeys.includes(key))
+        .toSorted(([a], [b]) => getModelSortIndex(a) - getModelSortIndex(b) || a.localeCompare(b))
+        .map(([key, config]) => ({
+          name: config.name,
+          label: getDisplayLabel(config),
+          color: resolveColor(key),
+          lineDasharray: 'none',
+          title: config.gpu,
+          hw: key,
+          isActive: visibleHwKeys.has(key),
+          onClick: () => toggleGpuVisibility(key),
+        })),
+    [hardwareConfig, availableHwKeys, visibleHwKeys, resolveColor, toggleGpuVisibility],
+  );
+
+  const costTypeLabels: Record<CostType, string> = useMemo(
+    () =>
+      locale === 'zh'
+        ? COST_TYPE_LABELS_ZH
+        : { total: 'Total tokens', input: 'Input tokens', output: 'Output tokens' },
+    [locale],
+  );
+
+  if (!loading && error) {
+    console.error(error);
+    return <EmptyState className="h-64">{t.errorLoading}</EmptyState>;
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <section data-testid="fleet-controls">
+        <Card className="relative z-30">
+          <div className="flex flex-col gap-4">
+            <DashboardSectionHeader
+              title={t.title}
+              description={t.description}
+              actions={<ChartShareActions />}
+            />
+
+            <TooltipProvider delayDuration={0}>
+              <ControlPanel
+                legend={t.benchmarkGroup}
+                data-testid="fleet-benchmark-panel"
+                className={`grid-cols-1 md:grid-cols-2 ${
+                  isAgenticSequence && featureGateUnlocked ? 'lg:grid-cols-5' : 'lg:grid-cols-4'
+                }`}
+              >
+                <div className="min-w-0 md:col-span-2">
+                  <ModelSelector
+                    id="fleet-model"
+                    data-testid="fleet-model-selector"
+                    value={selectedModel}
+                    onChange={handleModelChange}
+                    open={openDropdown === 'model'}
+                    onOpenChange={handleDropdownOpenChange('model')}
+                    availableModels={availableModels}
+                  />
+                </div>
+                <ScenarioSelector
+                  id="fleet-sequence"
+                  data-testid="fleet-sequence-selector"
+                  value={selectedSequence}
+                  onChange={handleSequenceChange}
+                  open={openDropdown === 'sequence'}
+                  onOpenChange={handleDropdownOpenChange('sequence')}
+                  availableSequences={availableSequences}
+                  model={selectedModel}
+                />
+                {isAgenticSequence && featureGateUnlocked && (
+                  <PercentileSelector
+                    id="fleet-percentile"
+                    data-testid="fleet-percentile-selector"
+                    value={selectedPercentile}
+                    onChange={handlePercentileChange}
+                  />
+                )}
+                <PrecisionSelector
+                  id="fleet-precision"
+                  data-testid="fleet-precision-selector"
+                  value={selectedPrecisions}
+                  onChange={handlePrecisionChange}
+                  open={openDropdown === 'precision'}
+                  onOpenChange={handleDropdownOpenChange('precision')}
+                  availablePrecisions={availablePrecisions}
+                />
+              </ControlPanel>
+              <ControlPanel
+                legend={t.chartGroup}
+                data-testid="fleet-chart-panel"
+                className="grid-cols-1 md:grid-cols-2 xl:grid-cols-4"
+              >
+                <div className="flex min-w-0 flex-col space-y-1.5">
+                  <LabelWithTooltip
+                    htmlFor="fleet-cost"
+                    label={t.costProviderLabel}
+                    tooltip={t.costProviderTooltip}
+                  />
+                  <div data-testid="fleet-cost-selector">
+                    <MultiSelect
+                      triggerId="fleet-cost"
+                      options={[
+                        ...COST_PROVIDER_OPTIONS.map((provider) => ({
+                          value: provider.value,
+                          label: locale === 'zh' ? provider.labelZh : provider.label,
+                        })),
+                        ...lockedCostProviderOptions(locale),
+                      ]}
+                      value={[costProvider]}
+                      onChange={(values) => {
+                        const next = values[0];
+                        if (!next) return;
+                        if (interceptLockedTier(next)) return;
+                        setCostProvider(next as CostProvider);
+                        track('fleet_cost_provider_changed', { provider: next });
+                      }}
+                      open={openDropdown === 'costProvider'}
+                      onOpenChange={handleDropdownOpenChange('costProvider')}
+                      placeholder={t.costProviderPlaceholder}
+                      minSelections={1}
+                      maxSelections={1}
+                      showClearAll={false}
+                      searchable={false}
+                      plainSelectedText
+                      showSelectionSummary={false}
+                    />
+                  </div>
+                </div>
+
+                <div className="flex min-w-0 flex-col space-y-1.5">
+                  <LabelWithTooltip
+                    htmlFor="fleet-cost-type"
+                    label={t.tokenTypeLabel}
+                    tooltip={t.tokenTypeTooltip}
+                  />
+                  <div data-testid="fleet-cost-type-selector">
+                    <MultiSelect
+                      triggerId="fleet-cost-type"
+                      options={COST_TYPE_OPTIONS.map((ct) => ({
+                        value: ct.value,
+                        label: costTypeLabels[ct.value],
+                      }))}
+                      value={[costType]}
+                      onChange={(values) => {
+                        const next = values[0];
+                        if (!next) return;
+                        setCostType(next as CostType);
+                        track('fleet_cost_type_changed', { cost_type: next });
+                      }}
+                      open={openDropdown === 'costType'}
+                      onOpenChange={handleDropdownOpenChange('costType')}
+                      placeholder={t.tokenTypePlaceholder}
+                      minSelections={1}
+                      maxSelections={1}
+                      showClearAll={false}
+                      searchable={false}
+                      plainSelectedText
+                      showSelectionSummary={false}
+                    />
+                  </div>
+                </div>
+                {showsTcoBasis && (
+                  <div className="flex min-w-0 max-w-48 flex-col space-y-1.5">
+                    <LabelWithTooltip
+                      label={locale === 'zh' ? 'TCO 口径' : 'TCO basis'}
+                      tooltip={
+                        locale === 'zh'
+                          ? '外部客户价格或内部持有成本；目前仅影响 TPUv7。'
+                          : 'External customer pricing or internal owner cost; currently affects only TPUv7.'
+                      }
+                    />
+                    <TcoBasisToggle source="fleet" className="md:h-9" />
+                  </div>
+                )}
+
+                {!loading && hasData && (
+                  <div
+                    className={`space-y-1.5 md:col-span-2 ${showsTcoBasis ? 'xl:col-span-1' : ''}`}
+                  >
+                    <LabelWithTooltip
+                      htmlFor="fleet-target"
+                      label={
+                        isAgenticSequence ? t.targetAgenticLabel(percentileLabel) : t.targetLabel
+                      }
+                      tooltip={
+                        isAgenticSequence
+                          ? t.targetAgenticTooltip(percentileLabel)
+                          : t.targetTooltip
+                      }
+                    />
+                    <RangeField
+                      label={
+                        isAgenticSequence ? t.targetAgenticLabel(percentileLabel) : t.targetLabel
+                      }
+                      min={currentRange.min}
+                      max={currentRange.max}
+                      value={targetValue}
+                      onSliderChange={handleSliderChange}
+                      onSliderCommit={() =>
+                        track('fleet_target_slider_set', { mode, value: targetValue })
+                      }
+                      input={{
+                        id: 'fleet-target',
+                        value: resolveCalculatorTargetInputValue(
+                          inputValue,
+                          targetValue,
+                          isTargetInputFocused,
+                        ),
+                        onFocus: handleInputFocus,
+                        onChange: handleInputChange,
+                        onBlur: handleInputBlur,
+                      }}
+                    />
+                  </div>
+                )}
+              </ControlPanel>
+            </TooltipProvider>
+
+            {!loading && legendItems.length > 0 && (
+              <div
+                data-testid="fleet-legend"
+                className="flex flex-wrap items-center gap-x-6 gap-y-2 border-t border-border/30 pt-3"
+              >
+                <ul className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                  {legendItems.map((item) => (
+                    <ChartLegendItem key={item.hw} {...item} sidebarMode />
+                  ))}
+                </ul>
+                {visibleHwKeys.size < availableHwKeys.length && (
+                  <Button
+                    type="button"
+                    variant="link"
+                    size="sm"
+                    data-testid="fleet-reset-filter"
+                    onClick={handleResetGpus}
+                    className="text-muted-foreground hover:text-foreground"
+                  >
+                    {t.resetFilter}
+                  </Button>
+                )}
+                <div className="flex items-center gap-2">
+                  <Switch
+                    id="fleet-high-contrast"
+                    data-testid="fleet-high-contrast"
+                    checked={highContrast}
+                    onCheckedChange={(checked: boolean) => {
+                      setHighContrast(checked);
+                      track('fleet_high_contrast_toggled', { enabled: checked });
+                    }}
+                  />
+                  <Label
+                    htmlFor="fleet-high-contrast"
+                    className="text-xs text-muted-foreground hover:text-foreground cursor-pointer"
+                  >
+                    {t.highContrast}
+                  </Label>
+                </div>
+              </div>
+            )}
+          </div>
+        </Card>
+      </section>
+
+      {loading && (
+        <Card>
+          <Skeleton className="h-64 w-full" />
+        </Card>
+      )}
+
+      {!loading && hasData && (
+        <FleetLifecycle
+          hardwareConfig={hardwareConfig}
+          costProvider={costProvider}
+          costType={costType}
+          targetValue={targetValue}
+          mode={mode}
+          visibleHwKeys={visibleHwKeys}
+          selectedModel={selectedModel}
+          selectedSequence={selectedSequence}
+          selectedPrecisions={selectedPrecisions}
+          selectedPercentile={selectedPercentile}
+          mwInput={mwInput}
+          onMwInputChange={handleMwInputChange}
+          colorResolver={resolveColor}
+        />
+      )}
+      {tcoModelDialog}
+    </div>
+  );
+}

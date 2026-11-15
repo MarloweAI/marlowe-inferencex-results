@@ -1,0 +1,19 @@
+import type { ReactNode } from 'react';
+
+export default function ChartNotices({
+  chartId,
+  notices,
+}: {
+  chartId: string;
+  notices?: ReactNode;
+}) {
+  if (!notices) return null;
+  return (
+    <div
+      className="no-export mt-3 space-y-2 border-t border-border/30 pt-3"
+      data-testid={`chart-notices-${chartId}`}
+    >
+      {notices}
+    </div>
+  );
+}

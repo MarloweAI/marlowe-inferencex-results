@@ -1,0 +1,708 @@
+import { AIR_COOLED_SYSTEM_PUE, LIQUID_COOLED_RACK_PUE } from '@/lib/power/facility-pue';
+
+import { metricOptionTitle, type MetricKey } from './metric-registry';
+
+export interface LocalizedText {
+  en: string;
+  zh: string;
+}
+
+export interface MetricExplanation {
+  description: LocalizedText;
+  formula: LocalizedText;
+}
+
+type CostBasis = 'h' | 'r';
+type TokenType = 'total' | 'output' | 'input';
+
+const COST_BASIS_EN: Record<CostBasis, string> = {
+  h: 'all-in hourly ownership cost at large hyperscaler purchasing volume',
+  r: 'all-in hourly rental cost on a 3-year commit',
+};
+
+const COST_BASIS_ZH: Record<CostBasis, string> = {
+  h: '按超大规模云厂商大批量采购价自有硬件的每小时全包成本',
+  r: '3 年承诺期租赁的每小时全包成本',
+};
+
+const TOKEN_TYPE_EN: Record<TokenType, string> = {
+  total: 'total tokens (input + output)',
+  output: 'output tokens',
+  input: 'input tokens',
+};
+
+const TOKEN_TYPE_ZH: Record<TokenType, string> = {
+  total: '总 token（输入 + 输出）',
+  output: '输出 token',
+  input: '输入 token',
+};
+
+const TOKEN_RATE_EN: Record<TokenType, string> = {
+  total: 'total tok/s/chip',
+  output: 'output tok/s/chip',
+  input: 'input tok/s/chip',
+};
+
+const TOKEN_RATE_ZH: Record<TokenType, string> = {
+  total: '总 tok/s/chip',
+  output: '输出 tok/s/chip',
+  input: '输入 tok/s/chip',
+};
+
+function throughputPerChip(tokenType: TokenType): MetricExplanation {
+  return {
+    description: {
+      en:
+        `Rate of ${TOKEN_TYPE_EN[tokenType]} the serving replica handles each second, divided ` +
+        'across every chip serving it. Normalizing per chip keeps different parallelism setups ' +
+        'and replica sizes comparable.',
+      zh:
+        `服务副本每秒处理的${TOKEN_TYPE_ZH[tokenType]}速率，平均到服务该副本的每一块芯片上。` +
+        '按芯片归一化后，不同并行配置和副本规模之间可以直接比较。',
+    },
+    formula: {
+      en: `tok/s/chip = ${TOKEN_TYPE_EN[tokenType]} per second ÷ number of chips serving the replica`,
+      zh: `tok/s/chip = 每秒${TOKEN_TYPE_ZH[tokenType]}数 ÷ 服务该副本的芯片数`,
+    },
+  };
+}
+
+function throughputPerMw(tokenType: TokenType): MetricExplanation {
+  return {
+    description: {
+      en:
+        `Rate of ${TOKEN_TYPE_EN[tokenType]} produced per megawatt of all-in utility power ` +
+        'provisioned for the hardware — the full data-center power budget attributed to the ' +
+        'chips, not just their own draw. It answers how much output a fixed power budget buys.',
+      zh:
+        `按硬件全电源配置（all-in utility）功率归一化的${TOKEN_TYPE_ZH[tokenType]}速率——` +
+        '即分摊到芯片上的整个数据中心电力预算，而不仅是芯片自身功耗。' +
+        '它回答的是固定电力预算能换来多少产出。',
+    },
+    formula: {
+      en: `tok/s/MW = ${TOKEN_RATE_EN[tokenType]} ÷ all-in utility MW provisioned per chip`,
+      zh: `tok/s/MW = ${TOKEN_RATE_ZH[tokenType]} ÷ 每芯片全电源配置功率（MW）`,
+    },
+  };
+}
+
+function tokenRevenuePerGpuHour(): MetricExplanation {
+  return {
+    description: {
+      en:
+        'Gross token revenue a GPU could earn per hour at this operating point. The normalized ' +
+        'source prices uncached input and output at $1 per million and cached input at $0.10 per ' +
+        'million. The OpenRouter source uses the selected model’s current public prices, with a ' +
+        '10%-of-input fallback when no cache-read price is published. Revenue prices uncached ' +
+        'input, cached input, and output separately. Input share comes from compatible measured ' +
+        'input/output throughput. When disaggregated rates use different GPU denominators, fixed ' +
+        'sequences use ISL:OSL and Agentic traces use measured prompt/generation tokens. Agentic ' +
+        'cache hit combines GPU and external cache when external cache is reported, otherwise GPU ' +
+        'and CPU cache. Historical Trends interpolates total throughput, input share, and cache ' +
+        'hit separately before pricing. A partially measured cache frontier receives no cache ' +
+        'discount. This turns the ' +
+        'throughput/interactivity tradeoff into a business-facing SLA curve.',
+      zh:
+        '表示该运行点下每块 GPU 每小时可获得的 token 毛收入。标准化模式下，未缓存输入和输出均按每百万 1 美元计价，' +
+        '缓存输入按每百万 0.10 美元计价。OpenRouter 模式采用所选模型当前公开的价格；未提供缓存读取价格时，按输入价格的 10% 计算。' +
+        '未缓存输入、缓存输入与输出分别计价。输入 token 占比优先采用口径一致的实测输入/输出吞吐量。分离式部署中预填充与解码的速率使用不同 GPU 分母时，' +
+        '固定序列采用 ISL:OSL，Agentic trace 采用实测 prompt/generation token 构成。已报告 external cache 时，Agentic 缓存命中率由 GPU 与 external cache 相加；' +
+        '否则由 GPU 与 CPU cache 相加。Historical Trends 会在计价前分别插值总吞吐量、输入 token 占比和缓存命中率。' +
+        '缓存指标仅覆盖部分 frontier 数据点时，不应用缓存折扣。该指标把吞吐量与交互性的权衡转换为面向业务的 SLA 曲线。',
+    },
+    formula: {
+      en: '$/GPU/hr = (uncached input × input price + cached input × cache-read price + output × output price) per GPU-second, scaled to one hour',
+      zh: '$/GPU/hr = 每 GPU 秒的（未缓存输入 × 输入价格 + 缓存输入 × 缓存读取价格 + 输出 × 输出价格），再换算为一小时',
+    },
+  };
+}
+
+function costPerMillion(basis: CostBasis, tokenType: TokenType): MetricExplanation {
+  return {
+    description: {
+      en:
+        `Estimated infrastructure cost of producing one million ${TOKEN_TYPE_EN[tokenType]} at ` +
+        `this operating point, priced with the ${COST_BASIS_EN[basis]}. Lower is cheaper.`,
+      zh:
+        `在该运行点生产一百万${TOKEN_TYPE_ZH[tokenType]}的基础设施成本估算，` +
+        `按${COST_BASIS_ZH[basis]}计价。数值越低越便宜。`,
+    },
+    formula: {
+      en: `$/Mtok = all-in cost per chip-hour ($) × 1,000,000 ÷ (3,600 × ${TOKEN_RATE_EN[tokenType]})`,
+      zh: `$/Mtok = 每芯片小时全包成本（$）× 1,000,000 ÷（3,600 × ${TOKEN_RATE_ZH[tokenType]}）`,
+    },
+  };
+}
+
+function tokensPerDollar(basis: CostBasis, tokenType: TokenType): MetricExplanation {
+  return {
+    description: {
+      en:
+        `How many ${TOKEN_TYPE_EN[tokenType]} one US dollar of infrastructure spend buys, ` +
+        `priced with the ${COST_BASIS_EN[basis]}. It is the reciprocal of cost per token, so ` +
+        'higher means cheaper.',
+      zh:
+        `1 美元基础设施开支能换来多少${TOKEN_TYPE_ZH[tokenType]}，` +
+        `按${COST_BASIS_ZH[basis]}计价。它是单 token 成本的倒数，数值越高越便宜。`,
+    },
+    formula: {
+      en: `tok/$ = (${TOKEN_RATE_EN[tokenType]} × 3,600) ÷ all-in cost per chip-hour ($)`,
+      zh: `tok/$ =（${TOKEN_RATE_ZH[tokenType]} × 3,600）÷ 每芯片小时全包成本（$）`,
+    },
+  };
+}
+
+function provisionedJoules(tokenType: TokenType): MetricExplanation {
+  return {
+    description: {
+      en:
+        `Electrical energy attributed to each of the ${TOKEN_TYPE_EN[tokenType]}, assuming the ` +
+        'full all-in utility power provisioned for the hardware is drawn. It is a provisioned ' +
+        'upper bound, not a telemetry measurement.',
+      zh:
+        `平均到每个${TOKEN_TYPE_ZH[tokenType]}上的电能，假设硬件按全电源配置功率满额用电。` +
+        '这是按配置功率计算的上限值，不是遥测实测值。',
+    },
+    formula: {
+      en: `J/tok = all-in utility power per chip (W) ÷ ${TOKEN_RATE_EN[tokenType]}`,
+      zh: `J/tok = 每芯片全电源配置功率（W）÷ ${TOKEN_RATE_ZH[tokenType]}`,
+    },
+  };
+}
+
+const MEASURED_TIER_NOTE_EN =
+  ' Validated points passed the current PowerX telemetry checks. Historical points are real ' +
+  "older measurements but lack the information needed to confirm today's method. Filter either " +
+  'status under Quick Filters → Measured Power.';
+const MEASURED_TIER_NOTE_ZH =
+  '已验证数据点通过了当前 PowerX 遥测检查。历史数据点来自真实的旧版测量，但缺少按当前方法完成验证所需的信息。' +
+  '可在快捷筛选的“实测功耗”中按测量状态筛选。';
+
+type MeasuredPhase = 'run' | 'prefill' | 'decode';
+
+const MEASURED_PHASE_EN: Record<MeasuredPhase, string> = {
+  run: 'the whole benchmark run',
+  prefill: 'the prefill phase (prompt processing)',
+  decode: 'the decode phase (token generation)',
+};
+
+const MEASURED_PHASE_ZH: Record<MeasuredPhase, string> = {
+  run: '整个基准测试运行期间',
+  prefill: 'prefill 阶段（处理提示词）',
+  decode: 'decode 阶段（生成 token）',
+};
+
+function measuredPower(phase: MeasuredPhase): MetricExplanation {
+  return {
+    description: {
+      en:
+        `Average per-chip accelerator power actually drawn during ${MEASURED_PHASE_EN[phase]}, ` +
+        `read from runner telemetry. Unlike the all-in provisioned metrics, this reflects real ` +
+        `measured draw, not the provisioned budget.${MEASURED_TIER_NOTE_EN}`,
+      zh:
+        `${MEASURED_PHASE_ZH[phase]}每块加速器芯片的实际平均功耗，来自运行器遥测数据。` +
+        `与全电源配置类指标不同，它反映的是真实实测功耗，而不是按配置计算的预算值。${
+          MEASURED_TIER_NOTE_ZH
+        }`,
+    },
+    formula: {
+      en: `W = mean of sampled per-chip accelerator power draw over ${MEASURED_PHASE_EN[phase]}`,
+      zh: `W = ${MEASURED_PHASE_ZH[phase]}每芯片加速器功耗采样值的平均`,
+    },
+  };
+}
+
+/** Why PowerX charges energy to every token: aggregated serving cannot split it by phase. */
+const PHASE_NOTE_EN: Record<TokenType, string> = {
+  total:
+    ' This is the PowerX default: aggregated serving runs prefill and decode on the same GPUs, so their energy cannot be split by phase and every token carries its share.',
+  output:
+    ' On aggregated serving the same GPUs run prefill and decode, so this also charges prompt processing to output tokens. On disaggregated runs, the Decode GPUs scope isolates decode energy.',
+  input: '',
+};
+
+const PHASE_NOTE_ZH: Record<TokenType, string> = {
+  total:
+    '这是 PowerX 的默认能耗指标：聚合式部署中预填充与解码共用同一批 GPU，能耗无法按阶段拆分，因此由全部 token 分摊。',
+  output:
+    '聚合式部署中预填充与解码共用同一批 GPU，因此这一指标也会把提示词处理的能耗计入输出 token。分离式部署可选择“解码 GPU”范围，单独查看解码能耗。',
+  input: '',
+};
+
+function measuredJoulesPerToken(tokenType: TokenType): MetricExplanation {
+  return {
+    description: {
+      en:
+        `Measured accelerator energy consumed per ${
+          tokenType === 'total' ? 'token (including prompt tokens)' : `${tokenType} token`
+        }, from runner power telemetry integrated over the run. Lower means the system converts ` +
+        `electricity into tokens more efficiently.${PHASE_NOTE_EN[tokenType]}${MEASURED_TIER_NOTE_EN}`,
+      zh:
+        `每个${TOKEN_TYPE_ZH[tokenType]}消耗的加速器实测能耗，由运行器功耗遥测在整个运行期间积分得到。` +
+        `数值越低，说明系统把电能转化为 token 的效率越高。${PHASE_NOTE_ZH[tokenType]}${MEASURED_TIER_NOTE_ZH}`,
+    },
+    formula: {
+      en: `J/tok = measured accelerator energy over the run ÷ ${TOKEN_TYPE_EN[tokenType]} processed`,
+      zh: `J/tok = 运行期间加速器实测能耗 ÷ 处理的${TOKEN_TYPE_ZH[tokenType]}数`,
+    },
+  };
+}
+
+const MEASURED_ROLE_EN: Record<'prefill' | 'decode', { tokens: string; isolates: string }> = {
+  prefill: { tokens: 'input (prompt)', isolates: 'prompt-processing' },
+  decode: { tokens: 'output', isolates: 'token-generation' },
+};
+
+const MEASURED_ROLE_ZH: Record<'prefill' | 'decode', { tokens: string; isolates: string }> = {
+  prefill: { tokens: '输入', isolates: '提示词处理' },
+  decode: { tokens: '输出', isolates: 'token 生成' },
+};
+
+function measuredRoleJoulesPerToken(role: 'prefill' | 'decode'): MetricExplanation {
+  return {
+    description: {
+      en:
+        `Measured accelerator energy consumed by the ${role} workers per ` +
+        `${MEASURED_ROLE_EN[role].tokens} token, from runner power telemetry integrated over ` +
+        `the run. Unlike the whole-deployment J/tok metrics, only that role's energy is ` +
+        `charged, so it isolates ${MEASURED_ROLE_EN[role].isolates} efficiency in ` +
+        `disaggregated deployments.${MEASURED_TIER_NOTE_EN}`,
+      zh:
+        `每个${MEASURED_ROLE_ZH[role].tokens} token 由 ${MEASURED_PHASE_ZH[role]}工作进程消耗的` +
+        `加速器实测能耗，由运行器功耗遥测在整个运行期间积分得到。与全部署 J/tok 指标不同，` +
+        `它只计入该角色的能耗，因此可以在分离式部署中单独衡量${
+          MEASURED_ROLE_ZH[role].isolates
+        }效率。${MEASURED_TIER_NOTE_ZH}`,
+    },
+    formula: {
+      en:
+        `J/tok = measured ${role}-worker energy over the run ÷ ` +
+        `${role === 'prefill' ? 'input' : 'output'} tokens processed`,
+      zh: `J/tok = 运行期间 ${role} 工作进程实测能耗 ÷ 处理的${MEASURED_ROLE_ZH[role].tokens} token 数`,
+    },
+  };
+}
+
+export const METRIC_EXPLANATIONS: Record<MetricKey, MetricExplanation> = {
+  tpPerGpu: throughputPerChip('total'),
+  inputTputPerGpu: throughputPerChip('input'),
+  outputTputPerGpu: throughputPerChip('output'),
+  tokenRevenuePerGpuHour: tokenRevenuePerGpuHour(),
+  tpPerMw: throughputPerMw('total'),
+  inputTputPerMw: throughputPerMw('input'),
+  outputTputPerMw: throughputPerMw('output'),
+  costh: costPerMillion('h', 'total'),
+  costr: costPerMillion('r', 'total'),
+  costhOutput: costPerMillion('h', 'output'),
+  costrOutput: costPerMillion('r', 'output'),
+  costhi: costPerMillion('h', 'input'),
+  costri: costPerMillion('r', 'input'),
+  tokensPerDollarH: tokensPerDollar('h', 'total'),
+  tokensPerDollarR: tokensPerDollar('r', 'total'),
+  outputTokensPerDollarH: tokensPerDollar('h', 'output'),
+  outputTokensPerDollarR: tokensPerDollar('r', 'output'),
+  inputTokensPerDollarH: tokensPerDollar('h', 'input'),
+  inputTokensPerDollarR: tokensPerDollar('r', 'input'),
+  costUser: {
+    description: {
+      en:
+        'Estimated infrastructure cost of producing one million total tokens, priced with the ' +
+        'hourly cost you entered in the custom-values panel instead of a modeled cost basis.',
+      zh:
+        '生产一百万总 token 的基础设施成本估算，按你在自定义值面板中输入的每小时成本计价，' +
+        '而不是按内置成本模型计价。',
+    },
+    formula: {
+      en: '$/Mtok = user-entered cost per chip-hour ($) × 1,000,000 ÷ (3,600 × total tok/s/chip)',
+      zh: '$/Mtok = 自定义每芯片小时成本（$）× 1,000,000 ÷（3,600 × 总 tok/s/chip）',
+    },
+  },
+  tokensPerDollarUser: {
+    description: {
+      en:
+        'How many total tokens one US dollar buys, priced with the hourly cost you entered in ' +
+        'the custom-values panel. Higher means cheaper under your own cost assumptions.',
+      zh:
+        '1 美元能换来多少总 token，按你在自定义值面板中输入的每小时成本计价。' +
+        '在你自己的成本假设下，数值越高越便宜。',
+    },
+    formula: {
+      en: 'tok/$ = (total tok/s/chip × 3,600) ÷ user-entered cost per chip-hour ($)',
+      zh: 'tok/$ =（总 tok/s/chip × 3,600）÷ 自定义每芯片小时成本（$）',
+    },
+  },
+  powerUser: {
+    description: {
+      en:
+        'Total token throughput normalized by the all-in utility power you entered in the ' +
+        'custom-values panel, instead of the modeled per-chip power budget.',
+      zh: '按你在自定义值面板中输入的全电源配置功率归一化的总 token 吞吐量，而不是按内置的每芯片电力预算。',
+    },
+    formula: {
+      en: 'tok/s/MW = total tok/s/chip ÷ user-entered all-in utility MW per chip',
+      zh: 'tok/s/MW = 总 tok/s/chip ÷ 自定义每芯片全电源配置功率（MW）',
+    },
+  },
+  jTotal: provisionedJoules('total'),
+  jOutput: provisionedJoules('output'),
+  jInput: provisionedJoules('input'),
+  measuredAvgPower: measuredPower('run'),
+  measuredP75Power: {
+    description: {
+      en: 'Power stayed at or below this level for 75% of the validated load window. Device telemetry is aligned in time and summed before taking the time-weighted percentile, then divided by the GPU count. This describes fleet draw per chip, not the P75 of an individual GPU; runs without this measurement stay unavailable.',
+      zh: '在通过验证的负载测量窗口内，75% 的时间里功耗不超过此值。各 GPU 遥测按时间对齐后求和，再计算按时间加权的 P75，最后除以 GPU 数量。该指标表示整组 GPU 功耗按芯片均摊后的水平，不是单个 GPU 的 P75；缺少此测量值的运行不显示该指标。',
+    },
+    formula: {
+      en: 'P75 fleet W/chip = time-weighted P75(sum of GPU watts) ÷ GPU count',
+      zh: '整组 GPU P75 功耗（W/芯片）= 各 GPU 功耗之和的时间加权 P75 ÷ GPU 数量',
+    },
+  },
+  measuredP90Power: {
+    description: {
+      en: 'Power stayed at or below this level for 90% of the validated load window. Device telemetry is aligned in time and summed before taking the time-weighted percentile, then divided by the GPU count. This describes fleet draw per chip, not the P90 of an individual GPU; runs without this measurement stay unavailable.',
+      zh: '在通过验证的负载测量窗口内，90% 的时间里功耗不超过此值。各 GPU 遥测按时间对齐后求和，再计算按时间加权的 P90，最后除以 GPU 数量。该指标表示整组 GPU 功耗按芯片均摊后的水平，不是单个 GPU 的 P90；缺少此测量值的运行不显示该指标。',
+    },
+    formula: {
+      en: 'P90 fleet W/chip = time-weighted P90(sum of GPU watts) ÷ GPU count',
+      zh: '整组 GPU P90 功耗（W/芯片）= 各 GPU 功耗之和的时间加权 P90 ÷ GPU 数量',
+    },
+  },
+  measuredPrefillAvgPower: measuredPower('prefill'),
+  measuredDecodeAvgPower: measuredPower('decode'),
+  measuredJPerOutputToken: measuredJoulesPerToken('output'),
+  measuredJPerInputToken: measuredJoulesPerToken('input'),
+  measuredJPerTotalToken: measuredJoulesPerToken('total'),
+  measuredPrefillJPerInputToken: measuredRoleJoulesPerToken('prefill'),
+  measuredDecodeJPerOutputToken: measuredRoleJoulesPerToken('decode'),
+  measuredJPerSuccessfulQuery: {
+    description: {
+      en:
+        `Measured accelerator energy consumed per successfully completed request, from runner ` +
+        `power telemetry. It charges the energy of the whole run only to requests that finished ` +
+        `successfully.${MEASURED_TIER_NOTE_EN}`,
+      zh:
+        `每个成功完成的请求消耗的加速器实测能耗，来自运行器功耗遥测。` +
+        `整个运行的能耗只计入成功完成的请求。${MEASURED_TIER_NOTE_ZH}`,
+    },
+    formula: {
+      en: 'J/query = measured accelerator energy over the run ÷ successfully completed requests',
+      zh: 'J/query = 运行期间加速器实测能耗 ÷ 成功完成的请求数',
+    },
+  },
+  measuredWhPerSuccessfulQuery: {
+    description: {
+      en:
+        `The same measured energy per successful request expressed in watt-hours, a more ` +
+        `familiar household unit (1 Wh = 3,600 J).${MEASURED_TIER_NOTE_EN}`,
+      zh: `与每次成功请求实测能耗相同的量，换算成更直观的瓦时单位（1 Wh = 3,600 J）。${MEASURED_TIER_NOTE_ZH}`,
+    },
+    formula: {
+      en: 'Wh/query = measured J per successful query ÷ 3,600',
+      zh: 'Wh/query = 每次成功请求实测能耗（J）÷ 3,600',
+    },
+  },
+  measuredPowerPercentTdp: {
+    description: {
+      en:
+        `Measured average per-chip power as a share of the accelerator’s rated TDP. Values well ` +
+        `below 100% suggest the workload leaves thermal or power headroom on the table.${
+          MEASURED_TIER_NOTE_EN
+        }`,
+      zh:
+        `每芯片实测平均功耗占加速器额定 TDP 的百分比。` +
+        `明显低于 100% 说明该工作负载没有用满散热或供电余量。${MEASURED_TIER_NOTE_ZH}`,
+    },
+    formula: {
+      en: '% TDP = measured average power per chip (W) ÷ rated TDP (W) × 100',
+      zh: '% TDP = 每芯片实测平均功耗（W）÷ 额定 TDP（W）× 100',
+    },
+  },
+  measuredPowerTimeline: {
+    description: {
+      en:
+        `The per-second accelerator power samples behind each measured average, drawn over ` +
+        `the whole benchmark job (server start, warmup, and the validated measurement window, ` +
+        `which is emphasized). One trace per config, mean of its GPUs by default; the rated TDP ` +
+        `is a dashed reference per hardware. Configs whose telemetry artifact is missing are ` +
+        `listed under the chart rather than estimated.${MEASURED_TIER_NOTE_EN}`,
+      zh:
+        `每个实测平均值背后的逐秒加速器功耗采样，覆盖整个基准测试任务（服务启动、warmup ` +
+        `以及被突出显示的有效测量窗口）。每个配置一条曲线，默认取其 GPU 的平均值；` +
+        `每种硬件的额定 TDP 以虚线作为参考。缺少遥测产物的配置会列在图表下方，而不会用估算值代替。${
+          MEASURED_TIER_NOTE_ZH
+        }`,
+    },
+    formula: {
+      en: 'W(t) = mean over GPUs of the sampled power draw in each one-second bucket',
+      zh: 'W(t) = 每个一秒时间桶内各 GPU 功耗采样值的平均',
+    },
+  },
+  gpuProvisionedJPerOutputToken: {
+    description: {
+      en:
+        'Energy per output token if every allocated accelerator drew exactly its rated TDP for ' +
+        'the whole run. Disaggregated deployments count prefill and decode GPUs together, so ' +
+        'this is the GPU-only provisioning boundary the measured J/token can be compared against.',
+      zh:
+        '假设所有已分配加速器在整个运行中恒以额定 TDP 耗电时的每输出 token 能耗。' +
+        '分离式部署将 prefill 与 decode GPU 一并计入，因此它是可与实测 J/token 对照的 GPU 侧额定边界。',
+    },
+    formula: {
+      en: 'J/tok = rated TDP (W) × allocated GPUs ÷ total output tokens per second',
+      zh: 'J/tok = 额定 TDP（W）× 已分配 GPU 数 ÷ 总输出 token 吞吐（tok/s）',
+    },
+  },
+  gpuProvisionedJPerTotalToken: {
+    description: {
+      en:
+        'Energy per total token (input + output) if every allocated accelerator drew exactly its ' +
+        'rated TDP for the whole run. Counting prompt tokens spreads prefill energy over every ' +
+        'token the requests process instead of charging it to output tokens alone.',
+      zh:
+        '假设所有已分配加速器在整个运行中恒以额定 TDP 耗电时，每个总 token（输入 + 输出）的能耗。' +
+        '计入提示词 token 后，prefill 能耗由请求处理的全部 token 分摊，而不是只计入输出 token。',
+    },
+    formula: {
+      en: 'J/tok = rated TDP (W) × allocated GPUs ÷ (input + output) tokens per second',
+      zh: 'J/tok = 额定 TDP（W）× 已分配 GPU 数 ÷（输入 + 输出）token 吞吐（tok/s）',
+    },
+  },
+  utilityProvisionedJPerOutputToken: {
+    description: {
+      en:
+        'Energy per output token at the all-in provisioned power boundary, normalized by every ' +
+        'allocated accelerator. It differs from the public All-in Provisioned J per Output Token ' +
+        'metric only for disaggregated runs, where that metric normalizes by decode GPUs alone.',
+      zh:
+        '在整体预配功耗边界下的每输出 token 能耗，按全部已分配加速器归一。' +
+        '仅在分离式运行中与公开的 All-in Provisioned J per Output Token 指标不同，后者只按 decode GPU 归一。',
+    },
+    formula: {
+      en: 'J/tok = all-in provisioned power per GPU (W) × allocated GPUs ÷ total output tokens per second',
+      zh: 'J/tok = 每 GPU 整体预配功耗（W）× 已分配 GPU 数 ÷ 总输出 token 吞吐（tok/s）',
+    },
+  },
+  utilityProvisionedJPerTotalToken: {
+    description: {
+      en:
+        'Energy per total token (input + output) at the all-in provisioned power boundary, ' +
+        'normalized by every allocated accelerator. It matches the public All-in Provisioned J ' +
+        'per Total Token metric, which also spreads total tokens across every GPU.',
+      zh:
+        '在整体预配功耗边界下，每个总 token（输入 + 输出）的能耗，按全部已分配加速器归一。' +
+        '公开指标“每总 token 全电源配置能耗”同样按全部 GPU 统计总 token，因此两者数值一致。',
+    },
+    formula: {
+      en: 'J/tok = all-in provisioned power per GPU (W) × allocated GPUs ÷ (input + output) tokens per second',
+      zh: 'J/tok = 每 GPU 整体预配功耗（W）× 已分配 GPU 数 ÷（输入 + 输出）token 吞吐（tok/s）',
+    },
+  },
+  itModeledWatts: {
+    description: {
+      en:
+        'Measured IT power per allocated accelerator, no PUE: measured GPU power plus the InferenceX ' +
+        'power model’s CPU, server parts, fans and PSU loss, and the scale-out network share for the ' +
+        'run’s workload state. The facility (PUE) overhead is left out. Same hardware coverage as ' +
+        'All in Measured.',
+      zh:
+        '每已分配加速器的整体实测 IT 功耗（不含 PUE）：GPU 实测功耗加上 InferenceX 功耗模型按该次运行工作负载状态估算的 CPU、服务器部件、风扇与电源损耗以及 scale-out 网络分摊。' +
+        '不计数据中心（PUE）开销。硬件覆盖范围与整体实测功耗相同。',
+    },
+    formula: {
+      en: 'W/GPU = measured IT power (W) ÷ allocated GPUs = All in Measured W/GPU ÷ PUE',
+      zh: 'W/GPU = 实测 IT 功耗（W）÷ 已分配 GPU 数 = 每 GPU 整体实测功耗 ÷ PUE',
+    },
+  },
+  itModeledJPerOutputToken: {
+    description: {
+      en:
+        'Measured energy per output token scaled to the measured IT boundary (no PUE), so its ratio to ' +
+        'measured GPU energy equals the ratio of measured IT power to measured GPU power. ' +
+        'Missing where the system power model or validated measured power is unavailable.',
+      zh:
+        '将实测每输出 token 能耗按整体实测 IT 功耗边界（不含 PUE）缩放，其与 GPU 实测能耗之比等于实测 IT 功耗与 GPU 实测功耗之比。' +
+        '系统功耗模型或通过验证的实测功耗缺失时不显示。',
+    },
+    formula: {
+      en: 'J/tok = measured J per output token × measured IT W per GPU ÷ measured W per GPU',
+      zh: 'J/tok = 实测每输出 token 能耗 × 每 GPU 实测 IT 功耗（W）÷ 每 GPU 实测功耗（W）',
+    },
+  },
+  itModeledJPerTotalToken: {
+    description: {
+      en:
+        'Measured energy per total token (input + output) scaled to the measured IT boundary (no PUE) ' +
+        'by the same power ratio as All in Measured IT J per Output Token. Missing where the system ' +
+        'power model or validated measured power is unavailable.',
+      zh:
+        '将每个总 token（输入 + 输出）的实测能耗缩放到整体实测 IT 功耗边界（不含 PUE），缩放比例与每输出 token 整体实测 IT 能耗相同。' +
+        '系统功耗模型或通过验证的实测功耗缺失时不显示。',
+    },
+    formula: {
+      en: 'J/tok = measured J per total token × measured IT W per GPU ÷ measured W per GPU',
+      zh: 'J/tok = 实测每总 token 能耗 × 每 GPU 实测 IT 功耗（W）÷ 每 GPU 实测功耗（W）',
+    },
+  },
+  utilityModeledWatts: {
+    description: {
+      en:
+        'Measured facility power per allocated accelerator: the InferenceX power model carries measured ' +
+        'GPU power to IT power for the run’s workload state and scale-out, then multiplies once by an ' +
+        `assumed PUE (${AIR_COOLED_SYSTEM_PUE} air-cooled, ${LIQUID_COOLED_RACK_PUE} liquid-cooled). ` +
+        'Supports eight-GPU HGX/OAM chassis and GB200/GB300 NVL72, where measured Grace-socket power ' +
+        'is a second input and every compute tray takes an equal share of a modeled rack.',
+      zh:
+        `每个已分配加速器的实测数据中心功耗：InferenceX 功耗模型根据该次运行的工作负载状态和 scale-out 设置，将 GPU 实测功耗换算为 IT 功耗，再乘以一次假定 PUE（风冷 ${AIR_COOLED_SYSTEM_PUE}，液冷 ${LIQUID_COOLED_RACK_PUE}）。` +
+        '支持八卡 HGX/OAM 机箱和 GB200/GB300 NVL72；NVL72 另以 Grace socket 实测功耗为输入，每个计算 tray 平均分摊建模机架的功耗。',
+    },
+    formula: {
+      en: 'W/GPU = measured IT power (W) × PUE ÷ allocated GPUs',
+      zh: 'W/GPU = 实测 IT 功耗（W）× PUE ÷ 已分配 GPU 数',
+    },
+  },
+  utilityModeledJPerOutputToken: {
+    description: {
+      en:
+        'Measured energy per output token scaled to the measured facility boundary, so its ratio to ' +
+        'measured GPU energy equals the ratio of measured facility power to measured GPU power. ' +
+        'Missing where the system power model or validated measured power is unavailable.',
+      zh:
+        '将实测每输出 token 能耗按实测数据中心功耗边界缩放，其与 GPU 实测能耗之比等于实测数据中心功耗与 GPU 实测功耗之比。' +
+        '系统功耗模型或通过验证的实测功耗缺失时不显示。',
+    },
+    formula: {
+      en: 'J/tok = measured J per output token × measured facility W per GPU ÷ measured W per GPU',
+      zh: 'J/tok = 实测每输出 token 能耗 × 每 GPU 实测数据中心功耗（W）÷ 每 GPU 实测功耗（W）',
+    },
+  },
+  utilityModeledJPerTotalToken: {
+    description: {
+      en:
+        'Measured energy per total token (input + output) scaled to the measured facility ' +
+        'boundary by the same power ratio as All in Measured J per Output Token. Missing where ' +
+        'the system power model or validated measured power is unavailable.',
+      zh:
+        '将每个总 token（输入 + 输出）的实测能耗缩放到整体实测功耗边界，缩放比例与每输出 token 整体实测能耗相同。' +
+        '系统功耗模型或通过验证的实测功耗缺失时不显示。',
+    },
+    formula: {
+      en: 'J/tok = measured J per total token × measured facility W per GPU ÷ measured W per GPU',
+      zh: 'J/tok = 实测每总 token 能耗 × 每 GPU 实测数据中心功耗（W）÷ 每 GPU 实测功耗（W）',
+    },
+  },
+};
+
+export type XAxisKind = 'interactivity' | 'e2eLatency' | 'ttft' | 'e2eNormalizedInteractivity';
+
+export const X_AXIS_KINDS: readonly XAxisKind[] = [
+  'interactivity',
+  'e2eLatency',
+  'ttft',
+  'e2eNormalizedInteractivity',
+];
+
+export interface XAxisExplanation {
+  name: {
+    en: (pctl: string | null) => string;
+    zh: (pctl: string | null) => string;
+  };
+  description: LocalizedText;
+}
+
+const zhPctl = (pctl: string | null): string =>
+  pctl === null ? '' : pctl === 'Median' ? '中位' : pctl === 'Mean' ? '平均' : `${pctl} `;
+
+const enPctl = (pctl: string | null): string => (pctl === null ? '' : `${pctl} `);
+
+export const X_AXIS_EXPLANATIONS: Record<XAxisKind, XAxisExplanation> = {
+  interactivity: {
+    name: {
+      en: (pctl) => `${enPctl(pctl)}Interactivity (tok/s/user)`,
+      zh: (pctl) => `${zhPctl(pctl)}交互性（tok/s/user）`,
+    },
+    description: {
+      en:
+        'Interactivity is the rate at which a single user receives generated tokens while the ' +
+        'model streams its answer — how quickly new words appear on screen. Higher values feel ' +
+        'snappier; operators trade it against batch throughput. For fixed-sequence Mean, the rate ' +
+        'is 1 divided by mean TPOT in seconds, not the arithmetic mean of per-request rates.',
+      zh:
+        '交互性（interactivity）指模型流式输出回答时，单个用户接收生成 token 的速率——' +
+        '即新内容出现在屏幕上的快慢。数值越高体验越流畅；运营方需要在交互性与批量吞吐量之间权衡。',
+    },
+  },
+  e2eLatency: {
+    name: {
+      en: (pctl) => `${enPctl(pctl)}End-to-end Latency (s)`,
+      zh: (pctl) => `${zhPctl(pctl)}端到端延迟（s）`,
+    },
+    description: {
+      en:
+        'End-to-end latency is the total wall-clock time from submitting a request until the ' +
+        'complete response finishes — the wait before the first token plus the entire ' +
+        'generation. Lower is better.',
+      zh:
+        '端到端延迟指从提交请求到完整响应结束的总耗时——包括收到首个 token 之前的等待和之后的全部生成过程。' +
+        '数值越低越好。',
+    },
+  },
+  ttft: {
+    name: {
+      en: (pctl) => `${enPctl(pctl)}Time To First Token (s)`,
+      zh: (pctl) => `${zhPctl(pctl)}首 token 延迟（TTFT，s）`,
+    },
+    description: {
+      en:
+        'Time to first token (TTFT) is the delay from submitting a request until the first ' +
+        'generated token arrives — the “thinking…” pause before the answer starts. Percentile ' +
+        'prefixes (Median, P90, P99) report that delay across all requests in the run.',
+      zh:
+        '首 token 延迟（TTFT，Time To First Token）指从提交请求到收到第一个生成 token 的等待时间——' +
+        '也就是回答开始前的“思考”停顿。百分位前缀（Median、P90、P99）表示该延迟在整个运行的所有请求上的分布。',
+    },
+  },
+  e2eNormalizedInteractivity: {
+    name: {
+      en: (pctl) => `${enPctl(pctl)}E2E Normalized Interactivity (tok/s/user)`,
+      zh: (pctl) => `${zhPctl(pctl)}端到端归一化交互性（tok/s/user）`,
+    },
+    description: {
+      en:
+        'E2E normalized interactivity is the effective per-user token rate over a complete ' +
+        'request: output tokens divided by end-to-end latency. Unlike plain interactivity it ' +
+        'also counts the wait before the first token, so slow prefill lowers the score.',
+      zh:
+        '端到端归一化交互性是完整请求内的等效单用户 token 速率：输出 token 数除以端到端延迟。' +
+        '与普通交互性不同，它把首个 token 之前的等待也计算在内，prefill 越慢得分越低。',
+    },
+  },
+};
+
+export function resolveXAxisKind(
+  chartType: 'interactivity' | 'e2e',
+  opts: {
+    xAxisField: string;
+    isDerivedNormalizedInteractivity: boolean;
+  },
+): XAxisKind {
+  if (opts.isDerivedNormalizedInteractivity) return 'e2eNormalizedInteractivity';
+  if (opts.xAxisField.endsWith('ttft')) return 'ttft';
+  return chartType === 'e2e' ? 'e2eLatency' : 'interactivity';
+}
+
+export function xAxisPercentileFromLabel(xAxisLabel: string): string | null {
+  if (xAxisLabel.startsWith('平均')) return 'Mean';
+  if (xAxisLabel.startsWith('中位')) return 'Median';
+  const match = /^(?<pctl>Median|Mean|P\d+(?:\.\d+)?)\s/iu.exec(xAxisLabel);
+  if (!match?.groups?.pctl) return null;
+  const pctl = match.groups.pctl;
+  return pctl.toLowerCase() === 'median'
+    ? 'Median'
+    : pctl.toLowerCase() === 'mean'
+      ? 'Mean'
+      : pctl.toUpperCase();
+}
+
+export function metricRowLabel(metricKey: MetricKey, locale: 'en' | 'zh'): string {
+  return metricOptionTitle(metricKey, locale);
+}

@@ -1,0 +1,246 @@
+'use client';
+
+import dynamic from 'next/dynamic';
+import { useMemo, useState } from 'react';
+
+import { Button } from '@/components/ui/button';
+
+import type { ChartDefinition, InferenceData } from '@/components/inference/types';
+import { type DataTableColumn, DataTable } from '@/components/ui/data-table';
+import { metricLabel, xAxisLabel } from '@/lib/charts/chart-utils';
+import { isAllInMeasuredConfigKey } from '@/components/inference/metric-registry';
+import {
+  allInMeasuredStatusLabel,
+  inferenceTableYValue,
+} from '@/components/inference/utils/inference-table-data';
+import { inferPowerCompare, powerSeriesLabel } from '@/components/inference/utils/power-compare';
+import { sortRowsByYMetric } from '@/components/inference/ui/inference-table-sort';
+import { type Precision, getPrecisionLabel } from '@/lib/catalog/data-mappings';
+import { getDisplayLabel } from '@/lib/shared/utils';
+import { getInferenceHardwareConfig } from '@/lib/benchmarks/inference-labels';
+import type { Locale } from '@/lib/i18n/i18n';
+import { useLocale } from '@/lib/i18n/use-locale';
+import { usePowerXSurface } from '@/components/inference/ui/powerx-surface';
+
+const ReproduceDrawer = dynamic(
+  () =>
+    import('@/components/inference/reproduce/ReproduceDrawer').then(
+      (module) => module.ReproduceDrawer,
+    ),
+  { ssr: false },
+);
+
+interface InferenceTableProps {
+  data: InferenceData[];
+  chartDefinition: ChartDefinition;
+  selectedYAxisMetric: string;
+}
+
+export function formatInferenceTableNumber(value: number | null, decimals?: number): string {
+  if (value === null || !Number.isFinite(value)) return '—';
+  const fixedDecimals =
+    decimals ??
+    (Math.abs(value) >= 100 ? 0 : Math.abs(value) >= 1 ? 1 : Math.abs(value) >= 0.01 ? 3 : 4);
+  return new Intl.NumberFormat('en-US', {
+    minimumFractionDigits: fixedDecimals,
+    maximumFractionDigits: fixedDecimals,
+  }).format(value);
+}
+
+export function inferenceTableHeaderLabels(
+  chartDefinition: ChartDefinition,
+  selectedYAxisMetric: string,
+  locale: Locale,
+) {
+  return {
+    chip: locale === 'zh' ? '芯片' : 'Chip',
+    precision: locale === 'zh' ? '精度' : 'Precision',
+    tensorParallelism: 'TP',
+    physicalChips: locale === 'zh' ? '物理芯片数' : 'Physical chips',
+    concurrency: locale === 'zh' ? '并发数' : 'Conc',
+    series: locale === 'zh' ? '系列' : 'Series',
+    yMetric: metricLabel(chartDefinition, selectedYAxisMetric, locale),
+    xMetric: xAxisLabel(chartDefinition, locale),
+    throughput: locale === 'zh' ? '单芯片吞吐量 (tok/s)' : 'Throughput/Chip (tok/s)',
+    measuredGpuPower: locale === 'zh' ? 'GPU 实测功耗 (W/芯片)' : 'Measured GPU Power (W/chip)',
+    estimateStatus: locale === 'zh' ? '整体估算状态' : 'All-in Estimate Status',
+    reproduce: locale === 'zh' ? '复现' : 'Reproduce',
+  };
+}
+
+export default function InferenceTable({
+  data,
+  chartDefinition,
+  selectedYAxisMetric,
+}: InferenceTableProps) {
+  const locale = useLocale();
+  // PowerX names the measured boundaries the way its Count control does.
+  const seriesLabelStyle = usePowerXSurface() ? 'count' : 'basis';
+  const yPath = chartDefinition[selectedYAxisMetric as keyof ChartDefinition] as string | undefined;
+  const showAllInMeasured = isAllInMeasuredConfigKey(selectedYAxisMetric);
+  const headers = useMemo(
+    () => inferenceTableHeaderLabels(chartDefinition, selectedYAxisMetric, locale),
+    [chartDefinition, selectedYAxisMetric, locale],
+  );
+
+  const sorted = useMemo(
+    () => sortRowsByYMetric(data, chartDefinition, selectedYAxisMetric),
+    [data, chartDefinition, selectedYAxisMetric],
+  );
+  const powerCompare = useMemo(() => inferPowerCompare(data), [data]);
+  const [reproducePoint, setReproducePoint] = useState<InferenceData | null>(null);
+
+  const columns = useMemo<DataTableColumn<InferenceData>[]>(
+    () => [
+      {
+        header: headers.chip,
+        cell: (row) => getDisplayLabel(getInferenceHardwareConfig(row.hwKey, row.model, [row])),
+        sortValue: (row) =>
+          getDisplayLabel(getInferenceHardwareConfig(row.hwKey, row.model, [row])),
+        className: 'font-medium whitespace-nowrap',
+        importance: 'key',
+        pinned: true,
+      },
+      {
+        header: headers.precision,
+        cell: (row) => (row.precision ? getPrecisionLabel(row.precision as Precision) : ''),
+        sortValue: (row) => row.precision ?? '',
+        className: 'whitespace-nowrap',
+        importance: 'key',
+      },
+      ...(powerCompare === 'none'
+        ? []
+        : [
+            {
+              header: headers.series,
+              cell: (row: InferenceData) =>
+                powerSeriesLabel(row, selectedYAxisMetric, powerCompare, locale, seriesLabelStyle),
+              sortValue: (row: InferenceData) =>
+                powerSeriesLabel(row, selectedYAxisMetric, powerCompare, locale, seriesLabelStyle),
+              className: 'whitespace-nowrap',
+              importance: 'key' as const,
+            },
+          ]),
+      {
+        header: headers.tensorParallelism,
+        align: 'right',
+        cell: (row) => row.decode_tp ?? row.tp,
+        sortValue: (row) => row.decode_tp ?? row.tp,
+        className: 'tabular-nums',
+        importance: 'secondary',
+      },
+      {
+        header: headers.physicalChips,
+        align: 'right',
+        cell: (row) => row.physicalChips ?? row.tp,
+        sortValue: (row) => row.physicalChips ?? row.tp,
+        importance: 'secondary',
+      },
+      {
+        header: 'DP',
+        align: 'right',
+        cell: (row) => row.dp ?? '—',
+        sortValue: (row) => row.dp ?? 0,
+        importance: 'secondary',
+      },
+      {
+        header: headers.concurrency,
+        align: 'right',
+        cell: (row) => row.conc,
+        sortValue: (row) => row.conc,
+        className: 'tabular-nums',
+        importance: 'secondary',
+      },
+      {
+        header: headers.yMetric,
+        align: 'right',
+        cell: (row) => formatInferenceTableNumber(inferenceTableYValue(row, yPath)),
+        sortValue: (row) => inferenceTableYValue(row, yPath) ?? '',
+        className: showAllInMeasured ? 'tabular-nums min-w-36' : 'tabular-nums',
+        importance: 'key',
+      },
+      ...(showAllInMeasured
+        ? [
+            {
+              header: headers.measuredGpuPower,
+              align: 'right' as const,
+              cell: (row: InferenceData) =>
+                formatInferenceTableNumber(row.measuredAvgPower?.y ?? null),
+              sortValue: (row: InferenceData) => row.measuredAvgPower?.y ?? '',
+              className: 'tabular-nums min-w-32',
+              importance: 'key' as const,
+            },
+            {
+              header: headers.estimateStatus,
+              cell: (row: InferenceData) =>
+                allInMeasuredStatusLabel(row, selectedYAxisMetric.slice(2), locale),
+              sortValue: (row: InferenceData) =>
+                allInMeasuredStatusLabel(row, selectedYAxisMetric.slice(2), locale),
+              className: 'w-28 min-w-28 sm:w-auto sm:min-w-48',
+              importance: 'key' as const,
+            },
+          ]
+        : []),
+      {
+        header: headers.xMetric,
+        align: 'right',
+        cell: (row) => formatInferenceTableNumber(row.x),
+        sortValue: (row) => row.x,
+        className: 'tabular-nums',
+        importance: 'key',
+      },
+      {
+        header: headers.throughput,
+        align: 'right',
+        cell: (row) => formatInferenceTableNumber(row.tput_per_gpu ?? 0, 1),
+        sortValue: (row) => row.tput_per_gpu ?? 0,
+        className: 'tabular-nums',
+        importance: 'key',
+      },
+      {
+        header: headers.reproduce,
+        align: 'right',
+        cell: (row) => (
+          <Button
+            type="button"
+            variant="outline"
+            size="2xs"
+            data-testid="inference-table-reproduce"
+            onClick={() => setReproducePoint(row)}
+          >
+            {headers.reproduce}
+          </Button>
+        ),
+        className: 'whitespace-nowrap',
+        importance: 'key',
+      },
+    ],
+    [
+      yPath,
+      headers,
+      showAllInMeasured,
+      powerCompare,
+      selectedYAxisMetric,
+      locale,
+      seriesLabelStyle,
+    ],
+  );
+
+  return (
+    <>
+      <DataTable
+        data={sorted}
+        columns={columns}
+        testId="inference-results-table"
+        analyticsPrefix="inference_table"
+      />
+      {reproducePoint === null ? null : (
+        <ReproduceDrawer
+          point={reproducePoint}
+          source="table"
+          onClose={() => setReproducePoint(null)}
+        />
+      )}
+    </>
+  );
+}
