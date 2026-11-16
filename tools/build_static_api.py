@@ -6,7 +6,8 @@ python3 tools/build_static_api.py --out app/packages/app/public/data/api [--site
 The app's API client (app/packages/app/src/lib/api/static-api.ts) maps each API request to a file here. Each
 Marlowe point becomes a benchmark row with InferenceX's row shape: hardware mi355x, framework `marlowe` (main
 series) or `marlowe-intvty` (interactivity-leaning), the measured metrics, and run_url pointing at its recipe page.
-Metrics we did not measure (power, cache hit rates, full-response percentiles) are left out. Candidate points are
+Their E2E normalized interactivity is added to derived-agentic-metrics.json under the row id, as the
+derived-metrics endpoint serves it. Metrics we did not measure (power, cache hit rates) are left out. Candidate points are
 not written. Standard library only.
 """
 
@@ -75,6 +76,8 @@ def marlowe_row(i: int, p: dict, site_base: str) -> dict:
         "input_tput_tps": m["input_tput_per_gpu"] * tp,
         "output_tput_tps": m["output_tput_per_gpu"] * tp,
         "duration_seconds": m["duration_seconds"],
+        "p75_e2e_norm_intvty": m["p75_e2e_norm_intvty"],
+        "p90_e2e_norm_intvty": m["p90_e2e_norm_intvty"],
         "total_requests_completed": m["num_requests"],
         "spec_algorithm": m["spec_algorithm"],
         "spec_draft_model": "native",
@@ -149,6 +152,14 @@ def main(argv: list[str] | None = None) -> int:
         f = a.out / "benchmarks" / f"{model}.json"
         published = json.loads(f.read_text()) if f.exists() else []
         f.write_text(json.dumps(published + rows, separators=(",", ":")))
+    derived_file = a.out / "derived-agentic-metrics.json"
+    derived = json.loads(derived_file.read_text())
+    for rows in by_model.values():
+        for r in rows:
+            m = r["metrics"]
+            derived[r["id"]] = {"id": int(r["id"]), "p75_e2e_norm_intvty": m["p75_e2e_norm_intvty"],
+                                "p90_e2e_norm_intvty": m["p90_e2e_norm_intvty"]}
+    derived_file.write_text(json.dumps(derived, separators=(",", ":")))
     (ROOT / SNAPSHOT_DATE_TS).write_text(
         "// Written by tools/build_static_api.py: the date of the InferenceX snapshot the site was built from.\n"
         f"export const MARLOWE_SNAPSHOT_DATE = '{snap.name}';\n")

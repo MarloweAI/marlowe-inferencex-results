@@ -9,7 +9,8 @@ to publish a static copy of the inference chart with Marlowe's measured points a
   `src/app/page.tsx` sends the root to the DeepSeek-V4.1-Flash chart. Only models listed in
   `src/components/marlowe/models.ts` are exported.
 - **Data from snapshots.** `src/lib/api/static-api.ts` maps the chart's API requests to JSON snapshots under
-  `/data/api/`; `src/lib/api/api.ts` and `src/hooks/api/use-benchmark-presence.ts` use it. Date-specific and
+  `/data/api/`; `src/lib/api/api.ts`, `src/hooks/api/use-benchmark-presence.ts` and `src/hooks/api/benchmark-id-query.ts` (the
+  derived-metrics batches, served from one file holding every row) use it. Date-specific and
   run-specific requests are not in the snapshot. `src/hooks/api/use-resident-sequence-lengths.ts` returns nothing,
   because its percentiles depend on the selected points.
 - **Marlowe points.** `packages/constants/src/framework-aliases.ts` registers the `marlowe` and `marlowe-intvty`

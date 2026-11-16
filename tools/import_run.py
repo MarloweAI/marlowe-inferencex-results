@@ -4,7 +4,8 @@
 python3 tools/import_run.py RUN_DIR --point tp4-c1 --series main [--status final|candidate] [--label TEXT]
 
 RUN_DIR is a copy of the run's small files (server_cmd.txt, cfg.txt, meta.txt, summary.json, windows.json,
-client/benchmark_command.txt, client/run_info.txt, client/aiperf_artifacts/profile_export_aiperf.json).
+client/benchmark_command.txt, client/run_info.txt, client/aiperf_artifacts/profile_export_aiperf.json, and the
+per-request client/aiperf_artifacts/profile_export.jsonl for the E2E normalized interactivity; see derived_metrics.py).
 Local paths are replaced by variables ($MODEL_PATH, $TOKENIZER_PATH, $OUT), node names, job ids and the
 image's storage path are dropped, and the server log is never copied. Standard library only.
 """
@@ -16,6 +17,8 @@ import json
 import re
 import shlex
 from pathlib import Path
+
+from derived_metrics import PROFILE, e2e_norm_intvty
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -194,6 +197,8 @@ def main() -> int:
     f = summary["full"]
     tp, conc = int(cfg["TP"]), int(cfg["C"])
     date = meta["end"][:10]
+    with open(d / PROFILE) as fh:
+        derived = e2e_norm_intvty(fh)
 
     point = {
         "id": a.point,
@@ -235,6 +240,7 @@ def main() -> int:
             "accept_len_mean": summary["accept_len_mean"],
             "num_requests": f["n"],
             "duration_seconds": 3600,
+            **{k: v for k, v in derived.items() if k != "n"},
         },
         "client": "InferenceX agentx-harness 1.0.13, agentx preset, 3600 s",
         "scorer": "InferenceX agentx-audit-data windows.py, full window",

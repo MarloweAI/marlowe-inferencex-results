@@ -16,6 +16,8 @@ export function staticApiUrl(url: string): string | null {
     }
     case '/api/v1/availability/compact':
       return `${BASE}/availability-compact.json`;
+    case '/api/v1/derived-agentic-metrics':
+      return q.has('ids') ? `${BASE}/derived-agentic-metrics.json` : null;
     case '/api/v1/benchmark-presence':
       return `${BASE}/benchmark-presence.json`;
     case '/api/v1/workflow-info': {

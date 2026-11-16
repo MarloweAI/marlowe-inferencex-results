@@ -51,7 +51,9 @@
   "spec_algorithm": "dspark",
   "accept_len_mean": 3.51,
   "num_requests": 2651,
-  "duration_seconds": 3600
+  "duration_seconds": 3600,
+  "p75_e2e_norm_intvty": 122.5427964420925,
+  "p90_e2e_norm_intvty": 52.23330027725321
  },
  "client": "InferenceX agentx-harness 1.0.13, agentx preset, 3600 s",
  "scorer": "InferenceX agentx-audit-data windows.py, full window",

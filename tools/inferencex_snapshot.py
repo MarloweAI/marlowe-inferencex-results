@@ -5,7 +5,8 @@ python3 tools/inferencex_snapshot.py [--out data/inferencex]
 
 InferenceX's public API needs no credential. For each model in MODELS it saves benchmarks/<model>.json (the latest
 result per configuration, as the dashboard fetches it), plus availability-compact.json, benchmark-presence.json and
-workflow-info/<date>.json for the model's latest run date. Responses are stored unmodified. A day's directory is
+workflow-info/<date>.json for the model's latest run date, and derived-agentic-metrics.json (E2E normalized
+interactivity per benchmark row, fetched in batches of 200 ids and merged). Responses are stored unmodified. A day's directory is
 never replaced, and a new one is written only when the benchmark rows changed since the latest snapshot, so the
 snapshot date is the day the published results last changed. If any request fails, nothing is written and the exit
 status is 1, so the site keeps the last snapshot. Standard library only.
@@ -29,6 +30,7 @@ BASE = "https://inferencex.semianalysis.com/api/v1"
 # InferenceX model code -> API model name
 MODELS = {"dsv41flash": "DeepSeek-V4.1-Flash"}
 TIMEOUT_SECONDS = 120
+IDS_PER_REQUEST = 200
 
 
 class Unavailable(Exception):
@@ -66,6 +68,12 @@ def fetch_all(dest: Path) -> dict[str, list]:
         latest = max(r["date"] for r in data if r.get("model") == code)
         write(dest / "workflow-info" / f"{latest}.json",
               get_json("/workflow-info?" + urllib.parse.urlencode({"date": latest})))
+    ids = sorted({int(r["id"]) for data in rows.values() for r in data})
+    derived = {}
+    for i in range(0, len(ids), IDS_PER_REQUEST):
+        chunk = ids[i:i + IDS_PER_REQUEST]
+        derived.update(get_json("/derived-agentic-metrics?" + urllib.parse.urlencode({"ids": ",".join(map(str, chunk))})))
+    write(dest / "derived-agentic-metrics.json", derived)
     write(dest / "availability-compact.json", get_json("/availability/compact"))
     write(dest / "benchmark-presence.json", get_json("/benchmark-presence"))
     return rows

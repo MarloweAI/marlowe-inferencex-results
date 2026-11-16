@@ -22,7 +22,7 @@ Licensed under the GNU GPL v3.0 (`LICENSE`), as the InferenceX-app code it conta
 | `data/inferencex/<date>/` | InferenceX public API responses the chart reads (benchmarks per model, availability, benchmark presence, workflow info), stored unmodified; a new directory only when the published rows change |
 | `recipes/<point>/` | `server.sh` and `client.sh` (exact commands, local paths replaced by `$MODEL_PATH`, `$TOKENIZER_PATH`, `$OUT`), `summary.json` (scorer result and run checks), `windows.json` (InferenceX's time windows), `aiperf_summary.json` (the client's aggregate export) |
 | `app/` | The modified InferenceX-app monorepo (Next.js, bun); `app/packages/app/out/` is the exported site |
-| `tools/` | `import_run.py` (raw run directory → record + recipe), `inferencex_snapshot.py`, `build_static_api.py` (snapshot + Marlowe rows → static API files), `build_site.py` (checks, recipe pages, static API files) |
+| `tools/` | `import_run.py` (raw run directory → record + recipe), `derived_metrics.py` (E2E normalized interactivity), `inferencex_snapshot.py`, `build_static_api.py` (snapshot + Marlowe rows → static API files), `build_site.py` (checks, recipe pages, static API files) |
 
 A point with `"status": "candidate"` is in the data and has a recipe but is not charted. The main-series TP2 C64
 point has two candidates (prefill-decode interval 32 and 34); when one is chosen, set its status to `final` and
@@ -46,7 +46,9 @@ cluster node name or a non-loopback IP address.
 ## Adding a point
 
 Copy the run's small files (`server_cmd.txt`, `cfg.txt`, `meta.txt`, `summary.json`, `windows.json`,
-`client/benchmark_command.txt`, `client/run_info.txt`, `client/aiperf_artifacts/profile_export_aiperf.json`) and run:
+`client/benchmark_command.txt`, `client/run_info.txt`, `client/aiperf_artifacts/profile_export_aiperf.json`, and the
+per-request `client/aiperf_artifacts/profile_export.jsonl`, used only to compute E2E normalized interactivity the way
+InferenceX does, in `tools/derived_metrics.py`; it is not published) and run:
 
 ```bash
 python3 tools/import_run.py RUN_DIR --point tp4-c32 --series main --label "max-running-requests 32"

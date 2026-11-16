@@ -8,6 +8,7 @@ import {
 
 import { ApiRequestError } from '@/lib/api/api-request-error';
 import { readJsonResponse } from '@/lib/api/gzip-json-response';
+import { staticApiUrl } from '@/lib/api/static-api';
 
 const STALE_TIME_MS = 5 * 60 * 1000;
 
@@ -27,7 +28,7 @@ export function bulkIdsFetcher<T>(
     const maps = await Promise.all(
       chunks.map(async (chunk) => {
         const url = `/api/v1/${endpoint}?ids=${chunk.join(',')}`;
-        const res = await fetch(url, { signal });
+        const res = await fetch(staticApiUrl(url) ?? url, { signal });
         if (!res.ok) throw new ApiRequestError(`${endpoint} ${res.status}`, res.status, url);
         return (await res.json()) as Record<number, T>;
       }),
