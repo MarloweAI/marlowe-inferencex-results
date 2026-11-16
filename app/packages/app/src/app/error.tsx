@@ -6,6 +6,25 @@ import { Button } from '@/components/ui/button';
 import { track } from '@/lib/analytics/analytics';
 import { isZhPathname } from '@/lib/i18n/i18n';
 
+// The private GitHub Pages site redirects a request to GitHub sign-in once its access cookie expires. A part of
+// the page loaded after that (the table, a dialog) then fails to load; a full reload signs in again. Reload at
+// most once a minute so a part that is really missing still shows this page.
+const CHUNK_ERROR = /Failed to load chunk|ChunkLoadError|Loading chunk/;
+const RELOAD_KEY = 'marlowe-chunk-reload-at';
+
+function reloadForChunkError(error: Error): boolean {
+  if (!CHUNK_ERROR.test(error.message)) return false;
+  try {
+    const last = Number(sessionStorage.getItem(RELOAD_KEY) ?? 0);
+    if (Date.now() - last < 60_000) return false;
+    sessionStorage.setItem(RELOAD_KEY, String(Date.now()));
+  } catch {
+    return false;
+  }
+  window.location.reload();
+  return true;
+}
+
 const STRINGS = {
   en: {
     title: 'Something went wrong',
@@ -31,6 +50,7 @@ export default function Error({
   const t = STRINGS[locale];
 
   useEffect(() => {
+    if (reloadForChunkError(error)) return;
     console.error(error);
     track('error_page_shown', { message: error.message, digest: error.digest, locale });
   }, [error, locale]);

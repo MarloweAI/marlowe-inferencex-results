@@ -23,6 +23,8 @@ to publish a static copy of the inference chart with Marlowe's measured points a
   (`ModelArchitectureInfoLink.tsx`). `src/components/marlowe/marlowe-notes.tsx` adds the measurement notes.
 - **Assets.** Images, whitepapers, sounds and favicons not used by the chart were removed from
   `packages/app/public/`, as were the upstream `.github`, `.claude` and editor settings.
+- **Error page.** `src/app/error.tsx` reloads the page once when a lazily loaded part fails to load, which on
+  the private GitHub Pages site happens after its sign-in cookie expires.
 - **Tooling.** The root `prepare` script no longer installs git hooks.
 
 The upstream tests were not updated for these changes and are not run.
