@@ -5,6 +5,7 @@ import { useState } from 'react';
 import { isMonochromeLogo } from '@/lib/catalog/model-logos';
 import { getHwVendorLogo } from '@/lib/catalog/vendor-logos';
 import { cn } from '@/lib/shared/utils';
+import { withBasePath } from '@/components/marlowe/base-path';
 
 export function HwVendorLogo({ vendor, className }: { vendor?: string; className?: string }) {
   const [failedSrc, setFailedSrc] = useState<string | null>(null);
@@ -14,7 +15,7 @@ export function HwVendorLogo({ vendor, className }: { vendor?: string; className
 
   return (
     <img
-      src={`/logos/${logo}`}
+      src={withBasePath(`/logos/${logo}`)}
       alt=""
       aria-hidden="true"
       className={cn(

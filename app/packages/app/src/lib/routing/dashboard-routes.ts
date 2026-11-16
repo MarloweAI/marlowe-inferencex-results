@@ -1,3 +1,5 @@
+import { BASE_PATH } from '@/components/marlowe/base-path';
+
 export type DashboardNavGroup = 'primary' | 'merged' | 'feature-gated' | 'footer-only';
 export type DashboardShareParamScope = 'g_' | 'i_' | 'e_' | 'r_' | 'c_' | 'v_';
 
@@ -310,7 +312,8 @@ export function getDashboardRoute<K extends DashboardRouteKey>(
 }
 
 export function dashboardRouteForPathname(pathname: string): DashboardRoute | undefined {
-  const barePath = pathname.split(/[?#]/u, 1)[0] || '/';
+  const unprefixed = BASE_PATH && pathname.startsWith(`${BASE_PATH}/`) ? pathname.slice(BASE_PATH.length) : pathname;
+  const barePath = unprefixed.split(/[?#]/u, 1)[0] || '/';
   const enPath = barePath === '/zh' ? '/' : barePath.replace(/^\/zh(?=\/)/u, '');
   return DASHBOARD_ROUTES.find(
     (route) =>
@@ -338,7 +341,8 @@ const DEFAULT_DASHBOARD_SHELL_CAPABILITIES: DashboardShellCapabilities = {
 export function dashboardShellCapabilitiesForPathname(
   pathname: string,
 ): DashboardShellCapabilities {
-  const barePath = pathname.split(/[?#]/u, 1)[0] || '/';
+  const unprefixed = BASE_PATH && pathname.startsWith(`${BASE_PATH}/`) ? pathname.slice(BASE_PATH.length) : pathname;
+  const barePath = unprefixed.split(/[?#]/u, 1)[0] || '/';
   const enPath = barePath === '/zh' ? '/' : barePath.replace(/^\/zh(?=\/)/u, '');
   const capabilityRoute = DASHBOARD_SHELL_CAPABILITY_ROUTES.find(
     (route) =>

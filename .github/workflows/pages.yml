@@ -39,13 +39,19 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.4.4"
+      # The site's URL path prefix (empty at a domain root, "/<repo>" for a project site).
+      - id: pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
       - name: Recipes and data
-        run: python3 tools/build_site.py
+        run: python3 tools/build_site.py --site-base "${{ steps.pages.outputs.base_path }}"
       - name: Install
         working-directory: app
         run: bun install --frozen-lockfile
       - name: Export
         working-directory: app/packages/app
+        env:
+          NEXT_PUBLIC_BASE_PATH: ${{ steps.pages.outputs.base_path }}
         run: bunx --bun next build
       - uses: actions/upload-pages-artifact@v3
         with:

@@ -36,6 +36,10 @@ cd app && bun install --frozen-lockfile && cd packages/app && bunx --bun next bu
 python3 -m http.server 8000 --directory app/packages/app/out
 ```
 
+That builds for a domain root. The Pages workflow builds for the site's URL prefix instead
+(`--site-base /marlowe-inferencex-results` and `NEXT_PUBLIC_BASE_PATH=/marlowe-inferencex-results`), taken from the
+repository's Pages settings.
+
 `build_site.py` refuses a point without a complete recipe, and any published file holding an absolute path, a
 cluster node name or a non-loopback IP address.
 

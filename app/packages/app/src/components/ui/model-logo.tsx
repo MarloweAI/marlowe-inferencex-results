@@ -5,6 +5,7 @@ import { useState } from 'react';
 import { getModelLogo, type Model } from '@/lib/catalog/data-mappings';
 import { isMonochromeLogo } from '@/lib/catalog/model-logos';
 import { cn } from '@/lib/shared/utils';
+import { withBasePath } from '@/components/marlowe/base-path';
 
 export function ModelLogo({ model, className }: { model: Model; className?: string }) {
   const [failedSrc, setFailedSrc] = useState<string | null>(null);
@@ -14,7 +15,7 @@ export function ModelLogo({ model, className }: { model: Model; className?: stri
 
   return (
     <img
-      src={`/logos/${logo}`}
+      src={withBasePath(`/logos/${logo}`)}
       alt=""
       aria-hidden="true"
       width={16}

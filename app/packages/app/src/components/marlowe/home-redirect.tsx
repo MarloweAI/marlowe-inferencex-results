@@ -1,17 +1,16 @@
 'use client';
 
 import { useEffect } from 'react';
-
-export const HOME_PATH = '/infx/inference/deepseek-v41-flash/';
+import { HOME_PATH, withBasePath } from '@/components/marlowe/base-path';
 
 /** The site's only page is the inference chart; the root sends readers there. */
 export function HomeRedirect() {
   useEffect(() => {
-    window.location.replace(HOME_PATH + window.location.search + window.location.hash);
+    window.location.replace(withBasePath(HOME_PATH) + window.location.search + window.location.hash);
   }, []);
   return (
     <main className="container mx-auto px-4 py-16 text-center">
-      <a className="underline" href={HOME_PATH}>
+      <a className="underline" href={withBasePath(HOME_PATH)}>
         Open the results
       </a>
     </main>
