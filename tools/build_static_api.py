@@ -20,7 +20,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-FRAMEWORK = {"main": "marlowe", "interactivity-leaning": "marlowe-intvty"}
+FRAMEWORK = {"main": "marlowe", "interactivity-leaning": "marlowe-intvty",
+             "release-main": "marlowe-release", "release-interactivity-leaning": "marlowe-release-intvty"}
 # Marlowe row ids sit far above InferenceX's so they never collide.
 ID_BASE = 90_000_000
 SNAPSHOT_DATE_TS = "app/packages/app/src/components/marlowe/snapshot-date.ts"

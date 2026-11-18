@@ -37,17 +37,21 @@ export function MarloweNotes() {
           stay on the GPU.
         </li>
         <li>
-          <strong className="text-foreground">Builds.</strong> TP2 and TP4 points: image{' '}
+          <strong className="text-foreground">Builds.</strong> Earlier series, TP2 and TP4 points: image{' '}
           <code>lb-sgl1a16c3def9-mono3c777011</code>, MarloweAI/sglang <code>1a16c3de</code> (marlowe-dev{' '}
           <code>08d1e520</code>) + sgl-amd-mono <code>3c777011</code> + marlowe-mix <code>edde9499</code>. TP8 C1:
           image <code>lb-sgl2ad94ff74d-mono5c4c0d20</code>, MarloweAI/sglang <code>2ad94ff7</code> (marlowe-dev{' '}
           <code>ab55bd11</code>) + sgl-amd-mono <code>5c4c0d20</code> + marlowe-mix <code>edde9499</code>; it changes
-          only bookkeeping and TP8 start-up, not the TP2/TP4 kernels. Both run InferenceX&apos;s MI355X SGLang agentic
+          only bookkeeping and TP8 start-up, not the TP2/TP4 kernels. The 2026-11-17 series (C1 to C8) runs on the
+          newer release build: image <code>team-nov17-marlowe-optimized-v0</code>, MarloweAI/sglang marlowe-dev{' '}
+          <code>0a0fcd33</code> + sgl-amd-mono <code>c85bc95c</code> + marlowe-mix <code>b79e6105</code>. The other
+          series, C16 and up included, are on the earlier build above. All run InferenceX&apos;s MI355X SGLang agentic
           recipe with Marlowe&apos;s MoE runner and monokernel added; no point uses DP attention.
         </li>
         <li>
           <strong className="text-foreground">Series.</strong> &ldquo;Marlowe SGLang&rdquo; is the main series;
-          &ldquo;interactivity-leaning&rdquo; trades TTFT for interactivity with tighter request caps. The main TP2 C64
+          &ldquo;interactivity-leaning&rdquo; trades TTFT for interactivity with tighter request caps. The two &ldquo;2026-11-17&rdquo; series re-measure the C1, C2 and C8 points on the
+          release build with the same server and client commands; the earlier curves stay as published. The main TP2 C64
           point is still being chosen and is not shown. Power, cost-per-energy and cache-hit metrics were not measured
           for Marlowe points, so they do not appear on those charts.
         </li>

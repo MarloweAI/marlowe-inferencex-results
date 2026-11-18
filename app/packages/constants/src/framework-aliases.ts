@@ -11,6 +11,8 @@ export const FW_REGISTRY: Record<string, FwEntry> = {
   'llmd-vllm': { label: 'llm-d vLLM' },
   marlowe: { label: 'Marlowe SGLang' },
   'marlowe-intvty': { label: 'Marlowe SGLang, interactivity-leaning' },
+  'marlowe-release': { label: 'Marlowe SGLang, 2026-11-17' },
+  'marlowe-release-intvty': { label: 'Marlowe SGLang, interactivity-leaning, 2026-11-17' },
   'mooncake-atom': { label: 'Mooncake ATOMesh¹' },
   'mori-sglang': { label: 'MoRI SGLang' },
   'vllm-disagg': { label: 'MoRI vLLM' },

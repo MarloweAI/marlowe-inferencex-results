@@ -30,6 +30,14 @@ LEAKS = (
 )
 
 
+# Legend names of the series, as the chart shows them.
+SERIES_LABEL = {
+    "main": "Marlowe SGLang",
+    "interactivity-leaning": "Marlowe SGLang, interactivity-leaning",
+    "release-main": "Marlowe SGLang, 2026-11-17",
+    "release-interactivity-leaning": "Marlowe SGLang, interactivity-leaning, 2026-11-17",
+}
+
 def leaks(path: Path) -> list[str]:
     text = path.read_text()
     found = []
@@ -61,7 +69,7 @@ def recipe_page(p: dict, files: dict[str, str]) -> str:
     s = p["server"]
     title = f"{p['model_name']} · MI355X TP{p['decode_tp']} C{p['conc']}"
     rows = [
-        ("Series", p["series"] + (" (candidate, not charted yet)" if p["status"] != "final" else "")),
+        ("Series", SERIES_LABEL[p["series"]] + (" (candidate, not charted yet)" if p["status"] != "final" else "")),
         ("Configuration", p["label"]),
         ("Interactivity P50 / P90, tok/s/user", f"{fmt(m['median_intvty'])} / {fmt(m['p90_intvty'])}"),
         ("TTFT P50 / P90, s", f"{fmt(m['median_ttft'], 3)} / {fmt(m['p90_ttft'], 3)}"),

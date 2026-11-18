@@ -55,6 +55,9 @@ function sortPairedByChip(keys: string[]): void {
 const MARLOWE_COLORS: Record<string, Record<'light' | 'dark', string>> = {
   marlowe: { light: 'oklch(0.650 0.200 45.0)', dark: 'oklch(0.720 0.190 50.0)' },
   'marlowe-intvty': { light: 'oklch(0.720 0.160 75.0)', dark: 'oklch(0.800 0.150 80.0)' },
+  // Newer measurements in violet, so they read apart from the earlier orange curves and AMD red.
+  'marlowe-release': { light: '#7a3cff', dark: '#7d45ff' },
+  'marlowe-release-intvty': { light: '#b13fb8', dark: '#d05fd8' },
 };
 
 export function generateVendorColors(

@@ -67,12 +67,18 @@ def read_kv(path: Path) -> dict:
     return out
 
 
-def parse_server_cmd(path: Path) -> tuple[dict, list[str], list[str], list[str], dict]:
-    """(build record, unset vars, env assignments, pinning prefix, argv) from server_cmd.txt."""
+def parse_server_cmd(path: Path, commits: dict) -> tuple[dict, list[str], list[str], list[str], dict]:
+    """(build record, unset vars, env assignments, pinning prefix, argv) from server_cmd.txt.
+
+    The header names the image and, for older runs, carries the image's build record with its commits; for runs
+    whose header has no record, the commits come from --commits.
+    """
     header, cmd = path.read_text().splitlines()[:2]
-    m = re.match(r"# image: (\S+) (\{.*)", header)
+    m = re.match(r"# image: (\S+)\s*(\{.*)?$", header)
     image = IMAGE_PATH.sub(r"\1", m.group(1))
-    commits = dict(re.findall(r'"(sglang|sgl_amd_mono|marlowe_mix)": "([0-9a-f]{40})"', m.group(2)))
+    if m.group(2):
+        commits = dict(re.findall(r'"(sglang|sgl_amd_mono|marlowe_mix)": "([0-9a-f]{40})"', m.group(2)))
+    assert set(commits) == set(REPOS), f"{path}: no build record in the header; pass --commits"
     tokens = shlex.split(cmd)
     assert tokens[0] == "env"
     i, unset, env = 1, [], []
@@ -180,9 +186,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("run_dir", type=Path)
     ap.add_argument("--point", required=True)
-    ap.add_argument("--series", required=True, choices=["main", "interactivity-leaning"])
+    ap.add_argument("--series", required=True, choices=["main", "interactivity-leaning", "release-main", "release-interactivity-leaning"])
     ap.add_argument("--status", default="final", choices=["final", "candidate"])
     ap.add_argument("--label", default="", help="short config label shown on hover")
+    ap.add_argument("--commits", default="", help="sglang=SHA,sgl_amd_mono=SHA,marlowe_mix=SHA (full SHAs), for runs\n"
+                    "whose server_cmd.txt header has no build record")
     a = ap.parse_args()
     d = a.run_dir
 
@@ -192,7 +200,7 @@ def main() -> int:
     meta = dict(re.match(r"(\w+):? (.*)", line).groups() for line in (d / "meta.txt").read_text().splitlines())
     client_cpus = re.search(r"client_cpus (\S+)", meta["job"]).group(1)
     image_sha = re.search(r"sha256 ([0-9a-f]+)", meta["image"]).group(1)
-    build, unset, env, pin, argv = parse_server_cmd(d / "server_cmd.txt")
+    build, unset, env, pin, argv = parse_server_cmd(d / "server_cmd.txt", dict(kv.split("=", 1) for kv in a.commits.split(",") if kv))
     assert summary["result"] == "PASS" and summary["faults"] == 0 and summary["errored_records"] == 0
     f = summary["full"]
     tp, conc = int(cfg["TP"]), int(cfg["C"])
