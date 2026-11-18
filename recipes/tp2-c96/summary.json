@@ -1,0 +1,29 @@
+{
+ "start": "2026-11-18T05:39:03",
+ "end": "2026-11-18T06:48:21",
+ "gpus": 2,
+ "concurrency": 96,
+ "requests_profiled": 12242,
+ "requests_errored": 1,
+ "error_categories": {
+  "InvalidInferenceResultError": 1
+ },
+ "score_full_window": {
+  "n": 12242,
+  "intv50": 61.020062019487746,
+  "intv90": 44.433953182237666,
+  "ttft50": 0.5812929404999999,
+  "ttft90": 2.5388361663999994,
+  "tpg": 206756.3091345367,
+  "otpg": 1709.2599095205387,
+  "e2en75": 43.737898517921195,
+  "e2en90": 33.819073114271816,
+  "traces": 178
+ },
+ "score_keys": {
+  "intv50/intv90": "interactivity P50/P90, tokens/s/user (1/TPOT)",
+  "ttft50/ttft90": "time to first token P50/P90, s",
+  "tpg/otpg": "total (input incl. cached + output) / output tokens/s per GPU",
+  "e2en75/e2en90": "E2E normalized interactivity P75/P90, tokens/s/user"
+ }
+}

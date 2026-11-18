@@ -4,8 +4,8 @@
 python3 tools/build_static_api.py --out app/packages/app/public/data/api [--site-base /]
 
 The app's API client (app/packages/app/src/lib/api/static-api.ts) maps each API request to a file here. Each
-Marlowe point becomes a benchmark row with InferenceX's row shape: hardware mi355x, framework `marlowe` (main
-series) or `marlowe-intvty` (interactivity-leaning), the measured metrics, and run_url pointing at its recipe page.
+Marlowe point becomes a benchmark row with InferenceX's row shape: hardware mi355x, framework `marlowe-release`,
+the measured metrics, and run_url pointing at its recipe page.
 Their E2E normalized interactivity is added to derived-agentic-metrics.json under the row id, as the
 derived-metrics endpoint serves it. Metrics we did not measure (power, cache hit rates) are left out. Candidate points are
 not written. Standard library only.
@@ -20,8 +20,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-FRAMEWORK = {"main": "marlowe", "interactivity-leaning": "marlowe-intvty",
-             "release-main": "marlowe-release", "release-interactivity-leaning": "marlowe-release-intvty"}
+FRAMEWORK = {"release-main": "marlowe-release"}
 # Marlowe row ids sit far above InferenceX's so they never collide.
 ID_BASE = 90_000_000
 SNAPSHOT_DATE_TS = "app/packages/app/src/components/marlowe/snapshot-date.ts"
@@ -57,6 +56,7 @@ def restrict_availability(av: dict, codes: set[str]) -> dict:
 def marlowe_row(i: int, p: dict, site_base: str) -> dict:
     m = p["metrics"]
     tp = p["decode_tp"]
+    dpa = p["decode_dp_attention"]
     # The app draws the latest curve run per series, so a series' points share one run id.
     run_id = str(ID_BASE + 100_000 + list(FRAMEWORK).index(p["series"]))
     run_started = f"{p['date']} 00:00:00+00"
@@ -85,7 +85,7 @@ def marlowe_row(i: int, p: dict, site_base: str) -> dict:
         "offload_mode": "off",
         "kv_offloading": "none",
         "pp": 1,
-        "dp": 1,
+        "dp": tp if dpa else 1,
         "dcp_size": 1,
         "pcp_size": 1,
         "power_valid": 0,
@@ -101,11 +101,11 @@ def marlowe_row(i: int, p: dict, site_base: str) -> dict:
         "is_multinode": False,
         "prefill_tp": tp,
         "prefill_ep": 1,
-        "prefill_dp_attention": False,
+        "prefill_dp_attention": dpa,
         "prefill_num_workers": 0,
         "decode_tp": tp,
         "decode_ep": 1,
-        "decode_dp_attention": False,
+        "decode_dp_attention": dpa,
         "decode_num_workers": 0,
         "num_prefill_gpu": tp,
         "num_decode_gpu": tp,

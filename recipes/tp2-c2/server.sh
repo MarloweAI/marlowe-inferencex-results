@@ -1,11 +1,11 @@
 #!/bin/bash
-# DeepSeek-V4.1-Flash AgentX server, MI355X TP2 C2 (main series).
+# DeepSeek-V4.1-Flash AgentX server, MI355X TP2 C2 (release-main series).
 # The exact command of the charted run. Only the model path is replaced by a variable.
 # MODEL_PATH: a local copy of deepseek-ai/DeepSeek-V4.1-Flash at revision 314113f8a7dadb388215396ba5fbee2c610a04d6.
-# Image: lb-sgl1a16c3def9-mono3c777011 (built on the InferenceX MI355X SGLang image), commits:
-#   MarloweAI/sglang 1a16c3def99bce67235d6639aae9eacca7a6b860 (merged to marlowe-dev as 08d1e520)
-#   MarloweAI/sgl-amd-mono-upstream 3c777011a885754659bb60c5b80be0d70cf4b2fc
-#   MarloweAI/marlowe-mix edde94993c964e6fa6d4d2851ec2a69f9fd165b5
+# Image: Nov-17-2026-marlowe-optimized-v0 (built on the InferenceX MI355X SGLang image), commits:
+#   MarloweAI/sglang 0a0fcd3356357adbfc201ac5fe4dd67f54446f3a
+#   MarloweAI/sgl-amd-mono-upstream c85bc95ca041621f16ba925d35426d1896d0eec6
+#   MarloweAI/marlowe-mix b79e610582f720ede1feb0b2380c8a5af7d89fd5
 # The image's own environment applies too; the variables below are set on top of it.
 # Several servers shared each node on disjoint GPUs, each pinned with taskset to its socket's cores.
 
@@ -39,13 +39,13 @@ env -u HIP_VISIBLE_DEVICES -u CUDA_VISIBLE_DEVICES \
   SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token \
   ROCR_VISIBLE_DEVICES=0,1 \
   SGLANG_SET_CPU_AFFINITY=0 \
-  taskset -c 0-39 \
+  taskset -c 96,128-159,177-183 \
   python3 -m sglang.launch_server \
   --model-path "$MODEL_PATH" \
   --served-model-name deepseek-ai/DeepSeek-V4.1-Flash \
   --host 127.0.0.1 \
-  --port 31000 \
-  --nccl-port 31001 \
+  --port 31100 \
+  --nccl-port 31101 \
   --trust-remote-code \
   --tensor-parallel-size 2 \
   --speculative-algorithm DSPARK \

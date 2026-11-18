@@ -11,12 +11,12 @@ export AIPERF_HTTP_TCP_USER_TIMEOUT=900000
 export AIPERF_REQUIRED_SERVER_METRIC_PREFIX=sglang:
 
 agentx profile \
-  --url http://127.0.0.1:31080 \
+  --url http://127.0.0.1:31000 \
   --model deepseek-ai/DeepSeek-V4.1-Flash \
   --tokenizer "$TOKENIZER_PATH" \
   --concurrency 8 \
   --benchmark-duration 3600 \
   --tokenizer-trust-remote-code \
-  --server-metrics http://127.0.0.1:31080/metrics \
+  --server-metrics http://127.0.0.1:31000/metrics \
   --output-artifact-dir "$OUT/aiperf_artifacts" \
   --public-dataset semianalysis_cc_traces_weka_062126

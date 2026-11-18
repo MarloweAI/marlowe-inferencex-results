@@ -132,7 +132,6 @@ import { resolveLabelState, serializeLabelState } from './utils/label-defaults';
 import { defaultInferenceHardware, defaultInferenceXAxisMode } from './utils/model-defaults';
 import { powerXViewFor } from './powerx/powerx-views';
 import { usePowerXSurface } from './ui/powerx-surface';
-import { bestSeriesPerSku, skuColumns, withUnrankedSkus } from './utils/best-series-per-sku';
 import { resolveBenchmarkSeed } from './utils/benchmark-seed';
 import {
   EMPTY_QUICK_FILTERS,
@@ -153,11 +152,12 @@ const InferenceDisplayContext = createContext<InferenceDisplayContextType | unde
 const InferenceActionsContext = createContext<InferenceActionsContextType | undefined>(undefined);
 
 
-/** Marlowe's measured series are always in the default selection, beside the best published series per SKU. */
-function withMarloweSeries(all: Set<string>, best: Set<string>): Set<string> {
-  const out = new Set(best);
-  for (const key of all) if (key.includes('_marlowe')) out.add(key);
-  return out;
+/** The series drawn by default; every other series stays in the legend, switched off. */
+const DEFAULT_SERIES = new Set(['mi355x_marlowe-release', 'mi355x_sglang', 'b200_sglang', 'mi355x_tilert']);
+
+/** The default selection: the default series that have data. */
+function defaultSeries(all: Set<string>): Set<string> {
+  return new Set([...all].filter((key) => DEFAULT_SERIES.has(key)));
 }
 
 export const INFERENCE_CONTEXT_STRINGS = {
@@ -1175,39 +1175,7 @@ export function InferenceProvider({
     [activeHwTypes, selectableHwTypes, comparisonExclusion, consentSupported],
   );
 
-  const bestHwTypes = useMemo(() => withMarloweSeries(hwTypesWithData, (() => {
-    const wantedType = selectedXAxisMode === 'interactivity' ? 'interactivity' : 'e2e';
-    const graph = graphs.find((candidate) => candidate.chartDefinition.chartType === wantedType);
-    if (!graph) return hwTypesWithData;
-    const tableCandidates = graph.tableData?.filter((point) =>
-      effectivePrecisions.includes(point.precision),
-    );
-    const unrankedHwTypes = tableCandidates
-      ? new Set(tableCandidates.map(extractHwKey))
-      : hwTypesWithData;
-    const direction =
-      graph.chartDefinition[
-        `${selectedYAxisMetric}_roofline` as keyof typeof graph.chartDefinition
-      ];
-    if (
-      direction !== 'upper_right' &&
-      direction !== 'upper_left' &&
-      direction !== 'lower_left' &&
-      direction !== 'lower_right'
-    ) {
-      return unrankedHwTypes;
-    }
-    const best = bestSeriesPerSku(skuColumns(graph.data), direction, effectivePrecisions);
-    if (best.size === 0) return unrankedHwTypes;
-    return tableCandidates ? withUnrankedSkus(best, graph.data, tableCandidates) : best;
-  })()), [
-    graphs,
-    hwTypesWithData,
-    selectedXAxisMode,
-    selectedYAxisMetric,
-    effectivePrecisions,
-    extractHwKey,
-  ]);
+  const bestHwTypes = useMemo(() => defaultSeries(hwTypesWithData), [hwTypesWithData]);
 
   const setBestPerSkuAndApply = useCallback(
     (enabled: boolean, options?: { applySelection?: boolean }) => {

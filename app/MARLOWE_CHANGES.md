@@ -13,9 +13,9 @@ to publish a static copy of the inference chart with Marlowe's measured points a
   derived-metrics batches, served from one file holding every row) use it. Date-specific and
   run-specific requests are not in the snapshot. `src/hooks/api/use-resident-sequence-lengths.ts` returns nothing,
   because its percentiles depend on the selected points.
-- **Marlowe points.** `packages/constants/src/framework-aliases.ts` registers the `marlowe` and `marlowe-intvty`
-  frameworks; `src/lib/charts/dynamic-colors.ts` gives them fixed orange shades; `src/components/inference/
-  InferenceContext.tsx` keeps them in the default selection; `src/components/inference/utils/tooltipUtils.ts`
+- **Marlowe points.** `packages/constants/src/framework-aliases.ts` registers the `marlowe-release`
+  framework; `src/lib/charts/dynamic-colors.ts` gives it a fixed violet; `src/components/inference/
+  InferenceContext.tsx` sets the default selection (Marlowe, SGLang on MI355X and B200, TileRT on MI355X); `src/components/inference/utils/tooltipUtils.ts`
   links a Marlowe point to its recipe, and a published point's detail pages to the official site.
 - **Branding.** `src/app/layout.tsx` uses Marlowe's header and footer (`src/components/marlowe/`) in place of the
   InferenceX header, footer, notices, analytics and seasonal effects. The dashboard tab bar is hidden

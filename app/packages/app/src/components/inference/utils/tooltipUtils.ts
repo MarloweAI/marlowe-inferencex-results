@@ -779,7 +779,7 @@ export const showsPowerTraceAction = (
 const OFFICIAL_SITE = 'https://inferencex.semianalysis.com';
 const MARLOWE_RECIPE_LABEL = { en: 'Marlowe recipe', zh: 'Marlowe 复现配方' } as const;
 
-/** Points measured by Marlowe (framework `marlowe` or `marlowe-intvty`). */
+/** Points measured by Marlowe (framework `marlowe-release`). */
 export const isMarlowePoint = (point: Pick<InferenceData, 'hwKey'>): boolean =>
   String(point.hwKey).includes('_marlowe');
 

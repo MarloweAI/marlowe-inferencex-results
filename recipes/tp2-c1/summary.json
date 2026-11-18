@@ -1,23 +1,23 @@
 {
  "result": "PASS",
- "start": "2026-11-15T03:20:30+00:00",
- "end": "2026-11-15T04:31:36+00:00",
+ "start": "2026-11-18T01:03:10+00:00",
+ "end": "2026-11-18T02:15:02+00:00",
  "gpus": 2,
  "concurrency": 1,
- "server_ready_s": 562,
+ "server_ready_s": 547,
  "server_fault_lines": 0,
  "errored_requests": 0,
- "accept_len_mean": 3.511,
+ "accept_len_mean": 3.51,
  "replay_checks": [
   "ok: sequential trace order",
   "ok: 1 lanes from 393 traces",
   "ok: lane 0 at turn 84/130",
   "ok: lane 0 trace 00200129",
   "ok: 10 warm-up requests per lane",
-  "profiling records 338 lane-0 primer ISL 314837 ok"
+  "profiling records 341 lane-0 primer ISL 314839 ok"
  ],
  "decode": {
-  "intervals": 4768,
+  "intervals": 4792,
   "mono_share": 1.0,
   "graph_share": 1.0,
   "mono_batch_sizes": [
@@ -25,18 +25,18 @@
   ]
  },
  "score_full_window": {
-  "n": 338,
-  "intv50": 721.0185632622479,
-  "intv90": 705.8340593687037,
-  "itl50_ms": 1.386926843430356,
-  "itl90_ms": 1.4167635958151377,
-  "ttft50": 0.472668619,
-  "ttft90": 0.9099221769,
-  "e2en50": 557.1467106000558,
-  "tpg": 15662.871402199593,
-  "otpg": 93.56286048846998,
-  "isl50": 355078.0,
-  "osl50": 924.5,
+  "n": 341,
+  "intv50": 724.5194723841017,
+  "intv90": 705.9751701210577,
+  "itl50_ms": 1.3802251535205847,
+  "itl90_ms": 1.4164804122339376,
+  "ttft50": 0.39665538599999994,
+  "ttft90": 0.663001286,
+  "e2en50": 577.1920252204833,
+  "tpg": 15686.814552703567,
+  "otpg": 93.81226606712,
+  "isl50": 353688.0,
+  "osl50": 904.0,
   "traces": 5
  },
  "score_keys": {

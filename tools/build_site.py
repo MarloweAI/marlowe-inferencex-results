@@ -26,17 +26,16 @@ RECIPE_FILES = ("server.sh", "client.sh", "summary.json", "windows.json", "aiper
 LEAKS = (
     ("absolute path", re.compile(r"(?<![\w$.:/!])/(?!dev/null\b)[A-Za-z][\w.-]*/[\w./-]*")),
     ("node name", re.compile(r"\b[a-z]+-mi\d{3}x-\d+\b")),
-    ("IP address", re.compile(r"\b(?!127\.0\.0\.1\b)\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")),
+    ("IP address", re.compile(r"\b(?!127\.0\.0\.1\b|0\.0\.0\.0\b)\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")),
 )
 
 
 # Legend names of the series, as the chart shows them.
 SERIES_LABEL = {
-    "main": "Marlowe SGLang",
-    "interactivity-leaning": "Marlowe SGLang, interactivity-leaning",
-    "release-main": "Marlowe SGLang, 2026-11-17",
-    "release-interactivity-leaning": "Marlowe SGLang, interactivity-leaning, 2026-11-17",
+    "release-main": "Marlowe SGLang, 2026-11-17 release",
 }
+STATUS_NOTE = {"candidate": " (candidate, not charted yet)"}
+
 
 def leaks(path: Path) -> list[str]:
     text = path.read_text()
@@ -69,16 +68,19 @@ def recipe_page(p: dict, files: dict[str, str]) -> str:
     s = p["server"]
     title = f"{p['model_name']} · MI355X TP{p['decode_tp']} C{p['conc']}"
     rows = [
-        ("Series", SERIES_LABEL[p["series"]] + (" (candidate, not charted yet)" if p["status"] != "final" else "")),
-        ("Configuration", p["label"]),
+        ("Series", SERIES_LABEL[p["series"]] + STATUS_NOTE.get(p["status"], "")),
+    ] + ([("Configuration", p["label"])] if p["label"] else []) + [
         ("Interactivity P50 / P90, tok/s/user", f"{fmt(m['median_intvty'])} / {fmt(m['p90_intvty'])}"),
         ("TTFT P50 / P90, s", f"{fmt(m['median_ttft'], 3)} / {fmt(m['p90_ttft'], 3)}"),
         ("TPOT P50 / P90, ms", f"{fmt(m['median_tpot'] * 1e3, 3)} / {fmt(m['p90_tpot'] * 1e3, 3)}"),
         ("Throughput, tok/s/GPU (input incl. cached + output)", fmt(m["tput_per_gpu"], 0)),
         ("Output throughput, tok/s/GPU", fmt(m["output_tput_per_gpu"], 1)),
         ("Requests scored", f"{m['num_requests']:,} over {m['duration_seconds']} s"),
+        ("Errored requests", m.get("errored_requests", 0)),
         ("Mean accept length (simulated 3.51)", fmt(m["accept_len_mean"], 3)),
-        ("GPUs", f"{p['num_decode_gpu']} × MI355X, TP{p['decode_tp']}, no DP attention"),
+        ("GPUs", f"{p['num_decode_gpu']} × MI355X, TP{p['decode_tp']}, "
+                 + ("DP attention" if p["decode_dp_attention"] else "no DP attention")),
+        ("Monokernel", "on" if s["monokernel"] else "off"),
         ("Request cap (max-running-requests)", s["max_running_requests"] or "SGLang default"),
         ("Engram host table", "on" if s["engram_host_table"] else "off"),
         ("Date", p["date"]),
@@ -105,8 +107,8 @@ def recipe_page(p: dict, files: dict[str, str]) -> str:
 <p class="crumb"><a href="../../">← Back to the chart</a></p>
 <p class="brand">Marlowe</p>
 <h1>{html.escape(title)}</h1>
-<p class="lede">Measured by Marlowe with InferenceX's agentx-harness client (1.0.13, <code>agentx</code> preset,
-3600 s) and InferenceX's scoring formulas. Not an InferenceX CI run.</p>
+<p class="lede">Measured by Marlowe with InferenceX's client ({html.escape(p["client"].removeprefix("InferenceX "))})
+and InferenceX's scoring formulas. Not an InferenceX CI run.</p>
 <div class="tablewrap"><table class="kv">{table}</table></div>
 {pre}
 <h2>Scores and client output</h2>

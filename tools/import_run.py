@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Turn one raw AgentX run directory into a charted point: data/marlowe/<point>.json and recipes/<point>/.
 
-python3 tools/import_run.py RUN_DIR --point tp4-c1 --series main [--status final|candidate] [--label TEXT]
+python3 tools/import_run.py RUN_DIR --point tp4-c1 --series release-main [--status final|candidate] [--label TEXT]
 
 RUN_DIR is a copy of the run's small files (server_cmd.txt, cfg.txt, meta.txt, summary.json, windows.json,
 client/benchmark_command.txt, client/run_info.txt, client/aiperf_artifacts/profile_export_aiperf.json, and the
@@ -186,9 +186,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("run_dir", type=Path)
     ap.add_argument("--point", required=True)
-    ap.add_argument("--series", required=True, choices=["main", "interactivity-leaning", "release-main", "release-interactivity-leaning"])
+    ap.add_argument("--series", required=True, choices=["release-main"])
     ap.add_argument("--status", default="final", choices=["final", "candidate"])
     ap.add_argument("--label", default="", help="short config label shown on hover")
+    ap.add_argument("--image", default="", help="the image's release tag, shown in place of its file name")
     ap.add_argument("--commits", default="", help="sglang=SHA,sgl_amd_mono=SHA,marlowe_mix=SHA (full SHAs), for runs\n"
                     "whose server_cmd.txt header has no build record")
     a = ap.parse_args()
@@ -201,6 +202,7 @@ def main() -> int:
     client_cpus = re.search(r"client_cpus (\S+)", meta["job"]).group(1)
     image_sha = re.search(r"sha256 ([0-9a-f]+)", meta["image"]).group(1)
     build, unset, env, pin, argv = parse_server_cmd(d / "server_cmd.txt", dict(kv.split("=", 1) for kv in a.commits.split(",") if kv))
+    build["image"] = a.image or build["image"]
     assert summary["result"] == "PASS" and summary["faults"] == 0 and summary["errored_records"] == 0
     f = summary["full"]
     tp, conc = int(cfg["TP"]), int(cfg["C"])
@@ -224,14 +226,14 @@ def main() -> int:
         "disagg": False,
         "prefill_tp": tp,
         "decode_tp": tp,
-        "decode_dp_attention": False,
+        "decode_dp_attention": "--enable-dp-attention" in argv,
         "num_prefill_gpu": tp,
         "num_decode_gpu": tp,
         "offload_mode": "off",
         "benchmark_type": "agentic_traces",
         "conc": conc,
         "date": date,
-        "image": f"{build['image']} (sha256 {image_sha}…)",
+        "image": f"{build['image']} (squashfs sha256 {image_sha}…)",
         "build": {REPOS[k]: v for k, v in build["commits"].items()},
         "server": server_settings(argv, env),
         "metrics": {
