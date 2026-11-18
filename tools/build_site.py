@@ -70,12 +70,13 @@ def recipe_page(p: dict, files: dict[str, str]) -> str:
     rows = [
         ("Series", SERIES_LABEL[p["series"]] + STATUS_NOTE.get(p["status"], "")),
     ] + ([("Configuration", p["label"])] if p["label"] else []) + [
-        ("Interactivity P50 / P90, tok/s/user", f"{fmt(m['median_intvty'])} / {fmt(m['p90_intvty'])}"),
+        ("Interactivity P50 / P90, tok/s/user (1 / full-response ITL, as charted)",
+         f"{fmt(m['median_full_response_intvty'])} / {fmt(m['p90_full_response_intvty'])}"),
         ("TTFT P50 / P90, s", f"{fmt(m['median_ttft'], 3)} / {fmt(m['p90_ttft'], 3)}"),
         ("TPOT P50 / P90, ms", f"{fmt(m['median_tpot'] * 1e3, 3)} / {fmt(m['p90_tpot'] * 1e3, 3)}"),
         ("Throughput, tok/s/GPU (input incl. cached + output)", fmt(m["tput_per_gpu"], 0)),
         ("Output throughput, tok/s/GPU", fmt(m["output_tput_per_gpu"], 1)),
-        ("Requests scored", f"{m['num_requests']:,} over {m['duration_seconds']} s"),
+        ("Requests scored", f"{m['total_requests_completed']:,} over {m['duration_seconds']:,.0f} s"),
         ("Errored requests", m.get("errored_requests", 0)),
         ("Mean accept length (simulated 3.51)", fmt(m["accept_len_mean"], 3)),
         ("GPUs", f"{p['num_decode_gpu']} × MI355X, TP{p['decode_tp']}, "

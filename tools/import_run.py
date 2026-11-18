@@ -5,7 +5,7 @@ python3 tools/import_run.py RUN_DIR --point tp4-c1 --series release-main [--stat
 
 RUN_DIR is a copy of the run's small files (server_cmd.txt, cfg.txt, meta.txt, summary.json, windows.json,
 client/benchmark_command.txt, client/run_info.txt, client/aiperf_artifacts/profile_export_aiperf.json, and the
-per-request client/aiperf_artifacts/profile_export.jsonl for the E2E normalized interactivity; see derived_metrics.py).
+per-request client/aiperf_artifacts/profile_export.jsonl, from which inferencex_metrics.py computes the metrics).
 Local paths are replaced by variables ($MODEL_PATH, $TOKENIZER_PATH, $OUT), node names, job ids and the
 image's storage path are dropped, and the server log is never copied. Standard library only.
 """
@@ -18,7 +18,7 @@ import re
 import shlex
 from pathlib import Path
 
-from derived_metrics import PROFILE, e2e_norm_intvty
+from inferencex_metrics import request_metrics
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -207,8 +207,6 @@ def main() -> int:
     f = summary["full"]
     tp, conc = int(cfg["TP"]), int(cfg["C"])
     date = meta["end"][:10]
-    with open(d / PROFILE) as fh:
-        derived = e2e_norm_intvty(fh)
 
     point = {
         "id": a.point,
@@ -237,23 +235,13 @@ def main() -> int:
         "build": {REPOS[k]: v for k, v in build["commits"].items()},
         "server": server_settings(argv, env),
         "metrics": {
-            "median_intvty": f["intv50"],
-            "p90_intvty": f["intv90"],
-            "median_ttft": f["ttft50"],
-            "p90_ttft": f["ttft90"],
-            "median_tpot": f["itl50_ms"] / 1000,
-            "p90_tpot": f["itl90_ms"] / 1000,
-            "tput_per_gpu": f["tpg"],
-            "input_tput_per_gpu": f["tpg"] - f["otpg"],
-            "output_tput_per_gpu": f["otpg"],
+            **request_metrics(d / "client" / "aiperf_artifacts", tp),
             "spec_algorithm": "dspark",
             "accept_len_mean": summary["accept_len_mean"],
-            "num_requests": f["n"],
-            "duration_seconds": 3600,
-            **{k: v for k, v in derived.items() if k != "n"},
+            "errored_requests": summary["errored_records"],
         },
         "client": "InferenceX agentx-harness 1.0.13, agentx preset, 3600 s",
-        "scorer": "InferenceX agentx-audit-data windows.py, full window",
+        "scorer": "InferenceX request_metrics.py formulas, profiling phase",
         "recipe": f"recipes/{a.point}/",
     }
     (ROOT / "data" / "marlowe" / f"{a.point}.json").write_text(json.dumps(point, indent=1) + "\n")
@@ -288,7 +276,9 @@ def main() -> int:
     (rd / "windows.json").write_text(json.dumps(windows) + "\n")
     aip = json.loads((d / "client/aiperf_artifacts/profile_export_aiperf.json").read_text())
     (rd / "aiperf_summary.json").write_text(json.dumps(scrub_tree(aip), indent=1) + "\n")
-    print(f"{a.point}: {f['intv50']:.1f}/{f['intv90']:.1f} tok/s/user, {f['tpg']:.0f} tok/s/GPU -> {rd.relative_to(ROOT)}")
+    m = point["metrics"]
+    print(f"{a.point}: {m['median_intvty']:.1f}/{m['p90_intvty']:.1f} tok/s/user, {m['tput_per_gpu']:.0f} tok/s/GPU -> "
+          f"{rd.relative_to(ROOT)}")
     return 0
 
 

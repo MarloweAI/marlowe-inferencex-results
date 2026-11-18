@@ -42,8 +42,8 @@ export function MarloweNotes() {
           sgl-amd-mono <code>c85bc95c</code> + marlowe-mix <code>b79e6105</code>.
         </li>
         <li>
-          <strong className="text-foreground">Metrics not measured.</strong> Power, cost-per-energy and cache-hit
-          metrics were not measured for Marlowe points, so they do not appear on those charts.
+          <strong className="text-foreground">Metrics not measured.</strong> Power, cost-per-energy and server-side
+          cache-hit metrics were not measured for Marlowe points, so they do not appear on those charts.
         </li>
       </ol>
       <p className="mt-4">

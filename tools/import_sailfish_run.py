@@ -6,9 +6,10 @@ python3 tools/import_sailfish_run.py RUN_DIR --scores SCORES.jsonl --point ID --
 
 RUN_DIR holds a sailfish run's small files: meta.txt, server_cmd.txt (the job's env and server command, then the
 expanded engine and router commands for DP-attention servers), client/benchmark_command.txt,
-client/aiperf_artifacts/profile_export_aiperf.json and client/aiperf_artifacts/inferencex_summary.json.
-SCORES.jsonl has one line per client job: InferenceX's windows.py full-window score ("ours"), with the E2E
-normalized interactivity computed by derived_metrics.py. Registry hosts, node addresses, local paths and job ids
+client/aiperf_artifacts/profile_export_aiperf.json, client/aiperf_artifacts/inferencex_summary.json and the
+per-request client/aiperf_artifacts/profile_export.jsonl, from which inferencex_metrics.py computes the metrics.
+SCORES.jsonl has one line per client job: InferenceX's windows.py full-window score ("ours"), kept in the
+recipe. Registry hosts, node addresses, local paths and job ids
 are dropped; the server log is never copied. Standard library only.
 """
 
@@ -21,6 +22,7 @@ import shlex
 from pathlib import Path
 
 from import_run import MODEL, REPOS, flag_pairs, scrub, scrub_tree, server_settings
+from inferencex_metrics import request_metrics
 
 ROOT = Path(__file__).resolve().parent.parent
 SERIES = ["release-main"]
@@ -192,25 +194,13 @@ def main() -> int:
         "build": {REPOS[k]: v for k, v in commits.items()},
         "server": server_settings(engine, env),
         "metrics": {
-            "median_intvty": f["intv50"],
-            "p90_intvty": f["intv90"],
-            "median_ttft": f["ttft50"],
-            "p90_ttft": f["ttft90"],
-            "median_tpot": 1 / f["intv50"],
-            "p90_tpot": 1 / f["intv90"],
-            "tput_per_gpu": f["tpg"],
-            "input_tput_per_gpu": f["tpg"] - f["otpg"],
-            "output_tput_per_gpu": f["otpg"],
+            **request_metrics(d / "client" / "aiperf_artifacts", tp),
             "spec_algorithm": "dspark",
             "accept_len_mean": float(dict(e.split("=", 1) for e in env)["SGLANG_SIMULATE_ACC_LEN"]),
-            "num_requests": f["n"],
             "errored_requests": acct["records_error_dropped"],
-            "duration_seconds": 3600,
-            "p75_e2e_norm_intvty": f["e2en75"],
-            "p90_e2e_norm_intvty": f["e2en90"],
         },
         "client": "InferenceX agentx-harness 1.0.12, agentx preset, 3600 s",
-        "scorer": "InferenceX agentx-audit-data windows.py, full window",
+        "scorer": "InferenceX request_metrics.py formulas, profiling phase",
         "recipe": f"recipes/{a.point}/",
     }
     (ROOT / "data" / "marlowe" / f"{a.point}.json").write_text(json.dumps(point, indent=1) + "\n")
@@ -240,7 +230,8 @@ def main() -> int:
     aip = json.loads((d / "client/aiperf_artifacts/profile_export_aiperf.json").read_text())
     aip = json.loads(scrub_sailfish(json.dumps(scrub_tree(aip))))
     (rd / "aiperf_summary.json").write_text(json.dumps(aip, indent=1) + "\n")
-    print(f"{a.point}: {f['intv50']:.1f}/{f['intv90']:.1f} tok/s/user, {f['otpg']:.1f} out tok/s/GPU, "
+    m = point["metrics"]
+    print(f"{a.point}: {m['median_intvty']:.1f}/{m['p90_intvty']:.1f} tok/s/user, {m['tput_per_gpu']:.0f} tok/s/GPU, "
           f"{acct['records_error_dropped']} errored -> {rd.relative_to(ROOT)}")
     return 0
 

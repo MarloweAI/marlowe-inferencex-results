@@ -60,26 +60,9 @@ def marlowe_row(i: int, p: dict, site_base: str) -> dict:
     # The app draws the latest curve run per series, so a series' points share one run id.
     run_id = str(ID_BASE + 100_000 + list(FRAMEWORK).index(p["series"]))
     run_started = f"{p['date']} 00:00:00+00"
+    # The InferenceX fields as computed by inferencex_metrics.py; accept length and errors stay in the recipe.
     metrics = {
-        "median_intvty": m["median_intvty"],
-        "p90_intvty": m["p90_intvty"],
-        "mean_intvty": None,
-        "median_ttft": m["median_ttft"],
-        "p90_ttft": m["p90_ttft"],
-        "median_tpot": m["median_tpot"],
-        "p90_tpot": m["p90_tpot"],
-        "median_itl": m["median_tpot"],
-        "p90_itl": m["p90_tpot"],
-        "tput_per_gpu": m["tput_per_gpu"],
-        "input_tput_per_gpu": m["input_tput_per_gpu"],
-        "output_tput_per_gpu": m["output_tput_per_gpu"],
-        "total_tput_tps": m["tput_per_gpu"] * tp,
-        "input_tput_tps": m["input_tput_per_gpu"] * tp,
-        "output_tput_tps": m["output_tput_per_gpu"] * tp,
-        "duration_seconds": m["duration_seconds"],
-        "p75_e2e_norm_intvty": m["p75_e2e_norm_intvty"],
-        "p90_e2e_norm_intvty": m["p90_e2e_norm_intvty"],
-        "total_requests_completed": m["num_requests"],
+        **{k: v for k, v in m.items() if k not in ("accept_len_mean", "errored_requests")},
         "spec_algorithm": m["spec_algorithm"],
         "spec_draft_model": "native",
         "offload_mode": "off",
